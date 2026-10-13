@@ -61,3 +61,4 @@ sources: []
 - [AutoRound NVFP4 method dispatch 合同](rules-autoround-dispatch.md)。
 - [数值精确性与平台可移植性规则](rules-numeric-exactness.md)
 - [Model Executor — NPU KV cache 布局规则](rules-npu-kv-layout.md)
+- [Model Executor — duplex per-unit turn metadata 规则](rules-duplex-turn-meta.md)

@@ -83,3 +83,4 @@ shared RMSNorm 的empty-input与fused精度边界沿 tensor dtype rules 的DIFF-
 
 - [Diffusion request batch 的 pipeline 合同](rules-request-batch.md)。
 - [Diffusion JIT CUDA 构建 include 顺序规则](rules-jit-cuda-includes.md)
+- [vLLM-Omni Diffusion AMD CI 规则](rules-amd-ci.md)
