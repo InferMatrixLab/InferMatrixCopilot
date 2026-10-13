@@ -1,7 +1,7 @@
 ---
 title: "Qwen3-TTS"
 created: 2026-07-20
-updated: 2026-09-22
+updated: 2026-10-09
 type: index
 tags: [vllm-omni, models, serving, qwen-omni]
 sources: ["PR #5157", "PR #5202", "PR #5608", "PR #6001", "PR #6113", "PR #6553", vllm_omni/entrypoints/openai/serving_speech.py, vllm_omni/entrypoints/openai/tts_adapters/qwen3_tts.py, vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py, vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py, vllm_omni/model_executor/models/qwen3_tts/segmented_graph_wrapper.py, vllm_omni/model_executor/stage_input_processors/qwen3_tts.py, vllm_omni/model_executor/stage_input_processors/chunk_size_utils.py, vllm_omni/platforms/npu/models/qwen3_tts_tokenizer_v2.py, vllm_omni/platforms/npu/layers/rotary_embedding.py, tests/entrypoints/openai_api/test_serving_speech.py]
@@ -31,8 +31,9 @@ confidence: high
   tokenizer RoPE 的 BNSD/BSND shape fallback。
 - 审查 Qwen3-TTS 的 effective `task_type`、uploaded/precomputed stored voice、
   `tts_model_type`/model-path checkpoint variant 与 Base speaker-embedding mismatch
-  admission 时，直接看 [Q3TTS-1d](rules.md#q3tts-1d-effective-task-必须在-dispatch-前与-checkpoint-variant-对齐)；
-  built-in `supported_speakers` 不属于 stored voice。
+  admission 时，查 [Qwen3-TTS rules](rules.md) 的 Q3TTS-1d；同页 Q3TTS-3a/3f/3g 与 Q3TTS-4a
+  还覆盖 ref publication/重复 callback、processed-token codec validity、stateless mask cache
+  和 MRv2 sampling scope。built-in `supported_speakers` 不属于 stored voice。
 - 其他源码入口与具体不变量见 Qwen3-TTS rules；模型家族结构见
   [Qwen-Omni](../qwen-omni/_index.md)。
 

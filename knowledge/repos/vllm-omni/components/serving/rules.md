@@ -1,10 +1,10 @@
 ---
 title: "Serving 规则"
 created: 2026-07-20
-updated: 2026-09-05
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, serving]
-sources: ["Issue #5369", "PR #3576", "PR #4583", "PR #4718", "PR #4834", "PR #4905", "PR #4912", "PR #5085", "PR #5157", "PR #5374", "PR #5670", "PR #5682", "PR #5713", "PR #5732", "PR #5746", "PR #5752", "PR #5843", "PR #5957", "PR #6008", "PR #6138", "PR #6202", "Issue #5811", "PR #6150", "claude-workflow-starter-private@09dca46", "zuiho-kai/claude-workflow-starter@c217fc6", .pre-commit-config.yaml, vllm_omni/entrypoints/async_omni.py, vllm_omni/entrypoints/omni_base.py, vllm_omni/entrypoints/openai/api_server.py, vllm_omni/entrypoints/openai/diffusion_request_utils.py, vllm_omni/entrypoints/openai/serving_chat.py, vllm_omni/entrypoints/openai/serving_speech.py, vllm_omni/entrypoints/openai/serving_video.py, vllm_omni/entrypoints/openai/video_api_utils.py, vllm_omni/entrypoints/openai/tts_adapters/, vllm_omni/engine/async_omni_engine.py, vllm_omni/engine/orchestrator.py, vllm_omni/engine/stage_pool.py, vllm_omni/engine/cfg_companion_tracker.py, vllm_omni/metrics/prometheus.py, tests/dfx/reliability/test_reliability_qwen3_omni.py, tests/engine/test_orchestrator_error_handling.py, tests/entrypoints/test_async_omni.py, tests/entrypoints/test_omni_entrypoints.py, tests/entrypoints/openai_api/test_api_server_guards.py, tests/entrypoints/openai_api/test_audex_serving_guards.py, tests/entrypoints/openai_api/test_omni_sleep_wakeup.py, tests/entrypoints/openai_api/test_serving_speech.py, tests/entrypoints/openai_api/test_tts_detection.py, tests/entrypoints/openai_api/test_video_api_utils.py, tests/entrypoints/openai_api/test_video_server.py, tests/tools/test_check_tts_adapter.py, tools/pre_commit/check_tts_adapter.py, "PR #4795", "PR #4755", "PR #3805", "PR #5878", "PR #6070", "PR #6122", "PR #4499", "PR #6050", "PR #6329", "PR #5999", "PR #5445", "PR #6288", "PR #6622", "PR #6499", "PR #6529", "PR #6776", recipes/MiniMaxAI/MiniMax-H3.md]
+sources: ["Issue #5369", "PR #3576", "PR #4583", "PR #4718", "PR #4834", "PR #4905", "PR #4912", "PR #5085", "PR #5157", "PR #5374", "PR #5670", "PR #5682", "PR #5713", "PR #5732", "PR #5746", "PR #5752", "PR #5843", "PR #5957", "PR #6008", "PR #6138", "PR #6202", "Issue #5811", "PR #6150", "claude-workflow-starter-private@09dca46", "zuiho-kai/claude-workflow-starter@c217fc6", .pre-commit-config.yaml, vllm_omni/entrypoints/async_omni.py, vllm_omni/entrypoints/omni_base.py, vllm_omni/entrypoints/openai/api_server.py, vllm_omni/entrypoints/openai/diffusion_request_utils.py, vllm_omni/entrypoints/openai/serving_chat.py, vllm_omni/entrypoints/openai/serving_speech.py, vllm_omni/entrypoints/openai/serving_video.py, vllm_omni/entrypoints/openai/video_api_utils.py, vllm_omni/entrypoints/openai/tts_adapters/, vllm_omni/engine/async_omni_engine.py, vllm_omni/engine/orchestrator.py, vllm_omni/engine/stage_pool.py, vllm_omni/engine/cfg_companion_tracker.py, vllm_omni/metrics/prometheus.py, tests/dfx/reliability/test_reliability_qwen3_omni.py, tests/engine/test_orchestrator_error_handling.py, tests/entrypoints/test_async_omni.py, tests/entrypoints/test_omni_entrypoints.py, tests/entrypoints/openai_api/test_api_server_guards.py, tests/entrypoints/openai_api/test_audex_serving_guards.py, tests/entrypoints/openai_api/test_omni_sleep_wakeup.py, tests/entrypoints/openai_api/test_serving_speech.py, tests/entrypoints/openai_api/test_tts_detection.py, tests/entrypoints/openai_api/test_video_api_utils.py, tests/entrypoints/openai_api/test_video_server.py, tests/tools/test_check_tts_adapter.py, tools/pre_commit/check_tts_adapter.py, "PR #4795", "PR #4755", "PR #3805", "PR #5878", "PR #6070", "PR #6122", "PR #4499", "PR #6050", "PR #6329", "PR #5999", "PR #5445", "PR #6288", "PR #6622", "PR #6499", "PR #6529", "PR #6776", recipes/MiniMaxAI/MiniMax-H3.md, "PR #7781"]
 confidence: high
 ---
 
@@ -35,7 +35,7 @@ confidence: high
 | SSE/streaming speech、audio format、PCM/WAV、speed、首 chunk 前校验 | `streaming-format`：`SERV-1a`, `SERV-1b` | `vllm_omni/entrypoints/openai/protocol/audio.py::{OpenAICreateSpeechRequest.validate_streaming_constraints,StreamingSpeechSessionConfig.validate_streaming_constraints}` → `serving_speech.py::{OmniOpenAIServingSpeech._validate_speech_streaming_request,OmniOpenAIServingSpeech.create_speech}` |
 | speech `sample_rate`、adapter capability、resample 与 stream header | [SERV-9b](rules-speech-output.md#serv-9b-speech-sample_rate-必须由-adapter-capability-限定) | protocol → TTS adapter capability → `serving_speech.py` / `audio_utils_mixin.py` |
 | video reference 解码、mixed media、frame conversion/mux、bounded memory | `media-ingress`：`SERV-1c`–`1e`, `1k` | `entrypoints/openai/video_api_utils.py` decode/coerce/encode helpers → video server callers |
-| `ref_audio`、x-vector/ICL、content identity、artifact cache/readiness | `artifact-readiness`：`SERV-3a`–`3c` | `serving_speech.py` reference resolve/decode/cache → adapter speaker cache → prefix salt |
+| `ref_audio`、x-vector/ICL、content identity、artifact cache/readiness、waveform 存储与 array/list 隔离 | `artifact-readiness`：`SERV-3a`–`3c`；[SERV-3e/3f](rules-multimodal-cache.md#serv-3e-resolved-waveform-必须拥有独立且紧凑的缓存存储) | `serving_speech.py` reference resolve/decode/cache → adapter speaker cache → prefix salt |
 | Prometheus、waiting/running gauge、replica stats、throttle、collector lifecycle、pipeline request gauge 或 image/diffusion metric emission | [metrics-lifecycle rules](rules-metrics.md)：`SERV-2a`, `SERV-2b`, `SERV-2e`, `SERV-2f` | `vllm_omni/entrypoints/omni_base.py::{OmniBase._log_summary_and_cleanup,OmniBase._process_stage_metrics_message,_publish_request_gauges}` → `vllm_omni/metrics/prometheus.py::{OmniPrometheusMetrics.__init__,set_running,set_waiting}` |
 
 | 审查组 | 什么时候触发 | 规则 ID |
@@ -44,7 +44,7 @@ confidence: high
 | `streaming-format` | SSE、audio streaming、format/default/capability | `SERV-1a`, `SERV-1b` |
 | `media-ingress` | video reference、decoder registry/backend、mixed capability、bounded upload/conversion | `SERV-1c`–`1e` |
 | `metrics-lifecycle` | metrics、gauge、replica、collector、pipeline request gauge 或 image/diffusion measurement boundary | [SERV-2a–2f](rules-metrics.md) |
-| `artifact-readiness` | artifact/content cache、capability、ready/mark/discard | `SERV-3a`, `SERV-3b`, `SERV-3c` |
+| `artifact-readiness` | artifact/content cache、capability、ready/mark/discard、waveform 所有权 | `SERV-3a`, `SERV-3b`, `SERV-3c`；[SERV-3e/3f](rules-multimodal-cache.md#serv-3e-resolved-waveform-必须拥有独立且紧凑的缓存存储) |
 | `chat-multimodal-contract` | chat template kwargs、SDK flatten、text/audio response shape | `SERV-4c`（见 [请求输入合同](rules-request-input.md)）+ 命中模型规则 |
 | `endpoint-capability` | endpoint restriction、route/app-state guard、公开 400 | `SERV-4c`, `SERV-4d` 见 [请求输入合同](rules-request-input.md)；`SERV-5d` 见 engine lifecycle；`SERV-5s` 见 [app assembly](rules-app-assembly.md) |
 | `engine-lifecycle` | pause/resume、sleep/wake、partial stage/tag、ACK、generation admission、abort cleanup/shutdown race、streaming raw terminal、event-driven orchestration、factory 状态矩阵、TTS adapter detection、replica membership/fault isolation | `SERV-5a`、`SERV-5c`–`SERV-5e`、`SERV-5g`–`SERV-5r`（`SERV-5m` 见 [sleep control](rules-sleep-control.md)，其余见 [engine 生命周期规则](rules-engine-lifecycle.md)）、[SERV-5t](rules-abort-lifecycle.md#serv-5t-acknowledged-abort-在-shutdown-边界只忽略已识别的-transport-closure)，`SERV-5f` |
@@ -200,11 +200,11 @@ confidence: high
 
 - 触发：修改 artifact ready/track/mark/discard、失败清理或 eviction。
 - 强制：所有状态入口使用同一 key/capability 合同；请求级 prompt/build 错误不得杀死
-  engine，后续健康请求仍应成功。
+  engine，后续健康请求仍应成功。resolve entry 替换/淘汰后，仅最后一条引用消失时才清理对应 artifact readiness。
 - 禁止：只改 ready 查询而遗漏 mark/discard；只测同模式 cache hit，不测跨模式顺序和
-  counterfactual failure。
+  counterfactual failure；共用 artifact 的别名 entry 仍在时提前使 readiness 失效。
 - 验收：单测枚举状态迁移；E2E 复现原始坏顺序、证明修复后存活，并在回退修复代码时
-  重新出现目标错误，避免测试空跑。 ^[PR #5157]
+  重新出现目标错误，避免测试空跑。两个 locator 共用 artifact 时，替换/逐出一条保留 readiness，最后移除才清理；核对替换与 entry/byte eviction 的字节计数。 ^[PR #5157] ^[PR #7781]
 
 ### SERV-3c — 内容身份必须原子贯穿全部缓存层
 

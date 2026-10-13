@@ -1,10 +1,10 @@
 ---
 title: "Scheduler release waiting queue 合同"
 created: 2026-10-06
-updated: 2026-10-06
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, scheduler]
-sources: ["PR #8459", "PR #6089", "PR #6360", "PR #6680", vllm_omni/core/sched/omni_scheduler_mixin.py, vllm_omni/core/sched/omni_generation_scheduler.py]
+sources: ["PR #8459", "PR #6089", "PR #6360", "PR #6680", vllm_omni/core/sched/omni_scheduler_mixin.py, vllm_omni/core/sched/omni_generation_scheduler.py, "PR #7781", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/core/sched/omni_scheduling_coordinator.py#L440-L476", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/core/sched/test_omni_scheduling_coordinator.py#L111-L139"]
 confidence: high
 ---
 
@@ -17,7 +17,8 @@ confidence: high
   `waiting`，优先访问 KV holder，connector state 只消费一次。park/restore/requeue
   依据 upstream `_holds_kv_blocks` 回到对应物理队列；移除依据实际 membership，不能
   依赖可能已被 input metadata 改写的 computed frontier。grammar、remote-KV 与
-  streaming-update 等 upstream blocked status 不得被 Omni readiness 覆写。
+  streaming-update 等 upstream blocked status 不得被 Omni readiness 覆写。park 从实际
+  container 移除：`running` list 使用 list API，upstream `RequestQueue` 使用其 queue API。
 - 强制：`deferred_waiting` 是独立的 blocked/deferred request set；恢复接纳和终态清理
   要同步它与两条物理队列。临时关闭 waiting admission 时两队一起保存/替换，在 `finally`
   恢复并保留顺序；reserved slots 对齐 `max_num_active_reqs`。generation path 同样先选
@@ -26,8 +27,9 @@ confidence: high
   remove；KV holder 恢复为 fresh 请求；因延迟输入覆盖 upstream blocked 状态。
 - 验收：AR/generation、full-payload/async-chunk、不同 queue policy 与双物理队列并存
   时覆盖 park→restore；检查 connector 单次消费、KV holder 优先、blocked waits 保持、
-  abort sweep、streaming counter 与跨队 CFG 配对。API import 成功不能代替此状态机验收。
-  ^[PR #8459]
+  abort sweep、streaming counter 与跨队 CFG 配对；另构造均非空的 running list 和 RequestQueue，
+  清除 readiness 后实际执行 park/remove 分支。API import 成功或空 running control 不能代替
+  此状态机验收。 ^[PR #8459] ^[PR #7781]
 
 ## SCHED-5g — resumable async-chunk 终态清理必须以 live queue 所有权为准
 

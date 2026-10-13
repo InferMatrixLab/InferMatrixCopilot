@@ -1,10 +1,10 @@
 ---
 title: "Qwen3-TTS 规则"
 created: 2026-07-20
-updated: 2026-09-22
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, models, serving, qwen-omni]
-sources: ["PR #5157", "PR #5202", "PR #5608", "PR #6001", "PR #6113", "PR #6523", "PR #6728", "PR #6861", vllm_omni/deploy/aura_omni.yaml, vllm_omni/deploy/qwen3_tts.yaml, vllm_omni/deploy/qwen3_tts_high_concurrency.yaml, vllm_omni/model_executor/models/aura_omni/pipeline.py, vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py, vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py, vllm_omni/model_executor/models/qwen3_tts/segmented_graph_wrapper.py, vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py, vllm_omni/model_executor/stage_input_processors/chunk_size_utils.py, vllm_omni/entrypoints/openai/serving_speech.py, vllm_omni/entrypoints/openai/serving_speech_stream.py, vllm_omni/entrypoints/openai/speech_usage.py, vllm_omni/entrypoints/openai/tts_adapters/qwen3_tts.py, vllm_omni/model_executor/stage_input_processors/qwen3_tts.py, tests/e2e/online_serving/test_qwen3_tts_base.py, tests/e2e/online_serving/test_qwen3_tts_base_expansion.py, tests/entrypoints/openai_api/test_serving_speech.py, tests/entrypoints/openai_api/test_serving_speech_stream.py, tests/entrypoints/openai_api/test_tts_adapter.py, tests/model_executor/models/qwen3_tts/test_qwen3_tts_code2wav.py, tests/model_executor/models/qwen3_tts/test_qwen3_tts_incremental_decode.py, tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py, "PR #5048", "PR #6639"]
+sources: ["PR #5157", "PR #5202", "PR #5608", "PR #6001", "PR #6113", "PR #6523", "PR #6728", "PR #6861", vllm_omni/deploy/aura_omni.yaml, vllm_omni/deploy/qwen3_tts.yaml, vllm_omni/deploy/qwen3_tts_high_concurrency.yaml, vllm_omni/model_executor/models/aura_omni/pipeline.py, vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py, vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py, vllm_omni/model_executor/models/qwen3_tts/segmented_graph_wrapper.py, vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py, vllm_omni/model_executor/stage_input_processors/chunk_size_utils.py, vllm_omni/entrypoints/openai/serving_speech.py, vllm_omni/entrypoints/openai/serving_speech_stream.py, vllm_omni/entrypoints/openai/speech_usage.py, vllm_omni/entrypoints/openai/tts_adapters/qwen3_tts.py, vllm_omni/model_executor/stage_input_processors/qwen3_tts.py, tests/e2e/online_serving/test_qwen3_tts_base.py, tests/e2e/online_serving/test_qwen3_tts_base_expansion.py, tests/entrypoints/openai_api/test_serving_speech.py, tests/entrypoints/openai_api/test_serving_speech_stream.py, tests/entrypoints/openai_api/test_tts_adapter.py, tests/model_executor/models/qwen3_tts/test_qwen3_tts_code2wav.py, tests/model_executor/models/qwen3_tts/test_qwen3_tts_incremental_decode.py, tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py, "PR #5048", "PR #6639", "PR #7781", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/stage_input_processors/qwen3_tts.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_ref_codes.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_silence_ban.py", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_stateless_capture.py"]
 confidence: high
 ---
 
@@ -18,7 +18,7 @@ confidence: high
 |---|---|---|
 | Qwen3-TTS、`qwen3_tts` pipeline | Q3TTS-1a/1b | `config/pipeline_registry.py::OMNI_PIPELINES["qwen3_tts"]`；`model_executor/models/qwen3_tts/pipeline.py` |
 | `ref_audio`、stored voice、task/checkpoint variant、x-vector、ICL、artifact-only reuse | Q3TTS-1a/1b/1c/1d | `entrypoints/openai/tts_adapters/qwen3_tts.py::{validate,_get_model_variant}` → `entrypoints/openai/serving_speech.py::_build_tts_params`、`_qwen3_tts_can_use_ref_audio_artifact_only`、`_track_ref_audio_artifact_warmup`、`_mark_ref_audio_artifact_ready_for_request` |
-| talker/code2wav、adaptive chunk、delta frame、request cache、segmented graph | Q3TTS-3a/3b/3c/3d/3e + Model Executor | `stage_input_processors/qwen3_tts.py::talker2code2wav_async_chunk` → `stage_input_processors/chunk_size_utils.py` → `qwen3_tts_code2wav.py::Qwen3TTSCode2Wav` → `segmented_graph_wrapper.py` |
+| talker/code2wav、native codec validity、重复 callback、implicit-position mask cache、adaptive chunk、segmented graph | Q3TTS-3a/3b/3c/3d/3e/3f/3g + Model Executor | `stage_input_processors/qwen3_tts.py::talker2code2wav_async_chunk` → `stage_input_processors/chunk_size_utils.py` → `qwen3_tts_code2wav.py::Qwen3TTSCode2Wav` → `segmented_graph_wrapper.py` |
 | OpenAI speech adapter | Q3TTS-1a/1b/1d + Serving | `entrypoints/openai/tts_adapters/qwen3_tts.py::Qwen3TTSAdapter` → `serving_speech.py` |
 | NPU、RoPE、BNSD/BSND、`codec_chunk_ramp` | Q3TTS-2a | `platforms/npu/models/qwen3_tts_tokenizer_v2.py::_apply_rotary_pos_emb_npu` → `platforms/npu/layers/rotary_embedding.py::npu_rotary_mul_with_bsnd_fallback` |
 
@@ -95,7 +95,7 @@ confidence: high
 ## Q3TTS-3a — async connector 只在首块传 prefix，后续只传 delta
 
 - 触发：`async_chunk=true` 的 Talker→Code2Wav 分块、ICL reference code、
-  x-vector-only 或 chunk ramp。
+  x-vector-only、chunk ramp、KV-resumed prefill 或重复 chunk callback。
 - 强制：首块包含有界 ICL ref prefix 和已完成 codec frames；后续块只传
   新完成 frames，`left_context_size=0`，依赖 Code2Wav 按 request 维护
   quantizer/conv/Transformer 状态。首个也是最后一个的短请求必须一次
@@ -103,8 +103,16 @@ confidence: high
 - 强制：async Code2Wav 缺 request ID 必须 fail fast；首个 ICL 状态若声明
   `ref_context_size` 却没有实际 prefix，也必须拒绝。非 async/stateless 路径
   继续传全序列，不要求 request ID。
-- 验收：ICL/xvec、ramp/固定 initial chunk、首块即 final、空 EOF、丢失
-  request ID/ref prefix，并证明后续 payload 没有重发旧 frames。 ^[PR #5202]
+- 强制：首次可用 reference codes 按请求只发布一次，包括 KV-resumed prefill；无 ref 的请求
+  保留 batch-aligned 空 entry。consumer 保留 ref 供首次 decoder 初始化。重复 callback 不重发
+  已发 frames；terminal 只 flush 未发余帧，没有余帧仍发送带 request ID 的 empty-finished sentinel。
+- 禁止：用“当前是否 prefill”替代 ref 发布状态；因重复完成回调重放最后一个 chunk，或把另一
+  请求的 ref 填入空 slot。
+- 验收：ICL/xvec、ramp/固定 initial chunk、首块即 final、空 EOF、丢失 request ID/ref prefix；
+  KV-resumed 输出连续调用两次只发布一次 ref；重复 nonterminal、整块边界 EOF、partial final、
+  再次 terminal 和 mixed-ref batch 均保持帧与 ref 请求归属正确。^[PR #5202] ^[PR #7781]
+  回归入口：[ref publication](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_ref_codes.py#L109-L145)、
+  [callback/EOF](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py#L39-L73)。
 
 ## Q3TTS-3b — decoder state 必须以 scheduler ID 定位且在所有终止边界释放
 
@@ -192,12 +200,45 @@ confidence: high
 共享 readiness/错误隔离规则见 [Serving rules](../../components/serving/rules.md)；
 Qwen 家族入口见 [Qwen-Omni](../qwen-omni/_index.md)。
 
+## Q3TTS-3f — codec frame validity 必须对应已处理的 input token
+
+- 触发：修改 Talker preprocess、`make_omni_output`、`codec_frame_valid` 或 async frame selection。
+- 强制：prefill/replay span 标无效；正常 decode 按已处理 input token 是否属于 codec vocabulary
+  标有效。consumer 使用显式 validity，多行 span 与选取的最后 audio row 对齐；刚采到 EOS
+  时仍保留前一 input token 的真实 frame，显式有效的全零码也必须保留。
+- 禁止：依据新采样 EOS 或 output history 丢弃当前真实 frame；用 `codes.any()` 覆盖显式
+  validity；把 prefill placeholder 当音频。缺字段时的旧 producer fallback 不得描述为能辨别
+  有效零码。
+- 验收：覆盖 prefill/replay、非零 invalid frame、全零 valid frame、刚采到 EOS 的真实尾帧，
+  以及多行 validity 最后一项选择和 scalar/batch 一致性；测试要求不等于这些边界均已有通过证据。
+  ^[PR #7781] 源码与回归入口：
+  [validity producer](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py#L1056-L1090)、
+  [consumer 与 frame tests](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py#L274-L359)。
+
+## Q3TTS-3g — sliding-mask cache 只复用于 implicit-position stateless decode
+
+- 触发：修改 Qwen3-TTS tokenizer decoder attention-mask 缓存或 stateless CUDA capture。
+- 强制：只有没有显式 attention mask、positions、cache positions、past KV 且未启用 cache
+  的调用才复用该缓存；key 保留 sequence length、dtype、device、attention implementation，
+  module placement/dtype 变化清空缓存。其余调用使用 live/prepared mask。
+- 禁止：仅因 length 相同就把 implicit zero-based mask 用于显式或增量 positions；通过读取
+  CUDA tensor 值推断可缓存性；用 legacy wrapper 测试代替 production segmented capture。
+- 验收：implicit cached path 对照独立 live-mask path，explicit/incremental path 不误命中；
+  dtype/device 迁移后缓存失效；真实 capture 后换输入并 replay，与 eager 对照。小型 decoder
+  的有限 shape 测试不能外推为任意 position pattern、完整 checkpoint 或跨平台验证。
+  ^[PR #7781] 源码与回归入口：
+  [cache eligibility/invalidation](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py#L533-L661)、
+  [production capture](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_stateless_capture.py#L21-L100)。
+
 ## Q3TTS-4a — silence codec ban 必须按 checkpoint 词表和 x-vector-only mode 生效
 
-- 触发：修改 Qwen3-TTS Base voice-clone 的 leading silence 行为、`silence_ban_frames`、talker codec mask 或 x-vector/ICL mode resolution。
+- 触发：修改 Qwen3-TTS Base voice-clone 的 leading silence 行为、`silence_ban_frames`、talker codec mask、x-vector/ICL mode resolution 或 MRv2 sampling context。
 - 强制：默认 `silence_ban_frames=0`；加载 checkpoint 后通过 `_encode_ref_audio_batch` 编码多种静音样本并只收集 codebook-0 ids，词表为空、越界或明显过大时记录 warning、清空启用值并禁用功能。decode 时只对 Base 的 x-vector-only request 在前 N 个 history steps 屏蔽派生 ids；mode resolution 必须与 prompt builder 一致，`voice_clone_prompt.icl_mode` 覆盖和未记录 mode 都要正确处理。
-- 禁止：硬编码当前 checkpoint 的 12 个 token、把 mask 施加到 ICL 或非 Base 请求、对不可信派生词表只做部分 masking，或把经验值 `N=3` 当成跨 checkpoint 的固定最优参数。
-- 验收：覆盖默认关闭、有效派生、空/越界/ oversized 派生和 encoder failure；覆盖 step 边界、mixed x-vector/ICL batch、ICL 与非目标请求保持未修改，以及实际 stage 配置能到达 talker。^[PR #5048]
+- 强制：MRv2 按本步请求顺序结合 live generated-token count，只在 sampling context 应用前 N 步 mask；正常与异常退出都清空临时 mask。
+- 禁止：硬编码当前 checkpoint 的 12 个 token、把 mask 施加到 ICL 或非 Base 请求、对不可信派生词表只做部分 masking，或把经验值 `N=3` 当成跨 checkpoint 的固定最优参数；让 sampling mask 污染随后 prompt logprobs，或用独立模型 counter 在 resume 后重启窗口。
+- 验收：覆盖默认关闭、有效派生、空/越界/ oversized 派生和 encoder failure；覆盖 step 边界、mixed x-vector/ICL batch、ICL 与非目标请求保持未修改，以及实际 stage 配置能到达 talker；MRv2 重排 mixed-mode/mixed-step batch 后 mask 仍对齐，context 外 prompt logits 和异常退出后均无遗留 mask。^[PR #5048] ^[PR #7781]
+  源码与回归入口：[sampling scope](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py#L1252-L1267)、
+  [scope/order test](https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_silence_ban.py#L82-L103)。
 
 ## Q3TTS-4b — Base codec token exhaustion 必须丢弃不完整音频
 

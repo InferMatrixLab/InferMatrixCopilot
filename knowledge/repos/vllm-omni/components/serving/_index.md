@@ -58,4 +58,4 @@ sources: []
 
 - [Realtime model-context 自动截断合同](rules-realtime-truncation.md)。
 
-- [多模态 processor cache 的 replica identity 合同](rules-multimodal-cache.md)。
+- [多模态缓存身份与存储合同](rules-multimodal-cache.md) — replica UUID 隔离、waveform buffer 所有权与 array/list 复用边界。

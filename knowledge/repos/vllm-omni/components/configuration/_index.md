@@ -1,7 +1,7 @@
 ---
 title: "vLLM-Omni Configuration"
 created: 2026-07-16
-updated: 2026-10-06
+updated: 2026-10-09
 type: index
 tags: [vllm-omni, components, config]
 sources: ["claude-workflow-starter-private@296ea45", vllm_omni/config/]
@@ -53,7 +53,7 @@ sources: ["claude-workflow-starter-private@296ea45", vllm_omni/config/]
 | 添加新模型和注册点 | [adding a model](adding-a-model.md) |
 | composable strategy、并行拓扑、VAE batch mode 的 WORLD→DP 门禁与 load balancing owner | [并行拓扑合同](rules-parallel-topology.md) |
 
-| 冻结 topology、辅助 stage、mixed V1/MRv2 runner、deploy profile 与 `additional_config` 投影 | [topology 与部署 profile](rules-topology-profiles.md) |
+| 冻结 topology、辅助 stage、mixed V1/MRv2 runner、native capability 缺失警告、deploy profile 与 `additional_config` 投影 | [topology 与部署 profile](rules-topology-profiles.md) |
 
 - [部署 platform overlay 的最终配置合同](rules-platform-overlays.md)。
 - [配置规则 — CUDA graph 显存预留与 KV 预算](rules-cudagraph-kv-reserve.md)

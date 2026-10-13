@@ -1,7 +1,7 @@
 ---
 title: "Model Executor"
 created: 2026-07-10
-updated: 2026-10-06
+updated: 2026-10-09
 type: index
 tags: [vllm-omni, components, model-executor]
 sources: []
@@ -54,7 +54,7 @@ sources: []
 - [显式seed、whole-MTPgraph与NVIDIA/ROCm抽样边界](rules-request-rng.md)。
 - [异步output slab、producer事件与storage所有权](rules-output-snapshots.md)。
 
-- [MRv2 aux tree、narrow sampler、sampled embedding 与 generation输出](rules-mrv2-output-contracts.md)。
+- [MRv2 aux tree、MTP capability、generation 输出与 native delivery 生命周期](rules-mrv2-output-contracts.md) — EXEC-MRV2-1a–1g；native materialization 线程 owner、terminal/abort fence 和 delivery quarantine。
 
 - [settled row predicate与preemption replay fallback](rules-settled-preprocess.md)。
 

@@ -41,13 +41,13 @@ sources: [vllm_omni/core/sched/omni_ar_scheduler.py, vllm_omni/core/sched/omni_g
 | 理解调度器继承链、KV transfer 与 prefix cache 语义 | [architecture](architecture.md) |
 | 按 PR 描述直达 prefix cache、token budget、upstream 接口或 side-stream 首批源码 | [rules / Direct 代码快速入口](rules.md#direct-代码快速入口) |
 
-- [rules-shared-lifecycle](rules-shared-lifecycle.md) — SCHED-6a2 共享生命周期；SCHED-1c 核对 `OmniPrefixCacheManager` 的 same-step prefetch version 重规划。
+- [rules-shared-lifecycle](rules-shared-lifecycle.md) — SCHED-6a2 共享生命周期与 native readiness inbox；SCHED-1c 核对 `OmniPrefixCacheManager` 的 same-step prefetch version 重规划。
 
 - [Running prefix-cache reset 能力](rules-prefix-reset-capability.md) — active request 的拓扑能力检查与拒绝边界。
 
 - [release 双 waiting queue、deferred set 与 resumable cleanup：SCHED-RELEASE-1a、SCHED-5g](rules-release-queues.md)。
 
-- [empty terminal、staged-payloadreceivegate与tail守恒](rules-stream-terminals.md)。
+- [empty terminal、staged receivegate、执行 step 终态与 code payload admission](rules-stream-terminals.md) — SCHED-STREAM-1a–1c。
 
 - [native sender-only admission 与 opt-in first-chunk express](rules-first-chunk-express.md)。
 - [Async-chunk prewarm 规则](rules-async-chunk-prewarm.md)

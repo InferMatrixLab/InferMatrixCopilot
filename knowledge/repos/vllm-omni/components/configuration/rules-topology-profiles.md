@@ -1,10 +1,10 @@
 ---
 title: "topology 与部署 profile 合同"
 created: 2026-09-04
-updated: 2026-10-06
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, config]
-sources: ["PR #4222", "PR #4795", "PR #5604", "PR #5842", "PR #5885", "PR #6082", vllm_omni/config/stage_config.py, vllm_omni/config/config_factory.py, vllm_omni/engine/stage_init_utils.py, vllm_omni/engine/stage_runtime.py, tests/engine/test_async_omni_engine_stage_init.py, vllm_omni/deploy/, "PR #6186", "PR #6813", "PR #6291", "PR #6829", vllm_omni/config/pipeline_registry.py, tests/config/test_config_factory.py, tests/config/test_omni_config.py, tests/config/test_pipeline_registry.py, tests/utils/test_tracking_parser.py, "PR #6230", vllm_omni/entrypoints/utils.py, tests/entrypoints/test_serve.py, tests/entrypoints/test_utils.py, "PR #7272", "PR #8184"]
+sources: ["PR #4222", "PR #4795", "PR #5604", "PR #5842", "PR #5885", "PR #6082", vllm_omni/config/stage_config.py, vllm_omni/config/config_factory.py, vllm_omni/engine/stage_init_utils.py, vllm_omni/engine/stage_runtime.py, tests/engine/test_async_omni_engine_stage_init.py, vllm_omni/deploy/, "PR #6186", "PR #6813", "PR #6291", "PR #6829", vllm_omni/config/pipeline_registry.py, tests/config/test_config_factory.py, tests/config/test_omni_config.py, tests/config/test_pipeline_registry.py, tests/utils/test_tracking_parser.py, "PR #6230", vllm_omni/entrypoints/utils.py, tests/entrypoints/test_serve.py, tests/entrypoints/test_utils.py, "PR #7272", "PR #8184", "PR #7781", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/config/stage_config.py#L1042-L1052", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/config/test_config_factory.py#L2728-L2745"]
 confidence: high
 ---
 
@@ -130,5 +130,6 @@ confidence: high
 
 - 触发：修改 `StageDeployConfig.model_runner`、runner resolution、平台overlay或 mixed V1/MRv2 pipeline。
 - 强制：stage的`v1|v2`覆盖deploy默认，legacy/structured两路把同一结果投影到`use_v2_model_runner`；native MRv2、存在upstream input的stage只允许`session_mode=turn`。平台V1 fallback清除既有stage V2 opt-in，完成platform stage overlay后再校验最终值；NPU/XPU最终含任一V2仍须拒绝。
-- 禁止：只按pipeline默认选择runner；通过free-form engine args绕过structured owner；让native下游MRv2接受streaming/duplex；在平台overlay前校验一次后漏掉stage override。
-- 验收：stage/deploy precedence、invalid runner、native turn/control与非turn拒绝、V1平台fallback及overlay后NPU/XPU拒绝都覆盖legacy/structured结果。^[PR #8184]
+  其它门禁通过后，最终选择 V2 但 stage 未声明 `supports_native_mrv2_data_plane` 时，保留所选 runner，并警告具体 stage/architecture、legacy transport 路径与该组合未验证。
+- 禁止：只按pipeline默认选择runner；通过free-form engine args绕过structured owner；让native下游MRv2接受streaming/duplex；在平台overlay前校验一次后漏掉stage override；静默接受未声明能力的 V2 组合，或把 transport fallback 描述为 runner 自动回退或 backend 已获支持。
+- 验收：stage/deploy precedence、invalid runner、native turn/control与非turn拒绝、V1平台fallback及overlay后NPU/XPU拒绝都覆盖legacy/structured结果；实际 merge 入口覆盖 `(V1,false)`、`(V2,false)`、`(V2,true)`，仅 `(V2,false)` 产生含 stage 与 legacy transport 信息的 warning。^[PR #8184] ^[PR #7781]

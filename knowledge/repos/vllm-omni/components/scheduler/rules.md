@@ -1,10 +1,10 @@
 ---
 title: "Scheduler 规则"
 created: 2026-07-16
-updated: 2026-10-06
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, scheduler]
-sources: ["PR #8459", "PR #8259", "PR #5957", "PR #5976", tests/core/sched/test_omni_ar_scheduler_stale_drain.py, tests/core/sched/test_omni_ar_scheduler_streaming.py, "vllm-omni-rebase-agent@122a9468:agent/skills/fix-talker-truncated-prefill-prefix-cache-key-cap/SKILL.md", "vllm-omni-rebase-agent@122a9468:agent/skills/gpu-hang-low-max-num-batched-tokens/SKILL.md", vllm_omni/worker/gpu_ar_model_runner.py, vllm_omni/core/prefix_cache.py, vllm_omni/utils/mm_outputs.py, vllm_omni/core/sched/omni_ar_scheduler.py, vllm_omni/core/sched/omni_generation_scheduler.py, vllm_omni/core/sched/omni_scheduler_mixin.py, vllm_omni/core/sched/omni_scheduling_coordinator.py, vllm_omni/core/sched/output.py, tests/core/test_prefix_cache.py, tests/core/test_prefix_cache_async_write.py, tests/core/sched/test_omni_scheduler_mixin_shared.py, tests/core/sched/test_omni_scheduler_mixin_timeouts.py, tests/distributed/omni_connectors/test_chunk_transfer_adapter.py, tests/utils/test_mm_outputs.py, tests/entrypoints/test_omni_new_request_data.py, "PR #4106", "PR #5310", "PR #5461", "PR #4795", "PR #5842", "PR #6021", "PR #6033", "PR #6089", "PR #6149", "PR #6360", "PR #6406", "PR #6150", "PR #6619", "PR #6680", "PR #6626", "PR #6529", tests/core/sched/test_omni_ar_scheduler_aborted_queue_sweep.py, tests/core/sched/test_omni_scheduler_streaming_input_counter.py, tests/core/sched/test_omni_sched_deferred_free_fence.py, "PR #6831", tests/e2e/online_serving/test_nemotron_voicechat_duplex.py]
+sources: ["PR #8459", "PR #8259", "PR #5957", "PR #5976", tests/core/sched/test_omni_ar_scheduler_stale_drain.py, tests/core/sched/test_omni_ar_scheduler_streaming.py, "vllm-omni-rebase-agent@122a9468:agent/skills/fix-talker-truncated-prefill-prefix-cache-key-cap/SKILL.md", "vllm-omni-rebase-agent@122a9468:agent/skills/gpu-hang-low-max-num-batched-tokens/SKILL.md", vllm_omni/worker/gpu_ar_model_runner.py, vllm_omni/core/prefix_cache.py, vllm_omni/utils/mm_outputs.py, vllm_omni/core/sched/omni_ar_scheduler.py, vllm_omni/core/sched/omni_generation_scheduler.py, vllm_omni/core/sched/omni_scheduler_mixin.py, vllm_omni/core/sched/omni_scheduling_coordinator.py, vllm_omni/core/sched/output.py, tests/core/test_prefix_cache.py, tests/core/test_prefix_cache_async_write.py, tests/core/sched/test_omni_scheduler_mixin_shared.py, tests/core/sched/test_omni_scheduler_mixin_timeouts.py, tests/distributed/omni_connectors/test_chunk_transfer_adapter.py, tests/utils/test_mm_outputs.py, tests/entrypoints/test_omni_new_request_data.py, "PR #4106", "PR #5310", "PR #5461", "PR #4795", "PR #5842", "PR #6021", "PR #6033", "PR #6089", "PR #6149", "PR #6360", "PR #6406", "PR #6150", "PR #6619", "PR #6680", "PR #6626", "PR #6529", tests/core/sched/test_omni_ar_scheduler_aborted_queue_sweep.py, tests/core/sched/test_omni_scheduler_streaming_input_counter.py, tests/core/sched/test_omni_sched_deferred_free_fence.py, "PR #6831", tests/e2e/online_serving/test_nemotron_voicechat_duplex.py, "PR #7781", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/core/sched/omni_generation_scheduler.py#L112-L133", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/core/sched/omni_generation_scheduler.py#L190-L213", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/core/sched/omni_generation_scheduler.py#L244-L262"]
 ---
 
 # Scheduler 规则
@@ -26,6 +26,7 @@ PR 描述先命中下表，再打开对应规则组和首批源码；changed fil
 | side-stream D2H、pinned host tensor、源 buffer 复用 | SCHED-4a/4b | `worker/gpu_ar_model_runner.py::_copy_tensor_payload_to_cpu`、`_get_or_create_omni_payload_copy_stream`；`core/prefix_cache.py` 的 async copy 路径 |
 | sampled-token logprobs、spec decode trim、request-local output error | SCHED-5a | `core/sched/omni_ar_scheduler.py::_slice_sampled_logprobs`、`update_from_output` |
 | stateful async chunk、full-payload input、KV cleanup | SCHED-5b/5c | `core/sched/omni_generation_scheduler.py`、`omni_scheduling_coordinator.py`、`omni_ar_scheduler.py::_free_request` |
+| native chunk 的 terminal step、空 token prompt 与真实 code payload | [SCHED-STREAM-1b/1c](rules-stream-terminals.md) | `omni_scheduling_coordinator.py::get_scheduled_input_terminal_req_ids` → generation scheduler admission/finish |
 | KV extraction wait、connector acknowledgement、partial interval cleanup | SCHED-5h | `core/sched/omni_ar_scheduler.py::{_free_request,update_from_output}` → scheduler stats → orchestrator metrics |
 | consumed chunk validation failure、receive ledger、live request termination | SCHED-5i | `core/sched/omni_scheduler_mixin.py::_process_chunk_receive_failures` → `chunk_transfer_adapter.py` |
 | async stop、streaming update、scheduled/async stale token fence、abort queue/counter drift | SCHED-6a/6f | `core/sched/omni_ar_scheduler.py::{_handle_stopped_request,update_from_output}` → scheduler mixin abort sweep/counter resync → streaming/stale tests |
@@ -204,15 +205,20 @@ modules=[online_serving, worker_runner]，status=active，run_count=38，2026-06
 
 ## SCHED-5b — stateful async-chunk request 必须占用调度容量
 
-- 触发：模型在等待下一 chunk 时保留 runner state，或 full-payload connector 负责把下
-  一段重新送入 generation stage。
+- 触发：模型在等待下一 chunk 时保留 runner state、native generation 重新接纳已完成的
+  chunk，或 full-payload connector 负责把下一段重新送入 generation stage。
 - 强制：`retains_state_across_chunks` 为真时，把 connector 中等待 chunk 的 request
   计入 `max_num_seqs`；full-payload consumer 在 chunk 到达时重新进入 waiting queue，
-  不要被 base scheduler 提前停放。
-- 禁止：只按 `running` list 计数导致超额 admission；把 connector-fed chunk 当成 API
-  streaming update；仅在 abort 路径释放 receiver。
+  不要被 base scheduler 提前停放。native stateless request 仅在当前 output 已结算后
+  释放执行槽并排到 waiting 尾部，保留 request-owned model/KV state 与 `WAITING_FOR_CHUNK`；
+  running 与 restored waiting 中仍有 in-flight tokens 的请求均不得重复执行，也不能阻塞其他就绪流。
+- 禁止：stateful 请求只按 `running` list 计数导致超额 admission；把 connector-fed chunk 当成 API
+  streaming update；仅在 abort 路径释放 receiver；把执行槽释放等同 model/KV 清理，或让
+  同一请求的两个 native chunks 同时拥有执行槽。
 - 验收：mixed batch 覆盖等待 chunk 的容量上限、full-payload requeue、normal finish
-  的 receiver cleanup 和 abort/replica-loss cleanup。
+  的 receiver cleanup 和 abort/replica-loss cleanup；stateless/stateful controls 分别验证
+  chunk requeue 后的容量、状态保留、无新输入不重复执行，以及 running/waiting 的 in-flight
+  guard 和其他 ready request 继续接纳。 ^[PR #7781]
 
 ## SCHED-5c — stage-0 final request 的 KV transfer 例外必须显式标记
 

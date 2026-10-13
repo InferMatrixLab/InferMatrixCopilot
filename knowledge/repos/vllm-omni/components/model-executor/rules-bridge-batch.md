@@ -1,10 +1,10 @@
 ---
 title: "跨 stage bridge 与 batch 合同"
 created: 2026-09-04
-updated: 2026-09-05
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, model-executor]
-sources: ["PR #3422", "PR #3642", "PR #4795", "PR #5073", "PR #5074", "PR #5310", "PR #5792", "PR #5842", "PR #5957", "PR #5976", "PR #6422", vllm_omni/worker/gpu_ar_model_runner.py, vllm_omni/worker/gpu_model_runner.py, vllm_omni/model_executor/models/higgs_audio_v3/higgs_audio_v3_talker.py, vllm_omni/core/sched/output.py, vllm_omni/utils/mm_outputs.py, tests/model_executor/models/higgs_audio_v3/test_higgs_audio_v3.py, "PR #4765", "PR #5666", "PR #5491", "PR #6186", "PR #5452", "vllm_omni/worker/output/payload_build.py", "PR #6406"]
+sources: ["PR #3422", "PR #3642", "PR #4795", "PR #5073", "PR #5074", "PR #5310", "PR #5792", "PR #5842", "PR #5957", "PR #5976", "PR #6422", vllm_omni/worker/gpu_ar_model_runner.py, vllm_omni/worker/gpu_model_runner.py, vllm_omni/model_executor/models/higgs_audio_v3/higgs_audio_v3_talker.py, vllm_omni/core/sched/output.py, vllm_omni/utils/mm_outputs.py, tests/model_executor/models/higgs_audio_v3/test_higgs_audio_v3.py, "PR #4765", "PR #5666", "PR #5491", "PR #6186", "PR #5452", "vllm_omni/worker/output/payload_build.py", "PR #6406", "PR #7781", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/vllm_omni/worker_v2/omni_ar_model_runner.py#L531-L578", "https://github.com/vllm-project/vllm-omni/blob/2e3c7fe2c171cd3429298094d175a64eacbdb341/tests/worker_v2/test_omni_ar_model_runner.py#L237-L253"]
 confidence: high
 ---
 
@@ -145,9 +145,9 @@ Direct 代码快速入口；loader 与 checkpoint 合同留在该页的 `EXEC-2x
 ## EXEC-1n — 多请求 payload 与共享调度状态必须保持 request ownership
 
 - 触发：修改 AR/generation runner 的 multimodal payload 路由、prefix-cache 合并、sparse `meta.req_id`，或模型 KV-transfer metadata 与 downstream payload memoization。
-- 强制：先由共享 resolver 校验 nested/flattened sparse declaration，按 `meta.req_id` 建立 sparse index；payload builder 按 request id/index 取值并过滤协议 metadata，singleton list 只作 request-invariant broadcast；合并模型 KV metadata 必须 copy-on-write，`omni_final_stage_id` 未到达前只能保守返回且不得缓存，获取失败原样抛出。
-- 禁止：用 batch index 代替 sparse index、用 `v[0]` 替代越界多元素值、把请求数据广播给另一 request、原地修改 scheduler-owned dict，或吞掉 transfer metadata 异常。
-- 验收：mixed batch 覆盖 sparse subset、combined prefix-cache/direct path、singleton broadcast、越界丢 key、nested/flat conflict、scheduler 原对象不变、marker 到达后 memoization 更新及异常传播；断言每个 request 只收到自己的 payload。 ^[PR #5452]
+- 强制：先由共享 resolver 校验 nested/flattened sparse declaration，按 `meta.req_id` 建立 sparse index；payload builder 按 request id/index 取值并过滤协议 metadata，singleton list 只作 request-invariant broadcast。选出 per-request list 元素后，其内部 tensor 使用 request-local axis，递归处理保留该所有权，不再按全 batch 的 token offset 切片；合并模型 KV metadata 必须 copy-on-write，`omni_final_stage_id` 未到达前只能保守返回且不得缓存，获取失败原样抛出。
+- 禁止：用 batch index 代替 sparse index、用 `v[0]` 替代越界多元素值、把请求数据广播给另一 request、因局部 tensor 长度恰等于 real/padded batch token 数而二次切片、原地修改 scheduler-owned dict，或吞掉 transfer metadata 异常。
+- 验收：mixed batch 覆盖 sparse subset、combined prefix-cache/direct path、singleton broadcast、越界丢 key、nested/flat conflict、scheduler 原对象不变、marker 到达后 memoization 更新及异常传播；另覆盖 prefill/decode 两种顺序、局部 frame 数分别与 real/padded token 数相等及 nested list/dict，断言每个 request 收到完整的自身 payload。 ^[PR #5452] ^[PR #7781]
 
 ## EXEC-1o — generation runner 必须逐请求构造 batch 输出并保持 zero-token 控制流
 
