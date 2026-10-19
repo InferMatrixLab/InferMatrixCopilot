@@ -1,10 +1,10 @@
 ---
 title: "VoxCPM2 请求噪声规则"
 created: 2026-09-22
-updated: 2026-10-06
+updated: 2026-10-19
 type: rule
 tags: [vllm-omni, models]
-sources: ["PR #7866", "PR #7010"]
+sources: ["PR #7866", "PR #7010", "PR #8311"]
 ---
 
 # VoxCPM2 请求噪声规则
@@ -29,3 +29,12 @@ sources: ["PR #7866", "PR #7010"]
 - 强制：三字段只从 `_VoxCPM2RuntimeConfig` 消费，默认 `10`、`2.0`、`1.0`；`inference_timesteps` 钳制到至少 `2`，`cfg_value` 必须有限，否则初始化失败，`cfg_cutoff_ratio` 夹至 `[0,1]`。所有 solver 路径使用同一已解析值。
 - 禁止：让 CFG-Zero* 的一阶输入跳过全部 estimator 并返回原始噪声；让 NaN/inf CFG 流入 solver；在 talker 或 graph path 保留另一套硬编码默认。有限负 CFG 当前仍可解析，不能把未实现的非负门禁写成已有合同。
 - 验收：覆盖负/0/1/2/4/10 timesteps、非有限 CFG、cutoff 两端以及不同 batch size；断言 estimator 调用数、有限且非原始噪声的输出、输入 noise 未被修改，以及省略配置的默认保持。^[PR #7010]
+
+## VLLM-OMNI-PR8311-VOXCPM2-DEFAULT-SYNC — VoxCPM2 运行时默认值翻转必须与 deploy YAML 的 hf_overrides pin 对账
+
+- 触发：修改 `_VoxCPM2RuntimeConfig`（`vllm_omni/model_executor/models/voxcpm2/runtime_config.py`）的运行时开关默认值（如 `enable_batched_fsq_fusion`、`enable_batched_prefill_tail` 由 False 改 True），或增删 `vllm_omni/deploy/voxcpm2.yaml` 对应 stage `hf_overrides` 中的同名运行时字段。
+- 强制：`voxcpm2.yaml` 的 `hf_overrides` 值优先于 dataclass 默认，且两者可以有意不同（如 `unified_decode_graph_max_batch_size` 在 YAML pin 为 8、dataclass 默认 64）。翻转 dataclass 默认时必须在同一 PR 对账 YAML 是否 pin 该字段：本例两个批处理开关在翻转默认的同时以 `true` 显式写入 YAML；对已 pin 的字段，只改 dataclass 不会改变 bundled 部署的实际取值。把批处理/融合开关由默认关闭改为默认开启属于改变执行路径的决定，须附目标硬件实测收益（本例 Ascend 910B3 TTFP -103ms）与音频质量回归（WAV 输出无退化），且单硬件结果不得外推为全平台承诺。
+- 禁止：只改 `runtime_config.py` 或只改 YAML 而未对账另一侧的最终生效值；把 dataclass 默认与 YAML pin 的有意分歧（如 `unified_decode_graph_max_batch_size` 64 vs 8）当作必须消除的错误；以 kernel dispatch 开销降低的推断代替基准数据；默认开启改变执行路径的开关而不做输出质量验证。
+- 验收：逐字段核对翻转后 dataclass 默认与 YAML `hf_overrides` 的最终取值符合意图（未 pin 字段吃到新默认，已 pin 字段显式更新或保持 pin），并随 PR 提交开启前后的 TTFP/延迟基准与音频质量检查结果。^[PR #8311]
+
+<!-- kb:rule status=active since=v0.30.0 -->

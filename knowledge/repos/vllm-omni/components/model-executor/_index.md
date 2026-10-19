@@ -64,3 +64,4 @@ sources: []
 - [Model Executor — Dynamo/cudagraph compile guard rules](rules-compile-guard.md)
 - [Model Executor — INC/AutoRound 量化配置规则](rules-inc-autoround.md)
 - [Model Executor — Orchestration Loop Rules](rules-orchestration-loop.md)
+- [MOSS codec 解码性能与数值规则](rules-moss-codec-perf.md)

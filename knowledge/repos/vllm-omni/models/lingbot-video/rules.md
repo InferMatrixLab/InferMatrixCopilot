@@ -1,10 +1,10 @@
 ---
 title: "LingBot-Video 规则"
 created: 2026-08-10
-updated: 2026-10-06
+updated: 2026-10-19
 type: rule
 tags: [vllm-omni, models, diffusion]
-sources: [vllm_omni/diffusion/models/lingbot_video/request_utils.py, vllm_omni/diffusion/models/lingbot_video/image_condition.py, vllm_omni/diffusion/models/lingbot_video/pipeline_lingbot_video.py, vllm_omni/entrypoints/openai/serving_video.py, vllm_omni/model_extras/lingbot_video.py, vllm_omni/model_extras/registry.py, examples/offline_inference/text_to_image/text_to_image.py, examples/offline_inference/image_to_video/image_to_video.py, tests/diffusion/models/lingbot_video/test_request_utils.py, tests/diffusion/models/lingbot_video/test_image_condition.py, tests/diffusion/models/lingbot_video/test_pipeline_lingbot_video.py, tests/entrypoints/openai_api/test_image_server.py, tests/entrypoints/openai_api/test_video_server.py, "PR #5311", "PR #5976", "PR #6049", "Issue #5883", "PR #7037"]
+sources: [vllm_omni/diffusion/models/lingbot_video/request_utils.py, vllm_omni/diffusion/models/lingbot_video/image_condition.py, vllm_omni/diffusion/models/lingbot_video/pipeline_lingbot_video.py, vllm_omni/entrypoints/openai/serving_video.py, vllm_omni/model_extras/lingbot_video.py, vllm_omni/model_extras/registry.py, examples/offline_inference/text_to_image/text_to_image.py, examples/offline_inference/image_to_video/image_to_video.py, tests/diffusion/models/lingbot_video/test_request_utils.py, tests/diffusion/models/lingbot_video/test_image_condition.py, tests/diffusion/models/lingbot_video/test_pipeline_lingbot_video.py, tests/entrypoints/openai_api/test_image_server.py, tests/entrypoints/openai_api/test_video_server.py, "PR #5311", "PR #5976", "PR #6049", "Issue #5883", "PR #7037", "PR #8651"]
 ---
 
 # LingBot-Video 规则
@@ -97,3 +97,12 @@ sources: [vllm_omni/diffusion/models/lingbot_video/request_utils.py, vllm_omni/d
 - 验收：同时覆盖 formatter 的 image/video key、T2I 单帧 shape、TI2V input cardinality、最终
   image size limit、frame-count precedence 和 n>1 的 400；FP32/BF16 与 omitted/pt/np 的黑、中灰、白须穿过真实 API frame conversion 后保持原 `[0,1]` 值，不能只测全白；bare pt 与 latent identity control 保持。^[PR #7037] PR 所报 H200 单次耗时、峰值显存与
   bitwise parity 缺少本知识树可复跑的命令/产物，不能作为性能或精度 gate。
+
+## VLLM-OMNI-PR8651-LBV-DEVICE-AUTOCAST — autocast 的 device_type 必须取自真实设备，cuDNN 布局与权重 dtype 门各守其位
+
+- 触发：修改 `vllm_omni/diffusion/models/lingbot_video/` 中 `lingbot_video_transformer.py` 的 `apply_rotary_emb`、`pipeline_lingbot_video.py` 的 `_transformer_autocast`/`_decode_latents`、`image_condition.py` 的 `encode_clean_image_latent` 的 autocast/half-precision 路径或 `channels_last_3d` 布局，或在 `docs/models/supported_models.md` 为 `LingBotVideoPipeline` 勾选新硬件列。
+- 强制：autocast 上下文的 `device_type` 必须来自真实张量/模块 device：`apply_rotary_emb` 的禁用保护写 `torch.amp.autocast(device_type=x.device.type, enabled=False)`——硬编码 `"cuda"` 的禁用保护在 XPU 等设备上是无效 no-op。各路径的启用条件归属不同：`encode_clean_image_latent` 在所有非 CPU 设备上启用 bf16 autocast（`enabled=vae_device.type != "cpu"`），不检查权重 dtype；`_transformer_autocast` 与 `_decode_latents` 以 `device.type == "cpu"` 为唯一设备排除条件，且 autocast dtype 另有 fp16/bf16 权重 dtype 门。`channels_last_3d` 是 cuDNN VAE 路径，仅当 `vae_device.type == "cuda"` 且 latents 为 5D 时应用；`torch._grouped_mm` 保持 CUDA-only。支持矩阵新勾选硬件（本例 XPU）必须与上述 device 合同同批落地。
+- 禁止：把 autocast 的 device_type 硬编码为 `"cuda"`；用 `device.type != "cuda"` 把 XPU 等非 CUDA 加速卡排除在 half-precision 之外；在非 CUDA 设备上套用 `channels_last_3d`；声称 encode 路径存在权重 dtype 门或要求未来改动为其添加证据中不存在的门；未按 device 合同验证就勾选支持矩阵。
+- 验收：按路径核对启用条件——encode：非 CPU（含 fp32 权重）开启、CPU 关闭；transformer/decode：非 CPU 且 fp16/bf16 权重才开启；CUDA 5D decode 使用 `channels_last_3d` 而其他设备布局不变；`_grouped_mm` 仍 CUDA-only；支持矩阵勾选与代码合同一致。^[PR #8651]
+
+<!-- kb:rule status=active since=v0.30.0 -->
