@@ -139,6 +139,18 @@ jobs:
                   bad.append(f"{name}: {d} has no {marker}")
           if bad:
               sys.exit("wheel runtime data broken: " + "; ".join(bad))
+          video_skill = importlib.resources.files("infermatrix_copilot").joinpath(
+              "_runtime/host_skills/explainer-video"
+          )
+          for relative in (
+              "SKILL.md", "templates/tts.py", "templates/render.py",
+              "templates/narration.json", "templates/stage/index.html",
+              "templates/stage/core.js", "templates/stage/boot.js",
+              "templates/stage/scenes/s1_title.js",
+              "templates/stage/scenes/s2_points.js",
+          ):
+              if not video_skill.joinpath(relative).is_file():
+                  sys.exit(f"wheel omits explainer-video resource: {relative}")
           client = DirectClient()
           for repo, changed in (
               ("vllm-omni", "vllm_omni/core/sched/scheduler.py"),

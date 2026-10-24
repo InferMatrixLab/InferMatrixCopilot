@@ -276,3 +276,19 @@ def test_codex_cli_path_falls_back_to_path(monkeypatch, tmp_path):
     monkeypatch.setattr(installer.shutil, "which", lambda command: "codex")
 
     assert installer._codex_cli_path() == "codex"
+
+
+def test_installed_explainer_video_keeps_nested_templates(tmp_path):
+    installer = _load_installer()
+    destination = tmp_path / "skills"
+    installer._install_skills(destination)
+
+    skill = destination / "explainer-video"
+    assert (skill / "SKILL.md").is_file()
+    templates = skill / "templates"
+    narration = json.loads((templates / "narration.json").read_text(encoding="utf-8"))
+    assert narration["scenes"]
+    for name in ["tts.py", "render.py", "stage/index.html", "stage/core.js", "stage/boot.js"]:
+        assert (templates / name).is_file(), name
+    for scene in narration["scenes"]:
+        assert (templates / "stage" / "scenes" / f"{scene['id']}.js").is_file()

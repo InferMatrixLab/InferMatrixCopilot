@@ -11,6 +11,8 @@
 - `imdesign`：写代码前理清问题、方案、接口边界和验证计划。
 - `imcoding`：把功能需求或已有设计落实为可运行代码，完成必要集成并针对性验证。
 - `imcifix`：从 GitHub issue 出发，在本地复现、最小修复并针对性验证。
+- [`explainer-video`](plugins/infermatrix-copilot/skills/explainer-video/SKILL.md)：制作技术演示或项目介绍视频，
+  从分镜、语音与 JS 动画到 FFmpeg 成片；视频依赖按需安装，时长、品牌和硬件范围按任务确定。
 - `imupdate`：上游变化后更新模型清单、registry、deploy、路径路由和
   source pin，避免继续按旧知识工作。
 - `imkbinit`：为新接入的仓库分阶段初始化知识库（`kb init`：骨架 → 模块 →
