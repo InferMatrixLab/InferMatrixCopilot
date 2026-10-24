@@ -618,14 +618,13 @@ def _ensure_upstream_scratch(ctx: StepContext) -> str | StepResult:
     # only a path INSIDE the run dir counts as an existing scratch — a
     # canonical path in `upstream_path` (older state, manual seeding) must
     # never be adopted as the mutable tree
-    if str(scratch).startswith(str(ctx.run_dir)) \
-            and (scratch / ".git").exists():
-        _register_scratch_teardown(ctx, scratch)
-        return str(scratch)
-    if not origin:
-        return StepResult(False, FailureKind.BLOCKED,
-                          "no canonical upstream recorded — prelude gap")
-    scratch = ctx.run_dir / "upstream_scratch"
+    adopted = (str(scratch).startswith(str(ctx.run_dir))
+               and (scratch / ".git").exists())
+    if not adopted:
+        if not origin:
+            return StepResult(False, FailureKind.BLOCKED,
+                              "no canonical upstream recorded — prelude gap")
+        scratch = ctx.run_dir / "upstream_scratch"
     if not (scratch / ".git").exists():
         r = subprocess.run(["git", "clone", "--shared", "--no-checkout",
                             str(origin), str(scratch)],
@@ -639,6 +638,22 @@ def _ensure_upstream_scratch(ctx: StepContext) -> str | StepResult:
                        timeout=300)
         ctx.trace.record("upstream_scratch_created", path=str(scratch))
     _register_scratch_teardown(ctx, scratch)
+    if origin:
+        # Borrow objects from the canonical checkout, but fetch branch refs
+        # from its upstream. A local clone may have only a main branch even
+        # when its remote publishes the release branch selected by this run.
+        remote = ctx.state.get("upstream_remote") or "origin"
+        source_remote = subprocess.run(
+            ["git", "-C", str(origin), "remote", "get-url", str(remote)],
+            capture_output=True, text=True, timeout=30, check=False)
+        if source_remote.returncode == 0 and source_remote.stdout.strip():
+            result = subprocess.run(
+                ["git", "-C", str(scratch), "remote", "set-url", "origin",
+                 source_remote.stdout.strip()],
+                capture_output=True, text=True, timeout=30, check=False)
+            if result.returncode != 0:
+                return StepResult(False, FailureKind.BLOCKED,
+                                  "upstream scratch remote configuration failed")
     ctx.state["upstream_path"] = str(scratch)
     return str(scratch)
 
@@ -841,6 +856,11 @@ async def _v3_prelude(ctx: StepContext) -> StepResult:
     if upstream:
         updates["upstream_origin_path"] = upstream
         ctx.state.setdefault("upstream_origin_path", upstream)
+        upstream_remote = (ctx.state.get("upstream_remote")
+                           or (manifest.get("upstream") or {}).get("remote")
+                           or "origin")
+        updates["upstream_remote"] = upstream_remote
+        ctx.state["upstream_remote"] = upstream_remote
     baseline = _task_params(ctx).get("last_rebase_commit", "") \
         or ctx.state.get("last_rebase_upstream_commit", "")
     if baseline:
@@ -1792,6 +1812,7 @@ async def _v3_module_rebase(ctx: StepContext) -> StepResult:
         vllm_path=paths.vllm_path, omni_path=paths.omni_path,
         script_dir=str(adapter_dir / "rebase"), model=target.model,
         log_dir=str(ctx.run_dir),
+        signal_dir=str(ctx.run_dir / "signals"),
         last_rebase_vllm_commit=ctx.state.get("last_rebase_upstream_commit",
                                               ""),
         # the prompt's CUDA/HF facts must describe THIS host, not the
@@ -1811,6 +1832,11 @@ async def _v3_module_rebase(ctx: StepContext) -> StepResult:
         repo=str((ctx.state.get("task_spec") or {}).get("repo") or ""),
         state_slice={"task_spec": ctx.state.get("task_spec") or {},
                      "run_id": ctx.state.get("run_id", ""),
+                     "target_branch": (manifest.get("upstream") or {})
+                     .get("target_branch") or (manifest.get("repo") or {})
+                     .get("default_branch", "main"),
+                     "last_rebase_upstream_commit": ctx.state.get(
+                         "last_rebase_upstream_commit", ""),
                      "upstream_commit": ctx.state.get("upstream_commit", "")})
     async with _serial_lock(ctx.run_dir):
         outcome = await rebase_module(

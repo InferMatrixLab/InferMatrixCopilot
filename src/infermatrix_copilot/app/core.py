@@ -293,17 +293,54 @@ class Copilot:
                 return code
         return 0
 
-    def resume_last(self) -> int:
-        """Re-enter the most recent run at its first incomplete step."""
-        runs = sorted(self.settings.run_root.glob("run-*")) \
-            if self.settings.run_root.exists() else []
-        for run_dir in reversed(runs):
+    def resume_last(self, run_id: str = "", *, repo: str = "",
+                    playbook: str = "", params: dict | None = None) -> int:
+        """Resume a selected run, or the latest run when no id is supplied.
+
+        Target arguments are assertions against the saved task, never edits to
+        it. Release launchers can therefore bind resume to an immutable campaign
+        without accidentally entering a newer, unrelated task.
+        """
+        if run_id:
+            try:
+                runs = [self._contained_run_dir(run_id)]
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"✋ cannot resume: {exc}")
+                return BLOCKED_EXIT
+        else:
+            runs = sorted(self.settings.run_root.glob("run-*"), reverse=True) \
+                if self.settings.run_root.exists() else []
+        for run_dir in runs:
             task_file = run_dir / "task.json"
             if not task_file.exists():
+                if run_id:
+                    print(f"✋ cannot resume {run_id}: task.json is missing")
+                    return BLOCKED_EXIT
                 continue
-            saved = json.loads(task_file.read_text(encoding="utf-8"))
-            spec = TaskSpec(**saved["spec"])
-            playbook = parse_playbook(saved["playbook"], str(task_file))
+            try:
+                saved = json.loads(task_file.read_text(encoding="utf-8"))
+                spec = TaskSpec(**saved["spec"])
+                saved_playbook = parse_playbook(saved["playbook"], str(task_file))
+            except (OSError, UnicodeError, ValueError, KeyError, TypeError,
+                    AttributeError) as exc:
+                print(f"✋ cannot resume {run_dir.name}: invalid task.json ({exc})")
+                return BLOCKED_EXIT
+            mismatches = []
+            if repo and repo != spec.repo:
+                mismatches.append("repo")
+            if playbook and playbook != saved_playbook.name:
+                mismatches.append("playbook")
+            for key, expected in (params or {}).items():
+                if key not in spec.params or (
+                    json.dumps(spec.params[key], sort_keys=True)
+                    != json.dumps(expected, sort_keys=True)
+                ):
+                    mismatches.append(f"task param {key!r}")
+            if mismatches:
+                print(f"✋ cannot resume {run_dir.name}: saved task does not match "
+                      + ", ".join(mismatches)
+                      + "; resume preserves the recorded task")
+                return BLOCKED_EXIT
             try:  # tier preflight holds on re-entry too (deployment state
                 # may have changed since the run was created)
                 self.settings.tier_target(spec.mode)
@@ -311,7 +348,7 @@ class Copilot:
                 print(style("✋ cannot resume: ", "red", "bold") + str(exc))
                 return BLOCKED_EXIT
             print(f"↻ resuming {run_dir.name}: {spec.describe()}")
-            return self._execute(playbook, spec, run_dir, resuming=True)
+            return self._execute(saved_playbook, spec, run_dir, resuming=True)
         print("no resumable run found")
         return 1
 

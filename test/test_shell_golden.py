@@ -118,13 +118,13 @@ def test_command_echo_parity_production_path(golden_built, tmp_path):
             [j["slug"] for j in golden_built.to_dict()["jobs"]].index(slug)])
         plan = runner.run(job, {}, dry_run=True).plan
         assert plan is not None, slug
-        assert plan.argv[:2] == ["bash", "-c"], slug
+        assert plan.argv[:3] == ["bash", "--norc", "-c"], slug
         # independent expected literal: the sole wrapper is the fail-fast
         # prefix, absent only when the command manages -e itself
         if "set +e" in t["cmd"]:
-            assert plan.argv[2] == t["cmd"], slug
+            assert plan.argv[3] == t["cmd"], slug
         else:
-            assert plan.argv[2] == "set -e\n" + t["cmd"], slug
+            assert plan.argv[3] == "set -e\n" + t["cmd"], slug
         assert plan.timeout_sec == float(t["timeout_sec"]), slug
         for token in shlex.split(t["env"] or ""):
             k, v = token.split("=", 1)

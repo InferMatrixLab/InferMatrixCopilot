@@ -328,7 +328,7 @@ class TestRunner:
             dry_run: bool = False) -> TestOutcome:
         log_file = log_file_for(self.tests_dir, job, baseline=baseline)
         plan = RunPlan(
-            argv=["bash", "-c", _exec_wrap(job.command)],
+            argv=["bash", "--norc", "-c", _exec_wrap(job.command)],
             env_overlay=dict(job.env), timeout_sec=job.timeout_sec,
             needs_gpu_lock=(job.gpu_lock if job.gpu_lock is not None
                             else job.min_gpus > 0),
@@ -450,7 +450,7 @@ class TestRunner:
         note = ""
         try:
             with open(log_file, "a", encoding="utf-8") as lf:
-                proc = subprocess.Popen(["bash", "-c", job.setup],
+                proc = subprocess.Popen(["bash", "--norc", "-c", job.setup],
                                         cwd=self.repo_root, env=env,
                                         stdout=lf, stderr=lf,
                                         start_new_session=True)
@@ -496,7 +496,7 @@ class TestRunner:
         except OSError:
             attempt_offset = 0
         with open(log_file, "a" if append else "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(["bash", "-c", exec_cmd],
+            proc = subprocess.Popen(["bash", "--norc", "-c", exec_cmd],
                                     cwd=self.repo_root, env=env,
                                     stdout=lf, stderr=lf,
                                     start_new_session=True)

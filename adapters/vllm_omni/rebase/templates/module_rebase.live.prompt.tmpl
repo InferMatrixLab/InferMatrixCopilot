@@ -1,6 +1,17 @@
 You are rebasing vllm-omni module `{MODULE_NAME}`.
 
-Goal: make `{OMNI_FILES}` compatible with upstream while preserving vllm-omni intent from `origin/main`.
+Goal: make `{OMNI_FILES}` compatible with upstream while preserving vllm-omni intent from `{BASELINE_REF}`.
+
+This campaign targets upstream `{TARGET_BRANCH}`, pinned at `{UPSTREAM_COMMIT}`.
+The module assignment baseline is `{LAST_REBASE_UPSTREAM_COMMIT}`. That baseline
+selects relevant changes; it does not establish the starting Omni tree's API
+version. Verify the upstream checkout and installed API match the run's pin.
+When the prior alignment is documented, compare its commit with the pinned
+target in both directions for your upstream paths. Release targets may omit
+APIs present on main. Port constructors, overrides, imports, and outputs
+against this target. Earlier verification does not validate the current pin.
+Preserve original test commands, assertions, budgets, and model geometry while
+repeating verification against the pinned target.
 
 {PLAN_REVIEW_CONTRACT}
 
@@ -57,21 +68,22 @@ Goal: make `{OMNI_FILES}` compatible with upstream while preserving vllm-omni in
 
 **CPU/merge pipeline:** optional-dep `ModuleNotFoundError`, bad LoRA `HTTPException`/400—fix deps/fixtures in `{OMNI_PATH}`.
 
-## Parallel execution (Phase 2)
-Other module agents edit `{OMNI_PATH}` concurrently.
+## Serialized module execution (Phase 2)
+Module agents run one at a time in the shared `{OMNI_PATH}` checkout. Completed
+modules and resumed attempts may leave dirty files; preserve their changes.
 
 1. Dirty `git status` outside `{OMNI_FILES}` is **expected**—ignore it.
-2. Never `git stash`, `git checkout`, or `git clean` paths outside `{OMNI_FILES}` (you would destroy other agents' work).
+2. Never stash, revert, clean, or commit paths outside `{OMNI_FILES}` (you would destroy or include another module's work).
 3. Do not ask the user to clean the workspace or wait for other modules.
 4. `tasks/01_guard_branch_clean.sh` already ran in Phase 1; do not re-verify globally.
 
 **Primary scope = `{OMNI_FILES}`.** Repeated `Module progress: (k done, f failed, s skipped) (k/M)` with the **same tuple** = **plateau** (heartbeat), not new failures. A tuple change then `ERROR: Module rebase failed` **without** `Timeout waiting for modules` = aggregate wave outcome—check signals.
 
-**All-fail-in-one-poll:** `(0,0,0)` → `(0,N,0)` with all modules failing in the same tick is likely **systemic** (shared config, common import, env var, tmux failure). Check shared infrastructure first. **Single-module waves:** same systemic check before blaming your code.
+**Failures across several modules:** check shared config, common imports, environment, and harness infrastructure before changing module code.
 
-**Straggler avoidance:** Finish checks and write the completion contract promptly. In **single-module waves** (no parallel modules), the orchestrator waits only for you—write your verdict as soon as final.
+**Completion:** Finish checks and write the completion contract promptly. The orchestrator waits for this module before starting the next one.
 
-**Orchestrator restart/resume:** `Skipping <module> (already done)` = incremental relaunch. Do not assume all agents restart together.
+**Orchestrator restart/resume:** `Skipping <module> (already done)` = incremental relaunch. Inspect the current files and preserve work from completed modules.
 
 ### Shared log hygiene
 Anchor on the **current run**—match `Resuming run: rebase-* (phase: …)` for **this** session. `[claude_auth]` / `API key probe OK` is CLI init—**not** a module failure. Repeated `Using level-1 agent model:` banners are **noise**—diagnose from `ERROR:` / phase banners / task names. Git boilerplate (`detached HEAD`, `git switch -c`) is scaffold—not merge outcome unless paired with conflict/error lines. `SSH fetch failed; retrying via HTTPS token auth` followed by HTTPS success is normal infrastructure fallback—**not** a module failure.
@@ -85,7 +97,7 @@ If a **required verification** fails and root cause is under `{OMNI_PATH}` but o
 1. **Follow the root cause**—minimal targeted fixes anywhere under `{OMNI_PATH}`.
 2. Keep fixes **small**—align with `{VLLM_PATH}`; no unrelated refactors.
 3. **Document** every out-of-scope edit in the completion contract.
-4. Prefer **additive** changes if another agent may touch the same file.
+4. Read the current file first and preserve work from completed modules and resumed attempts.
 5. After **two** failed attempts on that out-of-scope fix, **stop** and write `.fail` with traceback.
 
 ## Evaluation gates
@@ -151,13 +163,13 @@ If `{COMMIT_LIST}` is empty while notes imply commits: do not invent churn—fla
 - Upstream vLLM target branch: {VLLM_PATH}
   Key paths: {UPSTREAM_FILES}
 - vllm-omni baseline intent:
-  `git show origin/main:<path>` in {OMNI_PATH}
+  `git show {BASELINE_REF}:<path>` in {OMNI_PATH}
 
 ## Hard rules
 1. Edit only under {OMNI_PATH}. Never modify {VLLM_PATH}.
 2. **Temporary files**: Create all helper scripts and scratch artifacts under `\${AGENT_TMP}` (outside the repos). Never create temp files in `{OMNI_PATH}` or `{VLLM_PATH}`.
 3. Use only env from this prompt: `CUDA_VISIBLE_DEVICES={CUDA_DEVICES}`, `HF_HOME={HF_HOME}`. Ignore stale values in module prompt source.
-4. Preserve omni-specific behavior from `origin/main` while adapting to upstream APIs.
+4. Preserve omni-specific behavior from `{BASELINE_REF}` while adapting to upstream APIs.
 5. Do not change copyright/license headers or license files.
 6. Execute only valid shell commands. Never run bare narrative tokens (example: `Resume`).
 7. **Never ask the user a question or wait for human input.**
@@ -187,7 +199,7 @@ On its own line (parser-friendly):
 
 **Pytest truth:** `ERROR: FAILED: <job> (rc=…)`/`FAILED`/`ERROR` **override** `[watchdog] … CONTINUE` when `rc≠0`. `rc=143` SIGTERM; `rc=124` timeout; `rc=2` collection error.
 
-**Global timeout / stall:** `Build timed out` + frozen `Module progress` → parallel wave issue, not your `{OMNI_FILES}`. Confirm your module wrote the completion marker.
+**Global timeout / stall:** `Build timed out` + frozen `Module progress` → inspect the active module's logs and owning test outcome. Confirm the completion marker only after required verification terminates successfully.
 
 **Other signals to filter:**
 - `[MODEL DOWNLOAD]`, `IGNORE (gated model access / HF 401)`, remote container deps (`installing vllm-omni[dev]`) → infra noise unless pytest after recovery fails on your files.
@@ -235,14 +247,14 @@ If broken, find the new symbol in {VLLM_PATH} and update omni. Same semantics as
 
 ## Failure handling (up to {MAX_DEBUG_RETRIES} attempts)
 
-### MANDATORY: When a test fails, FIRST check origin/main baseline
-1. Call `git_show_test_baseline "<failing_test_path>"` — this shows how origin/main updated this test
-2. If origin/main CHANGED the test (new params, imports, assertions) → apply the SAME changes to omni
-3. If origin/main DELETED the test → check if omni still needs it
-4. If origin/main RENAMED/SPLIT the test → find the new file and port omni modifications there
-5. Only after aligning the test with origin/main, fix product code
+### MANDATORY: When a test fails, FIRST check {BASELINE_REF} baseline
+1. Call `git_show_test_baseline "<failing_test_path>"` — this shows how {BASELINE_REF} updated this test
+2. If {BASELINE_REF} CHANGED the test (new params, imports, assertions) → apply the SAME changes to omni
+3. If {BASELINE_REF} DELETED the test → check if omni still needs it
+4. If {BASELINE_REF} RENAMED/SPLIT the test → find the new file and port omni modifications there
+5. Only after aligning the test with {BASELINE_REF}, fix product code
 6. Do NOT change product code to make a stale test pass
-7. NEVER re-create or restore a test file that origin/main deleted or renamed
+7. NEVER re-create or restore a test file that {BASELINE_REF} deleted or renamed
    just because the rebase harness (config.sh / a CI test command) still
    references the old path. Harness config is NOT ground truth: if a referenced
    test path no longer exists (pytest rc=4, "file or directory not found"), use
@@ -254,7 +266,7 @@ If broken, find the new symbol in {VLLM_PATH} and update omni. Same semantics as
 2. Classify: `unrecognized arguments` → setup. Ruff after green pytest → still blocking. Unmapped CI → mapping. **`41`/`MISMATCH`** → signature/unpack. **`42`/`BROKEN`** → import path/symbol vs `{VLLM_PATH}`.
 3. **Time check:** If > 5 minutes of wall-clock work (not test wait) on the same failure without progress, write a `.fail` with what you tried and stop. Do not repeat the same fix pattern.
    - **"No code changes" trap:** If root cause is infra/config/environment, not omni code, you must still produce output. Document what you checked and why no fix is possible. Silence wastes the debug round.
-4. Map failing omni call site ↔ upstream in `{VLLM_PATH}`; `git show origin/main` for intent.
+4. Map failing omni call site ↔ upstream in `{VLLM_PATH}`; `git show {BASELINE_REF}` for intent.
 5. Minimal compatible fix in `{OMNI_PATH}`.
 6. Re-run failing check, then full verification.
 7. Report: changed files, summary, latest results, `MODULE={MODULE_NAME}`.

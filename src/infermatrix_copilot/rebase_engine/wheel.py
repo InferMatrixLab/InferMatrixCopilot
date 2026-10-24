@@ -11,7 +11,8 @@ Behavioral parity notes (each pinned by a test):
   variant listing mentions our arch wins; on reaching the last-known-good
   baseline without a hit, fall back to the baseline itself if it has a wheel,
   else keep searching older commits.
-- A forced commit must resolve and (outside release mode) must have a wheel.
+- A forced commit must belong to the target branch and (outside release mode)
+  must have a wheel.
 - Release mode uses the branch tip and skips the wheel probe.
 - Install failures abort immediately; only *import-validation* failures retry
   (with a stale-artifact clean between attempts).
@@ -145,11 +146,23 @@ def pick_wheel_commit(repo: Path, target_branch: str, spec: WheelSpec, *,
     the newest commit with a usable wheel, and leave the checkout AT that
     commit (detached). Returns the selected full SHA."""
     repo = Path(repo)
-    rc, _, err = run(["git", "fetch", "origin"], cwd=repo)
+    rc, _, err = run(["git", "check-ref-format",
+                      f"refs/heads/{target_branch}"], cwd=repo)
     if rc != 0:
-        raise WheelPickError(f"git fetch origin failed in {repo}: {err.strip()}")
+        raise WheelPickError(f"invalid upstream target branch {target_branch!r}")
+    # Scratch clones can inherit a single-branch fetch refspec. Fetch the
+    # requested branch explicitly, including its tracking ref, rather than
+    # depending on remote.origin.fetch (the v0.31.0 campaign hit this).
+    # A failed fetch must never fall through to a stale local tracking ref.
+    remote_ref = f"refs/remotes/origin/{target_branch}"
+    rc, _, err = run(["git", "fetch", "origin",
+                      f"+refs/heads/{target_branch}:{remote_ref}"], cwd=repo)
+    if rc != 0:
+        raise WheelPickError(
+            f"remote branch origin/{target_branch} does not exist or could "
+            f"not be fetched in {repo}: {err.strip()}")
 
-    rc, _, _ = run(["git", "rev-parse", "--verify", f"origin/{target_branch}"],
+    rc, _, _ = run(["git", "rev-parse", "--verify", f"{remote_ref}^{{commit}}"],
                    cwd=repo)
     if rc != 0:
         raise WheelPickError(
@@ -167,12 +180,20 @@ def pick_wheel_commit(repo: Path, target_branch: str, spec: WheelSpec, *,
     found = ""
     if force_commit:
         log(f"Using forced commit override: {force_commit}")
-        rc, out, _ = run(["git", "rev-parse", f"{force_commit}^{{commit}}"],
+        rc, out, _ = run(["git", "rev-parse", "--verify", "--end-of-options",
+                          f"{force_commit}^{{commit}}"],
                          cwd=repo)
         if rc != 0 or not out.strip():
             raise WheelPickError(
                 f"forced commit '{force_commit}' could not be resolved in {repo}")
         found = out.strip()
+        rc, _, err = run(["git", "merge-base", "--is-ancestor", found,
+                          remote_ref], cwd=repo)
+        if rc != 0:
+            raise WheelPickError(
+                f"forced commit {found} is not proven to belong to "
+                f"origin/{target_branch}; choose a commit from the target "
+                f"branch: {err.strip()}")
         if release_mode:
             log(f"Release mode: skipping wheel check for forced commit {found[:12]}")
         elif probe(found):

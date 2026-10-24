@@ -32,6 +32,43 @@ Placeholders used throughout (all resolved in the values file):
 `<phase1-snapshot-digest>` (recorded on the day) ·
 `archival_secret_allowlist` (PR7; may be empty).
 
+## Release campaign startup and resume
+
+Choose the adapter's `upstream.target_branch` and freeze the upstream commit
+before starting a campaign. The wheel picker fetches that branch explicitly,
+including in scratch clones whose fetch configuration covers only the default
+branch. A forced commit must be an ancestor of the fetched target branch;
+a main-only commit cannot override a release target. Fetch errors stop the
+run rather than using a stale tracking ref.
+
+Record the run id printed at startup. Resume that exact campaign with its
+saved identity asserted:
+
+```bash
+./infermatrix-copilot --resume <run-id> \
+    --repo <name> --playbook repo-rebase-v3 \
+    --task-param force_upstream_commit=<frozen-upstream-sha> \
+    --task-param last_rebase_commit=<last-rebase-baseline>
+```
+
+`--repo`, `--playbook`, and `--task-param` are assertions on resume. A mismatch
+blocks before execution and leaves the saved task unchanged. Bare `--resume`
+still selects the latest saved task; use an explicit id when several campaigns
+share the run directory. Changing the target calls for a new run rather than
+reusing another target's checkpoints or completion signals.
+
+Live module prompts take their target branch, upstream pin, assignment
+baseline, and target-repository baseline ref from the current run. The
+assignment baseline selects work; it does not prove the current tree's API
+version or provide test evidence for a new target. The checkout SHA displayed
+alongside the pin lets the agent check that its source and runtime agree.
+
+Agent shells and test shells disable Bash startup-file loading so SSH session
+metadata cannot shadow the selected runtime's executables. Harness completion
+requires a fresh module signal, no typed session/audit refusal, and the required
+plan decision from that module's current attempt. Plain completion prose does
+not replace these checks.
+
 ## External checkout pin (EXT1-class guard)
 
 Before cutover, the EXTERNAL orchestrator's canonical checkout gains a
