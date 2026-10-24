@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 from ..knowledge_service.signing import canonical_json, sign, verify
+from ..persistence import immutable_write_bytes
+from ..git_objects import tree_entries
 from .activate import activation_lock, build_snapshot, verify_snapshot
 
 PLAN_PURPOSE = "kb-reconciliation-plan"
@@ -127,11 +127,7 @@ def _validate_target(knowledge, target: str) -> dict:
         # git archive attributes must not silently hide a knowledge file from
         # the validators. Served text must be regular UTF-8, never a symlink.
         listing = knowledge._git("ls-tree", "-r", "-z", target, "--", "knowledge/")
-        for entry in listing.split(b"\0"):
-            if not entry:
-                continue
-            metadata, raw_path = entry.split(b"\t", 1)
-            mode, kind, oid = metadata.decode().split()
+        for mode, kind, oid, raw_path in tree_entries(listing):
             path = raw_path.decode("utf-8")
             exported = source / path
             if kind != "blob" or not exported.is_file() or exported.is_symlink():
@@ -143,17 +139,12 @@ def _validate_target(knowledge, target: str) -> dict:
                 if mode != "100644":
                     raise ReconciliationError(f"served knowledge has an unsupported mode: {path}")
                 exported.read_text(encoding="utf-8", errors="strict")
-        reports = []
-        for name in ("check_knowledge_tree.py", "check_wiki_lint.py"):
-            tool = source / "knowledge" / "tools" / name
-            if not tool.is_file():
-                raise ReconciliationError(f"mandatory validator missing: {name}")
-            run = subprocess.run([sys.executable, str(tool)], cwd=source, capture_output=True, timeout=180, check=False)
-            if run.returncode:
-                detail = (run.stdout + run.stderr).decode(errors="replace")[-2000:]
-                raise ReconciliationError(f"{name} failed: {detail}")
-            reports.append({"name": name, "code_sha256": hashlib.sha256(tool.read_bytes()).hexdigest(),
-                            "output_sha256": hashlib.sha256(run.stdout + run.stderr).hexdigest(), "exit_code": 0})
+        from ..knowledge_service.validation import validate_workspace
+
+        validation = validate_workspace(source, timeout_seconds=180, stop_on_failure=True)
+        if not validation.passed:
+            raise ReconciliationError("; ".join(validation.problems()))
+        reports = [execution.receipt() for execution in validation.executions]
         snapshot = build_snapshot(root / "state", target, knowledge.knowledge_files(target),
                                   extra=knowledge.top_level_knowledge(target))
         verify_snapshot(snapshot)
@@ -225,20 +216,7 @@ def apply_plan(rt, envelope: dict, key) -> Path:
         path = directory / f"{_digest(receipt)}.json"
         # Plans have a separate signature purpose and cannot be installed as
         # receipts. A successfully applied receipt is never replaced in place.
-        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(canonical_json(receipt))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.link(temporary, path)  # atomic publication, refuses replacement
-            directory_fd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            os.unlink(temporary)
+        immutable_write_bytes(path, canonical_json(receipt))
         rt.trace("outcome", context={"playbook": "kb-reconcile-reviewed", "repo": fresh["repository"]},
                  result={"outcome": "supervised_admission", "target": fresh["target"], "receipt": path.name,
                          "actor": fresh["actor"], "commits": len(fresh["commits"])})

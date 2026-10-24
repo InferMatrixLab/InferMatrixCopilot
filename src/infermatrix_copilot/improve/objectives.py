@@ -258,12 +258,14 @@ def score(driver, row, output, *, lint=False):
         return float(len(found) == len(row['payload']['cells']) and len(matches) == 1 and matches[0].get('stage') == expected['stage'] and not matches[0].get('disputed')
                      and expected['evidence'] in matches[0].get('evidence', []) and set(matches[0]['evidence']).issubset(ids))
     if driver == 'pr-review':
+        from ..review.severity import STRICT_TO_PRIORITY
         data = row['payload']; findings = output.get('review_comments')
         if not isinstance(findings, list) or not isinstance(output.get('review_text'), str) or not output['review_text'].strip(): return 0.0
         for f in findings:
             path, line = f.get('file', f.get('path')), f.get('line')
             if path not in data['head_files'] or not isinstance(line, int) or isinstance(line, bool) or not 1 <= line <= len(data['head_files'][path].splitlines()): return 0.0
-            if f.get('severity') not in ('blocker', 'major', 'minor', 'nit') or not f.get('comment') or f.get('disposition', 'publish') != 'publish': return 0.0
+            severity = f.get('severity')
+            if not isinstance(severity, str) or severity not in STRICT_TO_PRIORITY or not f.get('comment') or f.get('disposition', 'publish') != 'publish': return 0.0
             anchor = f.get('anchor_snippet')
             if anchor and anchor not in data['head_files'][path]: return 0.0
         return 1.0

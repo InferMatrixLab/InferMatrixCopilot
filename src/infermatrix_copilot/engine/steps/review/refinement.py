@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 
 from ....llm import parse_json_reply
+from ....review.severity import SEVERITY_GUIDANCE, STRICT_SEVERITY_DEMOTION
 from ...step import StepContext
 from .utils import _SEVERITY_ORDER
 
@@ -78,11 +78,13 @@ async def _promote_uncovered(ctx: StepContext, output: dict,
         "phrased as the change to make (name both files and the helper), "
         "NEVER as a 'could you confirm…?' question; only a validation with "
         "a genuinely unresolved residual becomes a scoping ask. (3) "
-        "severity: minor unless the raw line "
-        "demonstrates breakage (then major). (4) If everything relevant is "
+        "choose minor or major using the shared impact definitions below; "
+        "this promotion pass does not create blocker/nit comments. "
+        "(4) If everything relevant is "
         "already covered, return no additions. Reply with exactly one JSON "
         'object: {"additions": [{"file": str, "line": int, "severity": '
         '"major"|"minor", "comment": str, "evidence": str}]}')
+    system += "\n\n" + SEVERITY_GUIDANCE
     prompt = (
         "## KEPT COMMENTS\n"
         + json.dumps([{k: c.get(k) for k in ("file", "line", "severity",
@@ -170,15 +172,8 @@ def _uncovered_hunks(diff: str, output: dict) -> list[str]:
     where test-integrity findings hide. Returns `path:start` entries."""
     import re as _re
 
-    regions: dict[str, list[int]] = {}
-    current = None
-    for line in str(diff or "").splitlines():
-        if line.startswith("+++ b/"):
-            current = line[6:]
-        elif line.startswith("@@") and current:
-            m = _re.search(r"\+(\d+)", line)
-            if m:
-                regions.setdefault(current, []).append(int(m.group(1)))
+    from .anchor import diff_index
+    regions = {path: entry.starts for path, entry in diff_index(diff).items() if entry.starts}
     comments = output.get("review_comments") or []
     cited: dict[str, list[int]] = {}
     for f in output.get("findings") or []:
@@ -264,12 +259,9 @@ async def _second_round(ctx: StepContext, output: dict, common: dict,
     # truncated diff blob, so the beyond-cap hunks stayed unreviewable. The
     # slices come from the UNCAPPED diff text.
     seed_paths = {p.rsplit(":", 1)[0] for p in uncovered}
-    slices: list[str] = []
-    for chunk in re.split(r"(?m)^(?=diff --git )", str(diff or "")):
-        m = re.search(r"^\+\+\+ b/(.+)$", chunk, re.M)
-        if m and m.group(1) in seed_paths:
-            slices.append(chunk)
-    hunk_evidence = "".join(slices)[:100_000]
+    from ....review.diff import parse_diff
+    hunk_evidence = "".join(item.raw for item in parse_diff(diff)
+                            if item.new_path in seed_paths)[:100_000]
     from ...agent_runtime.ensemble import (
         lens_backend_member,
         outcome_blocked as _seat_produced_nothing,
@@ -355,8 +347,8 @@ In order, with the minimum tool calls (your budget is small):
    affected consumer, and a problem contingent on hypothetical future code
    changes, are not actionable. Check rejected_comments before reopening
    a concern; identify new evidence that defeats its rejection.
-4. Severity: major requires a real defect in the changed code or a required
-   update the diff lacks; "consider adding X" polish is minor at most.
+4. Severity: apply the shared severity definitions below to the demonstrated
+   trigger and impact; confirming the claim does not by itself justify P0.
 
 Verdicts:
 - confirmed: you READ the code that makes the claim true. You MUST return
@@ -381,7 +373,7 @@ Verdicts:
 - unverifiable: you could not decide within budget.
 
 Confirming from plausibility alone is the one failure this pass exists to
-prevent — when in doubt between confirmed and unverifiable, unverifiable."""
+prevent — when in doubt between confirmed and unverifiable, unverifiable.""" + "\n\n" + SEVERITY_GUIDANCE
 
 
 async def _verify_comments(ctx: StepContext, output: dict,
@@ -434,7 +426,7 @@ async def _verify_comments(ctx: StepContext, output: dict,
 
     results = await asyncio.gather(*(_one(i, c)
                                      for i, c in enumerate(comments)))
-    demote = {"blocker": "major", "major": "minor", "minor": "nit"}
+    demote = STRICT_SEVERITY_DEMOTION
     kept: list[dict] = []
     n_drop = n_demote = 0
     for i, result, out in sorted(results, key=lambda r: r[0]):

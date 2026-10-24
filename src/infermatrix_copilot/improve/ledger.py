@@ -16,8 +16,9 @@ Proposal states::
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import json
-import os
 import re
 import time
 import uuid
@@ -128,12 +129,8 @@ class Ledger:
 
     def save(self, ledger: WorkflowLedger) -> None:
         data = asdict(ledger)
-        # a per-process temp name: two writers must never share one (the
-        # rename of one would steal the other's contents)
-        tmp = self._path(ledger.workflow).with_name(
-            f".{self._path(ledger.workflow).name}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
-        tmp.replace(self._path(ledger.workflow))
+        atomic_write_bytes(self._path(ledger.workflow),
+                           json.dumps(data, ensure_ascii=False, indent=1, default=str).encode("utf-8"))
 
     @contextmanager
     def locked(self, workflow: str) -> Iterator[None]:
@@ -169,17 +166,18 @@ class Ledger:
     def record_cycle(self, workflow: str, *, at: float, declared: bool, tier: int, units: int,
                      quarantined: int, usd: float, seconds: float, lints: dict[str, dict],
                      usd_samples: list[float], seconds_samples: list[float],
-                     parse_failure_rate: float) -> WorkflowLedger:
+                     parse_failure_rate: float, cost_policy: str = '', cost_unknown_calls: int = 0) -> WorkflowLedger:
         with self.locked(workflow):
             return self._record_cycle(workflow, at=at, declared=declared, tier=tier, units=units,
                                       quarantined=quarantined, usd=usd, seconds=seconds, lints=lints,
                                       usd_samples=usd_samples, seconds_samples=seconds_samples,
-                                      parse_failure_rate=parse_failure_rate)
+                                      parse_failure_rate=parse_failure_rate,
+                                      cost_policy=cost_policy, cost_unknown_calls=cost_unknown_calls)
 
     def _record_cycle(self, workflow: str, *, at: float, declared: bool, tier: int, units: int,
                       quarantined: int, usd: float, seconds: float, lints: dict[str, dict],
                       usd_samples: list[float], seconds_samples: list[float],
-                      parse_failure_rate: float) -> WorkflowLedger:
+                      parse_failure_rate: float, cost_policy: str = '', cost_unknown_calls: int = 0) -> WorkflowLedger:
         ledger = self.load(workflow)
         ledger.declared = declared
         ledger.tier = tier
@@ -190,6 +188,10 @@ class Ledger:
         base["usd"] = (base.get("usd") or [])[-400:] + [round(x, 6) for x in usd_samples]
         base["seconds"] = (base.get("seconds") or [])[-400:] + [round(x, 3) for x in seconds_samples]
         base["parse_failure_rate"] = parse_failure_rate
+        if cost_policy:
+            ledger.cycles[-1].update(cost_policy=cost_policy, cost_unknown_calls=cost_unknown_calls)
+            base['planning_usd'] = (base.get('planning_usd') or [])[-400:] + [round(x, 6) for x in usd_samples]
+            base['cost_policy'] = cost_policy
         self.save(ledger)
         self._record("ledger_cycle", workflow=workflow, at=at, units=units, quarantined=quarantined,
                      usd=round(usd, 4), lints={k: v.get("rate") for k, v in lints.items()})

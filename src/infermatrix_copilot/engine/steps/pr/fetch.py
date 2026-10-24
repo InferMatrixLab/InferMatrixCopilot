@@ -464,7 +464,14 @@ async def _pr_fetch_diff(ctx: StepContext) -> StepResult:
     # PR context bundle (design W1): description + discussion + linked issues —
     # the recall evidence a diff-only review structurally lacks. Degrades to a
     # partial bundle on any sub-fetch failure; never blocks the run.
-    pr_context = _pr_context_bundle(ctx, repo, int(pr))
+    frozen = (spec.get("params") or {}).get("business_context")
+    if frozen:
+        from ....review.frozen_context import frozen_pr_context
+
+        pr_context = frozen_pr_context(frozen, include_discussion=
+            str(getattr(ctx.settings, "pr_context_mode", "full")) == "full")
+    else:
+        pr_context = _pr_context_bundle(ctx, repo, int(pr))
     ctx.state["pr_context"] = pr_context
     ctx.state["repo_path"] = wt_path
     ctx.state["checkout_note"] = note
@@ -493,6 +500,15 @@ async def _pr_gate_check(ctx: StepContext) -> StepResult:
     pr = spec.get("pr") if isinstance(spec, dict) else None
     if not pr:
         return StepResult(False, FailureKind.BLOCKED, "no PR number in task spec")
+    frozen = (spec.get("params") or {}).get("business_context")
+    if frozen:
+        from ....review.frozen_context import frozen_gate_report
+
+        report, pr_state = frozen_gate_report(frozen)
+        updates = {"gate_report": report, "pr_state": pr_state}
+        ctx.state.update(updates)
+        return StepResult(True, summary="frozen dispatch gate evidence",
+                          outputs={"gate_report": report, "state_updates": updates})
     if _snapshot_mode(ctx):
         snap = _snapshot_for(ctx, int(pr))
         if isinstance(snap, StepResult):

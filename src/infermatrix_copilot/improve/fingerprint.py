@@ -50,7 +50,7 @@ def _playbook_file(name: str, settings: Any) -> Path | None:
         if candidate.is_file():
             return candidate
     try:
-        from ..sdk._resources import resource_dir
+        from ..resources import resource_dir
 
         candidate = resource_dir("playbooks") / f"{name}.yaml"
     except Exception:  # noqa: BLE001 - resolved below by the source tree fallback

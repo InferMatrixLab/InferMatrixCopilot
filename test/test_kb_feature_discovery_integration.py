@@ -1,5 +1,6 @@
 """Discovery is additive, but a started catalog cannot be bypassed downstream."""
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -57,7 +58,9 @@ def _record(stage, files, report, path, *, status="dry_run"):
     if status == "dry_run":
         dest = stage.rt.state_dir / "preview"
         InitPublisher.dry_run(dest, files, title="catalog", body="reviewed")
-        record.pr = {"dry_run_dir": str(dest)}
+        from infermatrix_copilot.kb_service.preview import file_hashes
+        record.files = sorted(files)
+        record.pr = {"dry_run_dir": str(dest), "checked_files_sha256": file_hashes(files)}
     record.save(stage.rt.state_dir)
     return record
 
@@ -211,7 +214,9 @@ def test_existing_knowledge_override_cannot_bypass_discovery_gate(world):
 
     stage = ExistingStage(_runtime(world), _lifecycle(feature_discovery_required=True), dry_run=True, pin=None,
                           from_existing=True)
-    record = stage.run()
+    from infermatrix_copilot.kb_service.init_execution import execute_init
+    asyncio.run(execute_init(stage))
+    record = stage.record
     assert record.status == "blocked" and any("feature-discovery" in problem for problem in record.problems)
 
 
@@ -283,14 +288,11 @@ def test_discovery_model_defaults_are_independent_and_do_not_change_other_runtim
         def __init__(self, rt, lifecycle, **kwargs):
             captured.update(rt=rt, lifecycle=lifecycle, options=kwargs)
 
-        def run(self):
-            return InitRecord(stage="feature-discovery", repo="toy")
-
     monkeypatch.setattr(init_stages, "_stage_class", lambda name: Stage)
     rt = _runtime(world)
     original_roles = (rt.generator, rt.judge)
-    run_stage(rt, _lifecycle(), "feature-discovery", dry_run=True, from_existing=True,
-              retry_unfinished=True, budget_usd=4)
+    init_stages._make_stage(rt, _lifecycle(), "feature-discovery", dry_run=True, from_existing=True,
+                            retry_unfinished=True, budget_usd=4)
     assert captured["rt"].generator.label() == "zcode:GLM-5.3"
     assert captured["rt"].judge.label() == "codex:gpt-6.1-sol:medium"
     assert captured["rt"].discovery_concurrency == 13
@@ -299,7 +301,7 @@ def test_discovery_model_defaults_are_independent_and_do_not_change_other_runtim
     assert (rt.generator, rt.judge) == original_roles
     rt.environ = {"KB_DISCOVERY_JUDGE": "zcode:GLM-5.3", "KB_JUDGE_FAMILY_WAIVER": "true"}
     with pytest.raises(InitError, match="independent"):
-        run_stage(rt, _lifecycle(), "feature-discovery", dry_run=True)
+        init_stages._make_stage(rt, _lifecycle(), "feature-discovery", dry_run=True)
 
 
 def test_discovery_cli_forwards_incremental_options(monkeypatch, tmp_path):

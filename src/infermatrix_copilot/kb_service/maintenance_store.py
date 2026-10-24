@@ -14,6 +14,7 @@ import json
 import math
 from zoneinfo import ZoneInfo
 
+from ..budgeting import settlement_charge
 from .ledger import LeaseError
 from .maintenance_units import fresh_history
 
@@ -313,7 +314,8 @@ class MaintenanceStore:
                 "actual_cost_usd": row["actual_microusd"] / 1_000_000 if row["actual_microusd"] is not None else None}
 
     def reserve_cost(self, reservation_id, *, repo, owner, worst_cost_usd, lane="priority",
-                     cost_kind="api", metadata=None, now=None):
+                     cost_kind="api", metadata=None, now=None, require_existing=False):
+        """Bind one reservation; recovery may validate but never create it."""
         now, cost, encoded = self._now(now), _money(worst_cost_usd), _json(metadata or {})
         if metadata and "settlement" in metadata:
             raise ValueError("reservation metadata cannot use the settlement key")
@@ -330,6 +332,8 @@ class MaintenanceStore:
                 if _json(old_metadata) != encoded:
                     raise MaintenanceConflict("cost reservation request metadata changed")
                 return self._budget_row(old)
+            if require_existing:
+                raise MaintenanceConflict("original cost reservation is missing")
             totals = cur.execute("SELECT COALESCE(SUM(charged_microusd),0) total, "
                                  "COALESCE(SUM(CASE WHEN lane='priority' THEN charged_microusd ELSE 0 END),0) priority "
                                  "FROM maintenance_budget WHERE day=?", (day,)).fetchone()
@@ -394,8 +398,8 @@ class MaintenanceStore:
             # Subscription accounting uses the explicit reservation allowance,
             # while any actual charge is reported separately. Unknown/failed
             # calls never refund an uncertain amount.
-            charged = row["worst_microusd"] if actual is None or outcome != "completed" or row["cost_kind"] == "subscription" else actual
-            charged = max(charged, actual or 0)  # honestly retain any provider overrun
+            charged = settlement_charge(row["worst_microusd"], actual, outcome=outcome,
+                                        fixed_accounting=row["cost_kind"] == "subscription")
             combined = {**json.loads(row["metadata"]), "settlement": metadata or {}}
             cur.execute("UPDATE maintenance_budget SET charged_microusd=?,actual_microusd=?,status='settled',outcome=?,metadata=?,settled_at=? WHERE id=?",
                         (charged, actual, outcome, _json(combined), self._now(None), reservation_id))

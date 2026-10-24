@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from . import trace_store
+from .process_execution import run_command
 from .run_trace import RunTrace
 from .scopes import ToolScope
 
@@ -221,7 +221,8 @@ def _list_dir(path: str, **_: Any) -> str:
     return "\n".join(sorted(x.name + ("/" if x.is_dir() else "") for x in Path(path).iterdir()))
 
 
-def _grep(pattern: str, path: str, regex: bool = False, **_: Any) -> str:
+def search_files(pattern: str, path: str, *, regex: bool = False,
+                 max_chars: int = GREP_MAX_CHARS, label: str = "grep") -> str:
     """Recursively search `path` for `pattern`, returning `file:line:text` matches.
 
     `pattern` is a LITERAL string unless `regex=True`. The default matters: this
@@ -239,11 +240,11 @@ def _grep(pattern: str, path: str, regex: bool = False, **_: Any) -> str:
     failure that RAISES. Previously every non-zero code produced empty stdout and
     was reported as "(no matches)", so a bad path or malformed pattern told the
     caller a search succeeded and found nothing."""
-    out = subprocess.run(
+    out = run_command(
         ["grep", "-rn", "-E" if regex else "-F",
          *(f"--exclude-dir={d}" for d in GREP_EXCLUDE_DIRS),
          "-e", pattern, path],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        encoding="utf-8", errors="replace", timeout=60,
     )
     # membership, not `> 1`: subprocess reports signal death as a NEGATIVE code
     # (SIGKILL -> -9), which no `> 1` guard catches
@@ -255,8 +256,12 @@ def _grep(pattern: str, path: str, regex: bool = False, **_: Any) -> str:
             f"{bounded(out.stderr.strip(), 500, 'grep stderr') or 'no stderr'}")
     if out.returncode == 1:
         return "(no matches)"
-    return bounded(out.stdout, GREP_MAX_CHARS, "grep",
+    return bounded(out.stdout, max_chars, label,
                    hint="narrow the pattern or search a subdirectory")
+
+
+def _grep(pattern: str, path: str, regex: bool = False, **_: Any) -> str:
+    return search_files(pattern, path, regex=regex)
 
 
 def _run_shell(cmd: str, cwd: str | None = None, timeout: int = 600, **_: Any) -> str:
@@ -264,8 +269,8 @@ def _run_shell(cmd: str, cwd: str | None = None, timeout: int = 600, **_: Any) -
     Returns the exit code with the tail of stdout (10k) and stderr (5k) — tails
     because the signal is usually at the end of long build/test output, and each
     tail says so when it dropped a head, so a clipped log is not read as a whole one."""
-    out = subprocess.run(
-        cmd, shell=True, cwd=cwd, capture_output=True, text=True,
+    out = run_command(
+        cmd, shell=True, cwd=cwd,
         encoding="utf-8", errors="replace", timeout=timeout
     )
     stdout = bounded(out.stdout, SHELL_STDOUT_CHARS, "stdout", keep="tail")

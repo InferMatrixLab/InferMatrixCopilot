@@ -180,10 +180,10 @@ def test_actual_native_retry_prompt_contains_only_failed_facet_feedback_and_reta
     payload = json.loads(prompt.split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
     assert payload["prior_review_feedback"] == job["payload"]["prior_review_feedback"]
     assert payload["files"] and task["artifacts"][0]["verdict"]["verdict"] == "pass"
-    from infermatrix_copilot.kb_service.init_knowledge_inputs import SYSTEM_KNOWLEDGE_V4
+    from infermatrix_copilot.kb_service.init_knowledge_inputs import knowledge_system
     from infermatrix_copilot.kb_service.models import ModelGateway, ModelRole
     from test_kb_init_skeleton import _runtime
-    assert traces.blob(native["inputs"]["system"]) == SYSTEM_KNOWLEDGE_V4
+    assert traces.blob(native["inputs"]["system"]) == knowledge_system(task["payload"])
     rt = _runtime(world, ModelGateway(None, transport_factory=lambda _: pytest.fail("native retry replay dispatched a model")),
                   state_dir=state, generator=ModelRole("generator", "zcode", "GLM-5.3"))
     rt.unlimited_subscription = True

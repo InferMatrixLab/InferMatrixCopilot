@@ -32,6 +32,14 @@ class HarnessLLM:
     def available(self) -> bool:
         """True when the harness CLI is installed (auth is probed by doctor,
         not here — presence is the cheap honest signal)."""
+        from .completion_profiles import CompletionPolicyError, completion_profile_config
+        provider = getattr(getattr(self._transport, 'spec', None), 'id', '')
+        if completion_profile_config(self.settings, provider) is not None:
+            try:
+                self.validate_completion()
+            except (CompletionPolicyError, RuntimeError):
+                return False
+            return True
         return self._transport.cli_path() is not None
 
     def for_target(self, target) -> HarnessLLM:
@@ -50,6 +58,13 @@ class HarnessLLM:
         from ..llm import LLM
 
         return LLM(self.settings).for_member(member)
+
+    def validate_completion(self) -> None:
+        """Attest required completion support without dispatching a model."""
+        from .completion_profiles import validate_completion_policy
+        from .base import execution_effort
+        execution_effort(self._transport)
+        validate_completion_policy(self.settings, self._transport, require_trace=True)
 
     @property
     def _harness_model(self) -> str:
@@ -79,22 +94,19 @@ class HarnessLLM:
                 "harness backend supports tool-less create() only — agent "
                 "steps run through the provider's run_session "
                 "(doc/features/provider-registry.md)")
-        import time
-
-        from ..llm import capture_model_call
+        from .completion import complete_native
 
         kwargs = {"system": system, "messages": messages, "model": self._harness_model,
                   "max_tokens": max_tokens, "tools": []}
-        provider = f"harness:{self._transport.spec.id}"
-        started = time.monotonic()
-        try:
-            reply = self._transport.complete(
-                system=system, messages=messages, model=self._harness_model,
-                max_tokens=max_tokens, role=role)
-        except Exception as exc:
-            capture_model_call(kwargs, role, provider, None, time.monotonic() - started, error=str(exc))
-            raise
-        capture_model_call(kwargs, role, provider, reply, time.monotonic() - started)
+        from .base import execution_effort
+        effort = execution_effort(self._transport)
+        if effort:
+            kwargs['effort'] = effort
+        reply, _, _, _ = complete_native(
+            lambda: self._transport,
+            request={**{k: v for k, v in kwargs.items() if k != "tools"}, "role": role},
+            identity={"provider": self._transport.spec.id}, capture=True, settings=self.settings,
+        )
         if on_text is not None and reply.text:
             on_text(reply.text)
         return reply

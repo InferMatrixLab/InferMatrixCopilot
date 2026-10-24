@@ -1,5 +1,214 @@
 # Provider registry —— Strict 的六种后端
 
+
+> Execution-policy correction (2026-10-12): Default Codex tool-free completion
+> fails before dispatch because native tool disabling has not been established. A
+> read-only sandbox and an empty working directory do not prevent connected-app,
+> web, or native tool access. Existing agent-session support is separate. Do not
+> use older completion test results as proof of preventive tool isolation.
+> Explicit Docker containment is described below; it does not add native tool
+> disabling to the provider capability descriptor.
+
+Strict/quality readiness checks the adapter's completion preflight in addition
+to CLI/authentication. The shared agent-step runner also checks its output-repair
+client before dispatching an investigation, including API or harness mixture
+members: their repair still uses the run's client. Unsupported repair returns a
+blocked step without a paid investigation. This does not remove or weaken the
+completion requirement, and it does not certify native tool isolation for any
+other entry point.
+
+Claude's shared command builder disables built-in tools as a set with
+`--tools ""`, limits MCP configuration to the explicit review bridge, and sets
+`disableAllHooks` for governed calls. Native 2.1.296 loopback fixtures verify
+completion without tools, bridge-only review, inherited user-hook suppression
+and preservation of a user-configured model. Admin-managed customization and
+other native versions remain separate validation requirements.
+
+### Trusted sandbox completion configuration
+
+#### Sandbox backend and execution location
+
+Completion callers use `SandboxExecution` through a `SandboxCompletionProfile`.
+The provider registry and Codex adapter do not import Docker or SSH implementations.
+Backend configuration is registered through `sandbox.backends`; the shipped Docker
+adapter reuses `ContainerExecution` for its complete durable lifecycle. The old
+`ContainerCompletionProfile` translates its fields to this adapter and inherits
+the shared profile methods.
+
+New configuration separates the backend from its location:
+
+```json
+{
+  "codex": {
+    "kind": "sandbox",
+    "backend": {
+      "kind": "docker",
+      "docker": "/opt/docker",
+      "socket": "/run/docker.sock",
+      "image": "sha256:<64 hexadecimal characters>",
+      "model_proxy_socket": "/run/copilot/model-proxy.sock",
+      "codex_auth_file": "/home/agent/.codex/auth.json"
+    },
+    "location": {"kind": "local"}
+  }
+}
+```
+
+For an SSH sandbox, replace `location` with:
+
+```json
+{
+  "kind": "ssh",
+  "host": "Personal-Agent",
+  "python": "/opt/copilot-sandbox/env/bin/python",
+  "state_root": "/var/lib/copilot/sandboxes",
+  "sudo": false
+}
+```
+
+The remote Python must have the compatible Copilot wheel installed. Backend
+paths, login ownership and Unix sockets refer to that execution host. `ssh`
+(optional, default `/usr/bin/ssh`) refers to the controller. Existing SSH host/key
+configuration provides access; the adapter does not provision or weaken it.
+`sudo: true` explicitly selects `/usr/bin/sudo -n` on the remote host when its
+provisioned daemon requires it. Model input cannot select these settings.
+
+Both locations invoke the same registered backend and worker protocol. Credentials
+and proxy mounts are prepared beside the daemon. Remote execution uses a framed
+agent endpoint rather than mounting controller paths on another host. The host's
+absolute deadline bounds SSH and cancellation; the remaining worker duration is
+translated into the execution host's monotonic clock.
+
+The controller reserves `remote-binding.json` before dispatch; the execution host
+reserves its original request before starting the backend. Bindings preserve
+location, backend, command, input and agent package fingerprint. Unknown responses
+remain pending. Result/recovery/cancellation target that original identity; none
+can start a replacement. A recorded result can be read without SSH. Changed
+configuration/releases or corrupt result hashes refuse recovery. Keep the original
+remote runtime/state until its domain settles the result.
+
+Command callbacks expose native stdout/stderr only. The shared receipt decoder
+verifies the worker's terminal control record; its projection strips that record
+from both callbacks and `ProcessOutcome`. Raw backend records retain it for
+diagnostics. Malformed/unverified control output remains diagnostic evidence and
+cannot establish a successful result.
+
+Cancellation returns the same `CancellationReceipt` at either location:
+`requested`, `terminated`, and `state` (`terminal`, `pending`, or `unknown`).
+The durable intent targets the original identity. `terminated` requires observed
+terminal backend state; a created worker or unavailable daemon remains pending
+or unknown. Termination does not prove a complete model reply, settled budget or
+permission for a business retry. Existing bindings take precedence over invalid
+replacement arguments, expired deadlines, cancellation and credential setup.
+
+Agent protocol 2 declares this control contract before dispatch. Legacy bindings
+without a protocol field retain protocol 1 for original-result/cancel observation;
+its old acknowledgment translates to `terminated=false, state=unknown`.
+It does not receive invented termination proof or authorize another invocation.
+
+Native authentication also uses this profile through `HarnessTransport.auth_probe`.
+Optional `SandboxExecution.context/with_context` operations expose and bind a
+nonsecret identity: release, artifact, credential-source/snapshot hashes,
+credential mode and access-token expiry. Backends without these operations cannot
+grant admission. The sandbox returns identity; the provider workflow interprets
+the native login result and selects billing policy.
+
+`ModelGateway.subscription_billing` records a zero-model `auth_probe`, then retains
+an immutable admission for the next role dispatch. It requires explicit managed
+ChatGPT credentials, native `login status` success and a known unexpired access
+token. Dispatch revalidates the original proof, trace root, configuration, release,
+artifact and credential snapshot. Changed/expired/missing proof refuses dispatch
+without fallback. SSH validates the release before reservation and the prepared
+credential snapshot on the execution host before invoking the backend. No host
+login or credentials from another execution location can grant admission.
+
+This identifies native ChatGPT authentication mode, not membership, vendor quota,
+revocation state or an invoice. USD cost remains unknown. OAuth verification and
+refresh stay with the native client and its original host; no refresh token is
+exported. Model accounting remains separate from authentication control records.
+
+Docker is the shipped isolation backend; `local` and `ssh` are execution locations.
+Additional backends implement `SandboxExecution` and register a
+`SandboxBackendConfig` on both hosts. Unregistered backends fail before dispatch.
+The existing flat `kind: docker` configuration below remains compatible and means
+local execution. Contained completion supports Codex and ZCode. ZCode requires an explicit
+container-native CLI and delegates its existing adapter through the generic
+provider worker; native commands, regular-file spool and tool/event rules remain
+in that adapter. Configured ZCode does not inherit a host subscription claim.
+Native authentication/admission remains a separate open gate; schema, session,
+byte-idle and spend-threshold controls refuse before dispatch. Codex credential
+files and native policies cannot be applied to ZCode. This does not establish
+real-account or model-quality parity.
+
+#### Compatible flat Docker configuration
+
+An explicit host configuration can select the existing contained Codex completion
+mechanism for `HarnessLLM`, knowledge `ModelGateway`, and CLI judges. They all
+delegate to `providers.completion.complete_native`; callers do not launch Docker.
+For example, set the following in the trusted host environment, replacing paths
+and the digest with the actual provisioned executable, Unix daemon socket and
+immutable worker image:
+
+```bash
+export TRACE_STORE_ROOT=/absolute/path/to/copilot-traces
+export NATIVE_COMPLETION_PROFILES='{"codex":{"kind":"docker","docker":"/absolute/path/to/docker","socket":"/absolute/path/to/docker.sock","image":"sha256:<64 hexadecimal characters>"}}'
+```
+
+The image must contain Copilot's container worker and Codex at
+`/usr/local/bin/codex` (override with `native_cli`). An optional
+`model_proxy_socket` selects the existing Unix relay; it cannot be the daemon
+socket. `control_timeout_s` bounds Docker control commands. Configuration rejects
+unknown fields/providers and mutable images before dispatch. Model requests
+cannot choose these values.
+
+To use an existing native ChatGPT login, add `codex_auth_file` with the absolute
+path to its private `auth.json` and set `model_proxy_socket` to the provisioned
+relay. If the controller runs under a different service account, also pin
+`codex_auth_owner_uid` to the login owner's numeric UID. Otherwise ownership must
+match the controller. Symlinks, group/world-readable files and unsupported login
+formats fail before model dispatch. API-key, keyring and custom-provider login
+formats are not supported by this optional snapshot adapter.
+
+The controller reads a filtered external-token snapshot into memory. Worker
+protocol 4 delivers it through a private Unix socket and creates mode-0600 files
+in the worker's temporary filesystem. The original cache and host home are not
+mounted; the refresh token is never forwarded. Native Codex on the host retains
+refresh ownership. Expired or revoked access tokens require that host-managed
+refresh before a new attempt; the container cannot refresh the account. Profile
+and recovery bindings contain hashes, never credential contents. Worker streams
+use the same secret filter as stored traces before reaching Docker logs or the
+terminal receipt. Recovery of an existing result needs no live login or broker.
+
+Each invocation durably records the request, allocates its own native attempt,
+and stores an immutable execution-profile descriptor below that attempt. The
+cached host transport never carries a previous invocation's container profile.
+There is one model-call receipt, preserving the existing prompt or conversation
+shape. Recording and account-settlement failures after dispatch remain pending
+for reconciliation and cannot authorize fallback.
+
+Reserved SDK/MCP runs bind configuration and trace location before launch;
+children and resumptions restore that binding. CLI workflows bind it to their
+persisted task before execution. Old runs without a binding retain their original
+host policy. Init batches persist the profile independently of coverage and
+refuse configuration changes against the same batch. Missing or changed original
+bindings fail closed instead of selecting a replacement environment.
+
+Containment alone does not establish a preventive `builtin_tools_off` capability
+or subscription admission. Verdicts using native tools are still rejected.
+Without this opt-in configuration, Codex completion retains its existing
+preflight rejection. Agent-session transport selection is unchanged.
+
+On 2026-10-14, the pinned Codex 0.162.1 worker on Personal-Agent authenticated
+using the existing account and completed one frozen JSON request. The original
+cache hash was unchanged and the credential scan of retained evidence passed.
+This verifies this account/image's authentication and execution path. The CLI
+did not report a served-model identity or USD cost; neither is inferred.
+The later profile-scoped admission candidate passed native zero-model login
+probes in local Docker and through SSH using the existing Personal-Agent account;
+its original cache remained unchanged and retained evidence contained no token
+matches. Next-model binding is covered by deterministic worker tests. Broader
+native parity, refresh/revocation and model-quality acceptance remain open.
+
 > **一览**
 > | | |
 > |---|---|
@@ -183,9 +392,12 @@ MoA（`for_member`）在 v1 里**拒绝**把 harness provider 作为混合成员
 - 那个 `ToolScope`（frozen dataclass → JSON：name、allowed_tools、read_only、
   root、path_scope 模式）—— 可轻松往返；
 - 仓库名 + repo_path（PR-time worktree）、run_dir；
-- 要重建哪些额外工具族（knowledge/doc/repo_map）—— 它们在桥进程里由
-  `Settings()` + adapter 重建，用的是**与 runner 相同的工厂**
-  （`_knowledge_tools`、`_repo_map_tool`、`_repo_docs_tool`）。
+- 要重建哪些额外工具族（knowledge/doc/repo_map）：`repo_map` 委托共享工厂；
+  doc read/search 委托领域 `KnowledgeDocs` 与 `KnowledgeView.for_root`，
+  进程内调用和 bridge 使用同一个快照选择及逐次完整性校验实现。
+  bridge 保留 legacy 文本／分页包装；进程内 adaptive 检索与预算账本仍归
+  `KnowledgeContextService`，不据此宣称 adaptive 策略已完整迁入 bridge。
+  沙箱传递知识树旁的 manifest 原始字节，领域层负责解释与验证。
 
 每个 MCP 工具 handler 都是套在
 `tools.dispatch(name, args, scope=scope, trace=bridge_trace, extra=extra)`
@@ -233,6 +445,7 @@ Strict 子进程本身已经从 server worker 那里收到一份精选环境
 ```
 STRICT_BACKEND=                # Strict 必需：api | cursor | claude-code | codex
 STRICT_BACKEND_MODEL=          # harness 内部的模型 id（可选）
+STRICT_BACKEND_EFFORT=         # 原生推理强度默认值（可选；目前 Codex 支持，其他 provider 拒绝非空值）
 STRICT_BACKEND_CONCURRENCY=2   # 并发 harness 会话数
 STRICT_BACKEND_CLI=            # 二进制路径覆盖（否则走 PATH 查找）
 STRICT_BACKEND_TIMEOUT_S=1800  # 单会话墙钟上限
@@ -341,3 +554,21 @@ spec 只携带路径与模型标识：**不含 api_key，不含子进程 env**�
    用户通过显式选择后端，来自行决定把哪个账户暴露出去。
 5. harness 内部的模型命名（composer id、codex 模型 slug）——
    `doctor --probe` 报告 CLI **实际服务**的是什么；served-model 守卫逐次调用记录它。
+
+### Reported native token usage
+
+Codex preserves cache-read, cache-write and reasoning counters when reported by
+its native events. Session outcomes carry an optional `usage` mapping separate
+from legacy numeric display totals. Missing counters are unknown; do not replace
+them with zero or infer a subscription invoice amount.
+
+Session replies, trace records and account settlement use the same reported
+mapping. Legacy display totals remain available on the session outcome but do
+not become reported usage when that mapping is absent. A native event snapshot
+can supply missing reported facts; explicitly reported zero counts stay zero.
+
+Codex and OpenAI records set `input_tokens_include_cache=true`: cache tokens are
+subsets of `input_tokens`. The shared estimator removes those subsets before
+applying their rates. Older records without this marker retain the disjoint
+input/cache convention. Missing cache splits or inconsistent totals cannot
+establish an estimated cost.

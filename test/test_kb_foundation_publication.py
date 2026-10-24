@@ -35,8 +35,8 @@ def test_gate_preserves_partial_legacy_and_preview_modes(
     stage.record = InitRecord("knowledge", "toy", coverage={"knowledge": {
         "targets": {"required": required, "met": met}}})
     calls = []
-    monkeypatch.setattr(_Stage, "_publish", lambda self, changed: calls.append(changed) or self.record)
-    record = stage._publish({"knowledge/repos/toy/feature.md": "approved"})
+    monkeypatch.setattr(_Stage, "_prepare_publication", lambda self, changed: calls.append(changed) or self.record)
+    record = stage._prepare_publication({"knowledge/repos/toy/feature.md": "approved"})
     assert bool(calls) is not blocked
     assert (record.status == "blocked") is blocked
     if blocked:

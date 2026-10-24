@@ -14,11 +14,12 @@ from infermatrix_copilot.improve import forensics, gold as goldmod, meta, stats
 from infermatrix_copilot.improve.adapters import FindingLabel, Match, load_adapter, scores_from
 from infermatrix_copilot.improve.adapters.rb_review import RbReviewAdapter, classify
 from infermatrix_copilot.improve.adapters.review_eval import ReviewEvalAdapter
-from infermatrix_copilot.improve.judges import JudgeError, JudgeSpec, governed_subprocess, parse_verdict, run_judge
+from infermatrix_copilot.improve.judges import JudgeError, JudgeSpec, parse_verdict, run_judge
 from infermatrix_copilot.improve.reader import units_between
 from infermatrix_copilot.trace_store import TraceStore, bind_store, trace_context
 
 from test_improve_p1 import CLEAN, T0, Clock, _call, _decision, _store, _tool, _unit  # noqa: E402
+from execution_helpers import contained_codex  # noqa: F401
 
 REVIEW = ("## Review\n\nvllm/config.py:66 [major] — trust_remote_code should default to False; "
           "passing it through from CLI overrides is a bug.\n\nAlso the kernels version check is dead code.")
@@ -70,7 +71,7 @@ def test_gold_draft_load_and_id_discipline(tmp_path):
 
 # -- judges + stats ---------------------------------------------------------------------------
 
-def test_judge_runner_paths_and_verdict_parsing(tmp_path):
+def test_judge_runner_paths_and_verdict_parsing(tmp_path, contained_codex):
     assert parse_verdict('prose {"status": "hit", "quote": "x"} trailing')["status"] == "hit"
     with pytest.raises(JudgeError):
         parse_verdict("no json here")
@@ -117,16 +118,18 @@ def test_judge_runner_paths_and_verdict_parsing(tmp_path):
     def codex_ok(argv, **kw):
         assert "--skip-git-repo-check" in argv and "-C" in argv
         stream = json.dumps({"type": "item.completed", "item": {"item_type": "agent_message",
-                                                                 "text": '{"status": "miss", "quote": ""}'}})
+                                                                 "text": '{"status": "miss", "quote": ""}'}}) + '\n' + json.dumps({'type':'turn.completed'})
         return SimpleNamespace(returncode=0, stdout=stream, stderr="")
-    assert run_judge(JudgeSpec("cli", "gpt-6", provider="codex"), system="", prompt="p", runner=codex_ok)["status"] == "miss"
+    contained_codex.runner = codex_ok
+    assert run_judge(JudgeSpec("cli", "gpt-6", provider="codex"), system="", prompt="p")["status"] == "miss"
 
     def codex_tooling(argv, **kw):
         stream = json.dumps({"type": "item.completed", "item": {"item_type": "command_execution", "command": "cat gt"}}) + "\n" + \
-            json.dumps({"type": "item.completed", "item": {"item_type": "agent_message", "text": '{"status": "hit"}'}})
+            json.dumps({"type": "item.completed", "item": {"item_type": "agent_message", "text": '{"status": "hit"}'}}) + '\n' + json.dumps({'type':'turn.completed'})
         return SimpleNamespace(returncode=0, stdout=stream, stderr="")
+    contained_codex.runner = codex_tooling
     with pytest.raises(JudgeError, match="command_execution"):
-        run_judge(JudgeSpec("cli", "gpt-6", provider="codex"), system="", prompt="p", runner=codex_tooling)
+        run_judge(JudgeSpec("cli", "gpt-6", provider="codex"), system="", prompt="p")
 
     class FakeLLM:
         def create(self, **kw):
@@ -152,7 +155,6 @@ def test_zcode_judge_delegates_to_the_production_transport(tmp_path, monkeypatch
     """cli:zcode judging goes through ZCodeTransport.complete — the same
     tool-less one-shot the production kb gate uses — governed by the
     judge-call envelope and recorded like any CLI judge."""
-    from infermatrix_copilot.improve.judges import _run_zcode
     from infermatrix_copilot.providers import registry
 
     calls = []
@@ -204,25 +206,6 @@ def test_zcode_judge_delegates_to_the_production_transport(tmp_path, monkeypatch
     monkeypatch.setattr(registry, "transport_for_id", lambda settings, pid: empty)
     with pytest.raises(JudgeError, match="empty zcode judge reply"):
         run_judge(JudgeSpec("cli", "GLM-5.3", provider="zcode"), system="s", prompt="p", governor=None)
-
-
-def test_zcode_run_helper_returns_the_parsed_triple(monkeypatch):
-    """The helper's contract: (text, usage, error, served) — the reply's
-    text from text blocks only, non-text blocks ignored."""
-    from infermatrix_copilot.improve.judges import _run_zcode
-    from infermatrix_copilot.providers import registry
-
-    class Transport:
-        def complete(self, **kw):
-            return SimpleNamespace(blocks=[SimpleNamespace(type="reasoning", text="thinking"),
-                                           SimpleNamespace(type="text", text='{"verdict": "consistent"}')],
-                                   usage={"input_tokens": 1}, model="GLM-5.3")
-
-    monkeypatch.setattr(registry, "transport_for_id", lambda settings, pid: Transport())
-    text, usage, error, served = _run_zcode(JudgeSpec("cli", "GLM-5.3", provider="zcode"),
-                                            system="s", prompt="p", role="judge", governor=None)
-    assert text == '{"verdict": "consistent"}' and not error and served == "GLM-5.3"
-    assert usage == {"input_tokens": 1}
 
 
 def test_zcode_judge_serves_the_trusted_kb_gate(monkeypatch, tmp_path):
@@ -632,7 +615,7 @@ def test_executor_records_the_rendered_review_as_the_units_terminal_decision(tmp
     an empty body."""
     import asyncio
 
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.step import StepResult, StepSpec
     from infermatrix_copilot.playbooks.store import Playbook, PlaybookStep

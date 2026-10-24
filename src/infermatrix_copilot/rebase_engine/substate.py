@@ -15,9 +15,10 @@ Repo-neutral: module names and section shapes are data supplied by callers.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes, fsync_directory
+
 import errno
 import json
-import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +29,16 @@ _DIR_FSYNC_TOLERATED = {errno.EINVAL, errno.EOPNOTSUPP,
 
 class SubstateError(RuntimeError):
     """The substate file is unusable or belongs to a different run."""
+
+
+def _sync_directory(directory):
+    try:
+        fsync_directory(directory)
+    except OSError as e:
+        if e.errno not in _DIR_FSYNC_TOLERATED:
+            raise SubstateError(
+                "substate directory fsync failed — durability cannot be "
+                "guaranteed") from e
 
 
 def _deep_merge(base: dict, extra: Mapping) -> dict:
@@ -81,23 +92,8 @@ class Substate:
 
     def _write_durable(self, data: dict) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=1, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
-        try:
-            dfd = os.open(self.run_dir, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError as e:
-            if e.errno not in _DIR_FSYNC_TOLERATED:
-                raise SubstateError(
-                    "substate directory fsync failed — durability cannot be "
-                    "guaranteed") from e
+        atomic_write_bytes(self.path, json.dumps(data, indent=1, sort_keys=True).encode("utf-8"),
+                           directory_fsync=_sync_directory)
 
     # -- api ------------------------------------------------------------------
 

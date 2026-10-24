@@ -20,7 +20,7 @@ PAGE = "repos/demo/components/core/feature-demo.md"
 
 def test_owner_extraction_uses_all_production_roots_from_policy(world):
     import json
-    from infermatrix_copilot.kb_service.init_knowledge import SYSTEM_KNOWLEDGE
+    from test_kb_init_knowledge import CURRENT_KNOWLEDGE_SYSTEM as SYSTEM_KNOWLEDGE
 
     gateway = KnowledgeGateway()
     _chain(world, gateway)
@@ -328,7 +328,7 @@ def test_bad_denominators_and_cross_repository_features_are_rejected(mutation):
 
 def test_source_only_feature_can_be_extracted_and_covered_without_documentation(world):
     import json
-    from infermatrix_copilot.kb_service.init_knowledge import SYSTEM_KNOWLEDGE
+    from test_kb_init_knowledge import CURRENT_KNOWLEDGE_SYSTEM as SYSTEM_KNOWLEDGE
 
     gateway = KnowledgeGateway()
     _chain(world, gateway)

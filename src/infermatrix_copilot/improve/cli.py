@@ -137,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
     bp = sub.add_parser("budget")
     bp.add_argument("--ledger-dir", default=None)
     bp.add_argument("--trace-root", default=None)
+    reconciliation = bp.add_mutually_exclusive_group()
+    reconciliation.add_argument('--reconcile-native', default='', metavar='RESERVATION_ID')
+    reconciliation.add_argument('--reconcile-judge', default='', metavar='RESERVATION_ID')
+    bp.add_argument('--offline-confirmed', action='store_true')
     for name in ("publish", "sync"):
         p = sub.add_parser(name, help="proposal publication through the maintainer routine's outbox (publish needs ALLOW_POST=1)")
         p.add_argument("--ledger-dir", default=None)
@@ -454,7 +458,19 @@ def _experiment_commands(args) -> int:
     settings = Settings()
     ledger_dir = _ledger_dir(args)
     if args.command == "budget":
-        print(json.dumps(governor_for(settings, ledger_dir).remaining(), indent=1))
+        governor = governor_for(settings, ledger_dir)
+        if args.reconcile_native or args.reconcile_judge:
+            from .budget import BudgetRefused, BudgetBreach
+            from ..trace_store import MigrationError
+            try:
+                reconcile = governor.reconcile_judge if args.reconcile_judge else governor.reconcile_native
+                result = reconcile(args.reconcile_judge or args.reconcile_native, offline_confirmed=args.offline_confirmed)
+            except (BudgetRefused, BudgetBreach, ValueError, OSError, KeyError, MigrationError) as exc:
+                print(json.dumps({'error': str(exc), 'replacement_execution_authorized': False}), file=sys.stderr)
+                return 2
+        else:
+            result = governor.remaining()
+        print(json.dumps(result, indent=1))
         return 0
     store = _store(args)
     try:

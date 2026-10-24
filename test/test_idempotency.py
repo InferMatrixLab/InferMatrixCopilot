@@ -319,20 +319,75 @@ def test_execute_reserved_exits_without_running_when_already_claimed(settings):
 
 
 # ── retention ─────────────────────────────────────────────────────────────────
-def test_reaper_drops_entries_whose_run_is_gone(settings):
-    """A missing run dir is stale by definition: dropping the entry lets a later
-    request with that key open a fresh run instead of resolving to a run that
-    cannot be read."""
+def test_reaper_retains_entries_whose_run_is_gone(settings):
+    """Missing state cannot authorize another execution of the same key."""
     cop = Copilot(settings)
     run_id, _ = _reserve(cop, _spec())
     import shutil
 
     shutil.rmtree(Path(settings.run_root) / run_id)
     counts = idem.reap_stale(settings.run_root, worktree_root=_isolated_root())
-    assert counts["entries"] == 1
-    assert idem.read_entry(settings.run_root, KEY) is None
+    assert counts["entries"] == 0
+    assert idem.read_entry(settings.run_root, KEY)["run_id"] == run_id
     fresh, created = _reserve(cop, _spec())
-    assert created is True and fresh != run_id
+    assert created is False and fresh == run_id
+    assert not (Path(settings.run_root) / run_id).exists()
+
+
+@pytest.mark.parametrize("raw", ["{", "[]", "null", "{}"])
+def test_unreadable_or_invalid_key_binding_never_creates_another_run(settings, raw):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec())
+    path = idem._entry_path(settings.run_root, KEY)
+    path.write_text(raw)
+    with pytest.raises(idem.IdempotencyError, match="reconcile"):
+        _reserve(cop, _spec())
+    assert idem.reap_stale(settings.run_root, retention_days=0,
+                           worktree_root=_isolated_root())["entries"] == 0
+    assert path.read_text() == raw
+    assert [p.name for p in Path(settings.run_root).glob("run-*")] == [run_id]
+
+
+@pytest.mark.parametrize("raw", [None, "{", "[]", '{"state":"interrupted"}', '{"state":"queued"}'])
+def test_missing_or_damaged_status_preserves_original_dispatch(settings, raw):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec())
+    run_dir = Path(settings.run_root) / run_id
+    rs.mark_child_started(run_dir, child_pid=999)
+    path = rs.status_path(run_dir)
+    if raw is None:
+        path.unlink()
+    else:
+        path.write_text(raw)
+    assert not idem.relaunchable(run_dir)
+    assert not rs.reclaim_queued(run_dir, owner_server_id="S2", owner_server_pid=2)
+    assert not rs.claim_for_execution(run_dir, child_pid=123)
+    assert _reserve(cop, _spec()) == (run_id, False)
+    assert idem.reap_stale(settings.run_root, retention_days=0,
+                           worktree_root=_isolated_root())["entries"] == 0
+    assert idem.read_entry(settings.run_root, KEY)["run_id"] == run_id
+
+
+def test_aged_interrupted_execution_keeps_its_binding(settings):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec())
+    run_dir = Path(settings.run_root) / run_id
+    rs.mark_child_started(run_dir, child_pid=999)
+    rs.mark(run_dir, rs.INTERRUPTED)
+    assert idem.reap_stale(settings.run_root, retention_days=0,
+                           worktree_root=_isolated_root())["entries"] == 0
+    assert _reserve(cop, _spec()) == (run_id, False)
+
+
+def test_never_started_reservation_requires_its_original_request_to_relaunch(settings):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec())
+    run_dir = Path(settings.run_root) / run_id
+    rs.mark(run_dir, rs.INTERRUPTED)
+    (run_dir / "request.json").unlink()
+    with pytest.raises(idem.IdempotencyError, match="reconcile"):
+        _reserve(cop, _spec())
+    assert rs.read_status(run_dir)["state"] == rs.INTERRUPTED
 
 
 def test_reaper_never_touches_a_live_run(settings):
@@ -452,3 +507,104 @@ def test_reaper_deletes_only_dead_runs_pinned_refs(settings, tmp_path):
     assert counts["refs"] == 1
     remaining = _git(repo, "for-each-ref", "--format=%(refname)", "refs/imx/")[1]
     assert live.name in remaining and "bbbbbb" not in remaining
+
+
+def test_legacy_index_uses_persisted_request_to_check_identity(settings):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec(pr=7))
+    path = idem._entry_path(settings.run_root, KEY)
+    entry = json.loads(path.read_text())
+    entry.pop('spec_fingerprint')
+    path.write_text(json.dumps(entry))
+    assert _reserve(cop, _spec(pr=7)) == (run_id, False)
+    with pytest.raises(idem.IdempotencyError, match='different request'):
+        _reserve(cop, _spec(pr=8))
+
+
+def test_index_read_permission_failure_does_not_dispatch(settings, monkeypatch):
+    cop = Copilot(settings)
+    run_id, _ = _reserve(cop, _spec())
+    path = idem._entry_path(settings.run_root, KEY)
+    original = Path.read_text
+
+    def read(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError('unreadable')
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read)
+    with pytest.raises(idem.IdempotencyError, match='reconcile'):
+        _reserve(cop, _spec())
+    assert [p.name for p in Path(settings.run_root).glob('run-*')] == [run_id]
+
+
+def test_reaper_rechecks_replacement_binding_under_the_key_lock(settings, monkeypatch):
+    from contextlib import contextmanager
+
+    cop = Copilot(settings)
+    old, _ = _reserve(cop, _spec())
+    rs.mark(Path(settings.run_root) / old, rs.DONE)
+    replacement = 'run-20261013-000000-abcdef'
+    new_dir = Path(settings.run_root) / replacement
+    rs.init_queued(new_dir, run_id=replacement, owner_server_id='new', owner_server_pid=123)
+    original = idem.key_lock
+
+    @contextmanager
+    def replace_before_read(root, key, **kwargs):
+        with original(root, key, **kwargs):
+            idem.write_entry(root, key, replacement, idem.spec_fingerprint(_spec().model_dump()))
+            yield
+
+    monkeypatch.setattr(idem, 'key_lock', replace_before_read)
+    counts = idem.reap_stale(settings.run_root, retention_days=0, worktree_root=_isolated_root())
+    assert counts['entries'] == 0
+    assert idem.read_entry(settings.run_root, KEY)['run_id'] == replacement
+
+
+@pytest.mark.parametrize('lose_status', [False, True])
+def test_killed_execution_does_not_dispatch_again(settings, tmp_path, lose_status):
+    import subprocess
+    import sys
+    import time
+
+    ready = tmp_path / 'dispatch.json'
+    script = '''
+import json, os, sys, time
+from pathlib import Path
+from infermatrix_copilot.app.reservation import RunReservation
+from infermatrix_copilot.config import Settings
+from infermatrix_copilot.task_spec import TaskSpec
+from infermatrix_copilot import run_status
+root, ready, key, raw = sys.argv[1:]
+reservation = RunReservation(Settings(_env_file=None, run_root=Path(root)))
+run_id, created = reservation.reserve(TaskSpec.model_validate(json.loads(raw)),
+    owner_server_id='child', owner_server_pid=os.getpid(), idempotency_key=key)
+assert created and run_status.claim_for_execution(Path(root)/run_id, child_pid=os.getpid())
+Path(ready).write_text(json.dumps({'run_id': run_id, 'dispatches': 1}))
+time.sleep(120)
+'''
+    child = subprocess.Popen([sys.executable, '-c', script, str(settings.run_root), str(ready),
+                              KEY, json.dumps(_spec().model_dump())],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert ready.exists(), 'fixture did not reach execution claim'
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.communicate(timeout=10)
+    receipt = json.loads(ready.read_text())
+    run_dir = Path(settings.run_root) / receipt['run_id']
+    if lose_status:
+        rs.status_path(run_dir).unlink()
+    else:
+        rs.reconcile_if_dead(run_dir, settings.run_root)
+        assert rs.read_status(run_dir)['state'] == rs.INTERRUPTED
+    assert _reserve(Copilot(settings), _spec()) == (receipt['run_id'], False)
+    assert not rs.claim_for_execution(run_dir, child_pid=123)
+    assert idem.reap_stale(settings.run_root, retention_days=0,
+                           worktree_root=_isolated_root())['entries'] == 0
+    assert json.loads(ready.read_text()) == receipt
+    assert len(list(Path(settings.run_root).glob('run-*'))) == 1

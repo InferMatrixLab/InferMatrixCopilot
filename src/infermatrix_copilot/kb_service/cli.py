@@ -6,6 +6,7 @@
     kb resume (--repo R | --all)
     kb control                        refresh the signed control record now
     kb accept-unknown SHA             judge an unknown knowledge commit through the gate instead of reverting it
+    kb reconcile-review CHANGESET     settle a saved completed gate without model calls or publication
     kb run --playbook kb-intake --repo R   run one knowledge playbook once
     kb calibrate --repo R             run the judge over the repository's calibration set
     kb serve [--once]                 the scheduler (holds the single-writer lease)
@@ -13,6 +14,8 @@
     kb rollback --to SHA              point `active` back at an earlier snapshot
     kb traces [--kind K] [--changeset ID] [--rule ID] [--limit N]   query trace/1 records
     kb replay --record ID --model PROVIDER:MODEL[:EFFORT]           re-ask a recorded call
+    kb recover-attempt --attempt ID --record ID --offline-confirmed finalize an archived call without dispatch
+    kb reconcile-init-cost --repo R --stage S --record ID --offline-confirmed settle original init accounting
     kb export --out FILE [--role judge|generator]                   dataset (calibration-safe)
     kb init REPO --stage STAGE [--dry-run] [--pin SHA]
                                       bootstrap a repository's knowledge base, one
@@ -57,7 +60,7 @@ def _ledger(state_dir: Path):
 
 
 def _registry():
-    from ..sdk._resources import adapters_root
+    from ..resources import adapters_root
     from .config import general_lifecycle, load_registry
 
     general = general_lifecycle(
@@ -151,51 +154,24 @@ def _init_command(args, state_dir: Path) -> int:
     from .runner import run_playbook
 
     params = {"stage": args.stage, "dry_run": "true" if args.dry_run else "false", "pin": args.pin or ""}
-    foundation_mode = getattr(args, "foundation_mode", "strict")
-    foundation_record = getattr(args, "foundation_record", None)
-    if foundation_mode != "strict" or foundation_record is not None:
-        if foundation_mode != "partial" or args.stage not in ("knowledge", "knowledge-deepen") or not args.unlimited_subscription:
-            print("--foundation-mode partial requires unlimited knowledge or knowledge-deepen", file=sys.stderr)
-            return 2
-        if bool(foundation_record) != (args.stage == "knowledge-deepen"):
-            print("--foundation-record is required only for partial knowledge-deepen", file=sys.stderr)
-            return 2
-        params["foundation_mode"] = foundation_mode
-        if foundation_record is not None:
-            params["foundation_record"] = str(foundation_record)
-    if getattr(args, "acceptance_mode", "strict") != "strict":
-        if args.stage != "knowledge-deepen":
-            print("--acceptance-mode is for knowledge-deepen only", file=sys.stderr)
-            return 2
-        params["acceptance_mode"] = args.acceptance_mode
-    if args.from_existing:
-        if args.stage not in ("feature-discovery", "modules", "knowledge", "knowledge-deepen"):
-            print("--from-existing is for feature-discovery, modules, knowledge or knowledge-deepen only", file=sys.stderr)
-            return 2
-        params["from_existing"] = "true"
-    if args.subscription_generator:
-        params["subscription_generator"] = "true"
-    if args.unlimited_subscription:
-        params["unlimited_subscription"] = "true"
-    if args.retry_unfinished:
-        if args.stage not in ("feature-discovery", "knowledge-deepen"):
-            print("--retry-unfinished is for feature-discovery or knowledge-deepen only", file=sys.stderr)
-            return 2
-        params["retry_unfinished"] = "true"
-    if args.pr_count is not None:
-        if args.stage != "pr-history" or args.pr_count < 1:
-            print("--pr-count is a positive integer for --stage pr-history only", file=sys.stderr)
-            return 2
-        params["pr_count"] = str(args.pr_count)
-    if args.budget_usd is not None:
-        import math
+    from ..engine.steps.knowledge import init_options
+    from .init_stages import validate_options
+    from .init_support import InitError
 
-        if args.stage not in ("feature-discovery", "pr-history", "knowledge-deepen") or not math.isfinite(args.budget_usd) or args.budget_usd <= 0:
-            print("--budget-usd is a finite positive ceiling for feature-discovery, pr-history or knowledge-deepen", file=sys.stderr)
-            return 2
-        params["budget_usd"] = str(args.budget_usd)
+    for name in ("foundation_mode", "foundation_record", "acceptance_mode", "from_existing",
+                 "subscription_generator", "unlimited_subscription", "retry_unfinished", "pr_count", "budget_usd"):
+        value = getattr(args, name, None)
+        if value is not None and value is not False and value != "strict":
+            params[name] = str(value).lower() if isinstance(value, bool) else str(value)
+    try:
+        validate_options(args.stage, init_options(params))
+    except InitError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     outcome, run_dir = run_playbook(Settings(), "kb-init", args.repo, state_dir=state_dir, params=params)
     print(f"kb init {args.repo} {args.stage}: {outcome.status} ({run_dir})")
+    if getattr(outcome, "blocked_reason", ""):
+        print(outcome.blocked_reason, file=sys.stderr)
     return 0 if outcome.status == "done" else 1
 
 
@@ -216,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("control")
     accept = sub.add_parser("accept-unknown")
     accept.add_argument("sha")
+    review = sub.add_parser("reconcile-review", help="settle a completed gate receipt without model calls or publication")
+    review.add_argument("changeset")
     reconcile = sub.add_parser("reconcile-reviewed", help="verify and admit an exact owner-merged knowledge history")
     action = reconcile.add_mutually_exclusive_group(required=True)
     action.add_argument("--plan", type=Path, help="write a signed plan; does not admit any commit")
@@ -262,6 +240,40 @@ def main(argv: list[str] | None = None) -> int:
     traces.add_argument("--rule")
     traces.add_argument("--run")
     traces.add_argument("--limit", type=int, default=50)
+    recover = sub.add_parser("recover-attempt", help="finalize an interrupted native archive from its original trace")
+    recover.add_argument("--attempt", required=True)
+    recover.add_argument("--record", required=True)
+    recover.add_argument("--outcome", choices=("complete", "failed"), default="complete",
+                         help="failed preserves a recorded failure after an explicitly completed native call")
+    recover.add_argument("--offline-confirmed", action="store_true",
+                         help="confirm all writers to this trace store have stopped")
+    reconcile = sub.add_parser("reconcile-init-cost", help="settle an original init reservation from its completed native trace")
+    reconcile.add_argument("--repo", required=True)
+    reconcile.add_argument("--stage", required=True)
+    reconcile.add_argument("--record", required=True)
+    reconcile.add_argument("--outcome", choices=("complete", "failed"), default="complete",
+                           help="failed settles cost only for an explicitly completed original failure")
+    reconcile.add_argument("--offline-confirmed", action="store_true",
+                           help="confirm all init and trace writers have stopped")
+    review_recovery = sub.add_parser("reconcile-init-review", help="recover an original completed quality result")
+    review_recovery.add_argument("--repo", required=True)
+    from .init_support import STAGES, INDEPENDENT_STAGES
+    review_recovery.add_argument("--stage", choices=STAGES + INDEPENDENT_STAGES, required=True)
+    review_recovery.add_argument("--record", required=True)
+    review_recovery.add_argument("--offline-confirmed", action="store_true",
+                                 help="confirm all init and trace writers have stopped")
+    foundation_recovery = sub.add_parser("reconcile-foundation", help="recover an original foundation task from retained local inputs")
+    foundation_recovery.add_argument("--repo", required=True)
+    foundation_recovery.add_argument("--dispatch", required=True, help="original dispatch SHA-256")
+    foundation_recovery.add_argument("--attempt", required=True, type=int)
+    foundation_recovery.add_argument("--offline-confirmed", action="store_true",
+                                     help="confirm all init and trace writers have stopped")
+    discovery_recovery = sub.add_parser("reconcile-discovery", help="settle an original discovery task from retained local inputs")
+    discovery_recovery.add_argument("--repo", required=True)
+    discovery_recovery.add_argument("--dispatch", required=True, help="original dispatch SHA-256")
+    discovery_recovery.add_argument("--attempt", required=True, type=int)
+    discovery_recovery.add_argument("--offline-confirmed", action="store_true",
+                                    help="confirm all init and trace writers have stopped")
     replay = sub.add_parser("replay")
     replay.add_argument("--record", required=True)
     replay.add_argument("--model", required=True, help="provider:model[:effort], e.g. codex:gpt-6-mini:low")
@@ -367,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "publish":
         return _publish(args)
-    if args.command in {"traces", "replay", "export"}:
+    if args.command in {"traces", "replay", "export", "recover-attempt", "reconcile-init-cost", "reconcile-init-review", "reconcile-foundation", "reconcile-discovery"}:
         return _traces_command(args, _state_dir(args.state_dir))
     if args.command in ("init", "widen", "deepen"):
         # before any ledger is opened: kb init never touches the service's kb.db
@@ -412,10 +424,23 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = _state_dir(args.state_dir)
     ledger = _ledger(state_dir)
     try:
+        if args.command == "reconcile-review":
+            from .gate_receipts import settle_gate_result
+            from .ledger import LeaseError
+
+            try:
+                with ledger.lease() as owner:
+                    row = settle_gate_result(ledger, state_dir, owner, args.changeset)
+                print(json.dumps({"changeset_id": row["id"], "status": row["status"]}))
+                return 0
+            except (OSError, ValueError, KeyError, TypeError, LeaseError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
         registry = _registry()
         if _sync_repos(ledger, registry) and os.environ.get("KB_SIGNING_KEY"):
             _refresh(state_dir, ledger, registry)
         if args.command == "status":
+            from .intake import unresolved_draft_checkpoints
             from .reconcile import read_receipts
             from .sources import KnowledgeRepo
 
@@ -429,6 +454,12 @@ def main(argv: list[str] | None = None) -> int:
                     {**row, "configured": row["repo"] in registry or row["repo"] == "*",
                      "open_changesets": len(ledger.changesets(row["repo"], ("pr_open", "merge_requested")))
                      if row["repo"] != "*" else None,
+                     "unresolved_draft_events": [
+                         {"id": event["id"], "detail": event["detail"]}
+                         for event in ledger.events(row["repo"], "draft_unknown", limit=-1)
+                     ] if row["repo"] != "*" else [],
+                     "unresolved_draft_checkpoints": unresolved_draft_checkpoints(ledger, row["repo"])
+                     if row["repo"] != "*" else [],
                      "human_queue": len(ledger.human_queue(row["repo"])) if row["repo"] != "*" else None}
                     for row in ledger.all_repo_states()
                 ],
@@ -561,10 +592,39 @@ def _publish(args) -> int:
 
 
 def _traces_command(args, state_dir: Path) -> int:
-    """Read-only over the trace store (replay also calls the substitute model)."""
-    from ..trace_store import TraceStore
+    """Trace inspection, explicit replay, and offline archive finalization."""
+    import zlib
+    from ..trace_store import MigrationError, TraceStore
 
     store = TraceStore(state_dir / "traces")
+    if args.command in {"reconcile-init-cost", "reconcile-init-review", "reconcile-foundation", "reconcile-discovery"}:
+        from .init_recovery import reconcile_cost, reconcile_review, reconcile_foundation, reconcile_discovery
+        from .init_support import InitError
+        from .models import ModelUnavailable
+        try:
+            if args.command in {"reconcile-foundation", "reconcile-discovery"}:
+                operation = reconcile_foundation if args.command == 'reconcile-foundation' else reconcile_discovery
+                result = operation(state_dir, repo=args.repo, scope=(args.dispatch, args.attempt),
+                                   offline_confirmed=args.offline_confirmed)
+            else:
+                operation = reconcile_review if args.command == "reconcile-init-review" else reconcile_cost
+                result = operation(state_dir, repo=args.repo, stage=args.stage, trace_id=args.record,
+                                   **({"outcome": args.outcome} if args.command == "reconcile-init-cost" else {}),
+                                   offline_confirmed=args.offline_confirmed)
+        except (InitError, ModelUnavailable, MigrationError, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError, zlib.error) as exc:
+            print(f"init reconciliation refused: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "recover-attempt":
+        try:
+            attempt = store.recover_native_attempt(args.attempt, args.record,
+                                                   offline_confirmed=args.offline_confirmed, outcome=args.outcome)
+        except (MigrationError, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError, zlib.error) as exc:
+            print(f"native archive recovery refused: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({key: attempt[key] for key in ("id", "trace_id", "status")}, sort_keys=True))
+        return 0
     if args.command == "traces":
         records = store.query(kind=args.kind, changeset_id=args.changeset, rule_id=args.rule,
                               run_id=args.run, limit=args.limit)
@@ -584,7 +644,7 @@ def _traces_command(args, state_dir: Path) -> int:
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
         print()
         return 0
-    from ..sdk._resources import adapters_root
+    from ..resources import adapters_root
     from .replay import export_dataset
 
     adapters = Path(os.environ.get("ADAPTERS_DIR") or adapters_root())

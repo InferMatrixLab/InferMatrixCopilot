@@ -53,7 +53,7 @@ def read_roots_for(settings: Any, shadow_dir: str | Path) -> tuple[str, ...]:
         if candidate:
             roots.append(str(candidate))
     try:
-        from ..sdk._resources import adapters_root
+        from ..resources import adapters_root
 
         roots.append(str(adapters_root()))
     except Exception:  # noqa: BLE001 - no packaged adapters: nothing to add
@@ -110,7 +110,8 @@ def make_executables_dir(dest: str | Path, executables: Iterable[str] = DEFAULT_
 def shadow_env(*, shadow_dir: str | Path, run_dir: str | Path, trace_root: str | Path,
                executables_dir: str | Path, repo_name: str, environ: dict | None = None,
                ledger_dir: str | Path | None = None, usd_week: float = 20.0,
-               judge_calls_week: int = 300, input_context_limits: dict[str, int] | None = None) -> dict[str, str]:
+               judge_calls_week: int = 300, input_context_limits: dict[str, int] | None = None,
+               native_call_limits: dict | None = None) -> dict[str, str]:
     """The allowlisted environment for a shadow subprocess (layer 3). The
     child binds its own budget governor from IMPROVE_GOVERNED=1 and the
     ledger directory, against the same weekly files as the parent."""
@@ -139,6 +140,7 @@ def shadow_env(*, shadow_dir: str | Path, run_dir: str | Path, trace_root: str |
     out["IMPROVE_BUDGET_USD_WEEK"] = str(usd_week)
     out["IMPROVE_BUDGET_JUDGE_CALLS_WEEK"] = str(judge_calls_week)
     out["IMPROVE_INPUT_CONTEXT_LIMITS"] = json.dumps(input_context_limits or {}, sort_keys=True)
+    out['IMPROVE_NATIVE_CALL_LIMITS'] = json.dumps(native_call_limits or {}, sort_keys=True)
     return out
 
 

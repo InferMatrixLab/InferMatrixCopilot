@@ -113,12 +113,12 @@ def test_grep_error_is_not_reported_as_no_matches(tmp_path: Path):
 
 def test_grep_signal_death_is_an_error(tmp_path: Path, monkeypatch):
     """Signal termination is a NEGATIVE return code, which no `> 1` guard catches."""
-    import subprocess
+    from infermatrix_copilot import tools
 
     class Killed:
         returncode, stdout, stderr = -9, "", ""
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Killed())
+    monkeypatch.setattr(tools, "run_command", lambda *a, **k: Killed())
     out = dispatch("grep", {"pattern": "x", "path": str(tmp_path)})
     assert out["ok"] is False and "exit -9" in out["error"]
 
@@ -201,13 +201,13 @@ def test_read_file_refuses_negative_offset(tmp_path: Path):
 def test_grep_error_stderr_is_bounded_and_marked(tmp_path: Path, monkeypatch):
     """The stderr IS the diagnostic on a failed search, so it is bounded like any
     other model-visible cut rather than sliced silently."""
-    import subprocess
+    from infermatrix_copilot import tools
 
     class Noisy:
         returncode, stdout = 2, ""
         stderr = "E" * 5_000
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Noisy())
+    monkeypatch.setattr(tools, "run_command", lambda *a, **k: Noisy())
     out = dispatch("grep", {"pattern": "x", "path": str(tmp_path)})
     assert out["ok"] is False
     assert "truncated" in out["error"]

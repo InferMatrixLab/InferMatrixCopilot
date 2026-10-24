@@ -64,6 +64,55 @@ def test_evidence_capped_and_archived(settings, trace, tmp_path):
     assert str(archived) in prompt  # agent told where the full text lives
 
 
+def test_identical_drafts_keep_their_qualified_agent_identity_during_repair(settings, trace, tmp_path):
+    from infermatrix_copilot.trace_store import current_context
+    seen = []
+    class LLM(ScriptedLLM):
+        def create(self, **kwargs):
+            if kwargs['system'].startswith("Convert the agent's draft"):
+                seen.append(current_context().get('agent_step'))
+                return contract()
+            return Reply(blocks=[Block(type='text', text='identical draft')])
+    ctx = _ctx(settings, trace, tmp_path, llm=LLM([]))
+    before = current_context()
+    for name in ('review#logic', 'review#contracts'):
+        result, _ = _run(ctx, step_name=name)
+        assert result.ok
+    assert seen == ['review#logic', 'review#contracts']
+    assert current_context() == before
+
+
+@pytest.mark.parametrize("member_kind", ["default", "api", "harness"])
+def test_agent_admission_checks_repair_client_before_any_member_dispatch(
+    settings, trace, tmp_path, monkeypatch, member_kind,
+):
+    from types import SimpleNamespace
+    from infermatrix_copilot.providers.codex import CodexTransport
+    from infermatrix_copilot.providers.harness_llm import HarnessLLM
+
+    transport = CodexTransport(settings)
+    monkeypatch.setattr(transport, "cli_path", lambda: "/fake/codex")
+    ctx = _ctx(settings, trace, tmp_path,
+               llm=HarnessLLM(settings, transport))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported repair must block before a paid agent call")
+
+    monkeypatch.setattr("infermatrix_copilot.agent_loop.run_agent", forbidden)
+    monkeypatch.setattr("infermatrix_copilot.providers.run_harness_step", forbidden)
+    kwargs = {}
+    if member_kind == "api":
+        kwargs["llm_override"] = ScriptedLLM([contract()])
+    elif member_kind == "harness":
+        kwargs["harness_member"] = SimpleNamespace(provider="cursor", model="test")
+    result, output = _run(ctx, **kwargs)
+    assert not result.ok and result.failure == FailureKind.BLOCKED
+    assert "output-repair completion" in result.summary
+    assert "builtin_tools_off" in result.summary
+    assert output == {}
+    assert not list(trace.events("agent_dispatch"))
+
+
 @pytest.mark.parametrize("enabled,changed,expected", [
     (True, "pkg/models/catalog.py", True),
     (True, "unrelated.py", False),
@@ -85,7 +134,9 @@ def test_review_prompt_gets_scoped_knowledge_and_respects_ablation(
     monkeypatch.setattr(runner, "_repo_map_tool", lambda *args: {})
     diff = f"diff --git a/{changed} b/{changed}\n--- a/{changed}\n+++ b/{changed}\n@@ -1 +1 @@\n-old\n+new\n"
     llm = ScriptedLLM([contract()])
-    result, _ = _run(_ctx(settings, trace, tmp_path, llm=llm), evidence={"pr_diff": diff})
+    from infermatrix_copilot.app.agent_context import compose_agent_context
+    ctx = compose_agent_context(_ctx(settings, trace, tmp_path, llm=llm))
+    result, _ = _run(ctx, evidence={"pr_diff": diff})
     assert result.ok
     prompt = llm.calls[0]["messages"][0]["content"]
     assert ("validates credentials" in prompt) is expected
@@ -298,3 +349,84 @@ def test_needs_review_thin_draft_still_escalates(settings, trace, tmp_path):
         settings, trace, tmp_path, "agent.draft_issue_answer",
         {"task_spec": {"issue": 2}, "issue_text": "help"}, reply)
     assert not result.ok and result.failure is FailureKind.ESCALATE
+
+
+def test_injected_shadow_policy_prevents_skill_usage_for_write_capable_task(settings, trace, tmp_path):
+    from infermatrix_copilot.improve.execution import shadow_agent_policy
+    from infermatrix_copilot.memory.paths import KnowledgePaths
+
+    store = SkillStore(settings.skills_dir)
+    store.propose(name="test-skill", description="guidance for t.step testing", body="## Fix\ndo the thing")
+    path = store.promote("test-skill")
+    before = path.read_bytes()
+    ctx = _ctx(settings, trace, tmp_path, state={"task_spec":{"kind":"pr_rebase", "pr":1}},
+               llm=ScriptedLLM([contract()]))
+    ctx.agent_policy = shadow_agent_policy()
+    result, _ = _run(ctx, step_name="t.step testing")
+    assert result.ok
+    assert path.read_bytes() == before
+    assert not KnowledgePaths.resolve(settings, "").skills_usage_journal.exists()
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+def test_injected_scope_reaches_actual_agent_read_tools(settings, trace, tmp_path, shadow):
+    from infermatrix_copilot.improve.execution import shadow_agent_policy
+
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    inside = repo / "inside.txt"
+    inside.write_text("INSIDE_READ_WITNESS")
+    outside = tmp_path / "private.txt"
+    outside.write_text("OUTSIDE_READ_WITNESS")
+    llm = ScriptedLLM([
+        Reply(blocks=[Block(type="tool_use", id="inside", name="read_file", input={"path":str(inside)})]),
+        Reply(blocks=[Block(type="tool_use", id="outside", name="read_file", input={"path":str(outside)})]),
+        contract(),
+    ])
+    ctx = _ctx(settings, trace, tmp_path, state={"task_spec":{"kind":"pr_review"},
+               "repo_path":str(repo)}, llm=llm)
+    if shadow:
+        ctx.agent_policy = shadow_agent_policy()
+    result, _ = _run(ctx)
+    assert result.ok
+    messages = json.dumps(llm.calls[-1]["messages"])
+    assert "INSIDE_READ_WITNESS" in messages
+    assert ("OUTSIDE_READ_WITNESS" in messages) is not shadow
+
+
+@pytest.mark.parametrize('backend', ['api', 'harness'])
+def test_task_completion_guidance_reaches_dispatch_and_shared_repair(
+    settings, trace, tmp_path, monkeypatch, backend,
+):
+    from types import SimpleNamespace
+    from infermatrix_copilot.agent_loop import AgentOutcome
+    from infermatrix_copilot.engine.agent_runtime.dispatch import TASK_STATUS_GUIDANCE
+    draft = Reply(blocks=[Block(type='text', text='Completed analysis: the reviewed change has a defect.')])
+    llm = ScriptedLLM(([draft] if backend == 'api' else []) + [contract()])
+    ctx = _ctx(settings, trace, tmp_path, llm=llm)
+    captured = []
+    def harness(*args, **kwargs):
+        captured.append(kwargs['prompt'])
+        return AgentOutcome(text=draft.text, iterations=1, tool_calls=0)
+    monkeypatch.setattr('infermatrix_copilot.providers.run_harness_step', harness)
+    kwargs = {'harness_member': SimpleNamespace(provider='codex', model='fixture')} if backend == 'harness' else {}
+    result, _ = _run(ctx, **kwargs)
+    assert result.ok
+    prompt = captured[0] if backend == 'harness' else llm.calls[0]['messages'][0]['content']
+    assert prompt.count(TASK_STATUS_GUIDANCE) == 1
+    assert prompt.index('## OUTPUT CONTRACT') < prompt.index('## TASK STATUS') < prompt.index('## PERMISSIONS')
+    assert TASK_STATUS_GUIDANCE in llm.calls[-1]['system']
+    assert len(llm.calls) == (1 if backend == 'harness' else 2)
+
+
+def test_task_status_guidance_does_not_accept_explicit_non_success_recheck(settings, trace, tmp_path):
+    llm = ScriptedLLM([contract(status='needs_review', finding_rechecks=[{
+        'finding_id': 'carried', 'head_sha': 'a' * 40, 'outcome': 'fixed',
+        'evidence': 'The required guard exists on the current head.',
+    }])])
+    result, output = _run(_ctx(settings, trace, tmp_path, llm=llm),
+        output_extension={'finding_rechecks': 'list of explicit rechecks'})
+    assert not result.ok and result.failure == FailureKind.ESCALATE
+    assert output['status'] == 'needs_review'
+    assert output['finding_rechecks'][0]['outcome'] == 'fixed'
+    assert len(llm.calls) == 1  # a declared failure is not rewritten by repair

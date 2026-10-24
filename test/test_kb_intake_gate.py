@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,10 +117,10 @@ def test_codex_transport_pins_reasoning_effort(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return SimpleNamespace(stdout="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
 
-    monkeypatch.setattr(codex.subprocess, "run", fake_run)
     transport = codex.CodexTransport.__new__(codex.CodexTransport)
+    transport.runner = fake_run
     transport.settings = SimpleNamespace(strict_backend_model="", strict_backend_timeout_s=5)
     monkeypatch.setattr(transport, "require_cli", lambda: "codex", raising=False)
     transport._run("hi", cwd="/tmp", timeout_s=5, model="gpt-6-sol", effort="medium")
@@ -452,6 +453,193 @@ def test_intake_human_path_enqueues(tmp_path):
     assert rt.ledger.human_queue("demo")
 
 
+@pytest.mark.parametrize('message', ['response lost', 'reply failed its schema: response lost'])
+def test_unknown_generator_response_removes_event_from_automatic_redrafting(tmp_path, message, monkeypatch, capsys):
+    def lost(role, prompt):
+        error = ModelUnavailable(message, allow_fallback=False)
+        error.native_call_sent = True
+        error.native_call_completed = False
+        raise error
+
+    rt, lifecycle = _runtime(tmp_path, ScriptedGateway(lost))
+    collect_events(rt, lifecycle)
+    assert run_intake(rt, lifecycle) is None
+    assert len(rt.gateway.calls) == 1
+    event, = rt.ledger.events('demo', 'draft_unknown')
+    assert message in event['detail']
+    assert not rt.ledger.events('demo', 'pending')
+    assert run_intake(rt, lifecycle) is None
+    assert len(rt.gateway.calls) == 1
+    assert rt.ledger.changesets_of_kind('demo', 'intake') == []
+    from infermatrix_copilot.kb_service import cli
+    monkeypatch.setattr(cli, '_registry', lambda: {'demo': lifecycle})
+    assert cli.main(['--state-dir', str(rt.state_dir), 'status']) == 0
+    report = json.loads(capsys.readouterr().out)
+    reported = next(row for row in report['repos'] if row['repo'] == 'demo')
+    assert reported['unresolved_draft_events'] == [{'id': event['id'], 'detail': event['detail']}]
+
+
+def test_intake_process_interruption_keeps_generation_intent_before_gate(tmp_path, monkeypatch, capsys):
+    def interrupted(role, prompt):
+        raise KeyboardInterrupt('worker interrupted')
+
+    rt, lifecycle = _runtime(tmp_path, ScriptedGateway(interrupted))
+    collect_events(rt, lifecycle)
+    with pytest.raises(KeyboardInterrupt):
+        run_intake(rt, lifecycle)
+    calls = list(rt.gateway.calls)
+    state, = [json.loads(value) for value in rt.ledger.cursors_with_prefix('demo', 'draft:intake:').values()]
+    assert state['draft_dispatched'] and 'draft_result' not in state
+    assert run_intake(rt, lifecycle) is None
+    assert rt.gateway.calls == calls
+    assert rt.ledger.changesets_of_kind('demo', 'intake') == []
+    from infermatrix_copilot.kb_service import cli
+    monkeypatch.setattr(cli, '_registry', lambda: {'demo': lifecycle})
+    before = rt.ledger.cursors_with_prefix('demo', 'draft:')
+    assert cli.main(['--state-dir', str(rt.state_dir), 'status']) == 0
+    report = json.loads(capsys.readouterr().out)
+    reported = next(row for row in report['repos'] if row['repo'] == 'demo')
+    assert reported['unresolved_draft_events'] == []  # hard interruption never settled the event
+    checkpoint, = reported['unresolved_draft_checkpoints']
+    assert checkpoint == {'cursor': next(iter(before)), 'status': 'outcome_unknown',
+                          'input_sha256': state['draft_binding']['input_sha256'],
+                          'base_sha': state['draft_binding']['base_sha'],
+                          'generation': state['draft_binding']['generation'], 'attempts': 1}
+    assert rt.ledger.cursors_with_prefix('demo', 'draft:') == before
+    assert rt.gateway.calls == calls
+
+
+@pytest.mark.parametrize('raw', ['', '{', 'null', '[]', '{"draft_dispatched": 0}',
+                                '{"draft_dispatched": 1}', '{"draft_result": []}',
+                                '{"draft_dispatched": false, "draft_result": {}}',
+                                '{"draft_dispatched": true}'])
+def test_status_preserves_corrupt_generation_checkpoints(tmp_path, raw, monkeypatch, capsys):
+    from infermatrix_copilot.kb_service import cli
+    rt, lifecycle = _runtime(tmp_path, ScriptedGateway(_generator_then_judge()))
+    rt.ledger.set_cursor('demo', 'draft:refine:original', raw)
+    rt.ledger.set_cursor('demo', 'draft:sweep:completed', json.dumps({'draft_dispatched': False}))
+    monkeypatch.setattr(cli, '_registry', lambda: {'demo': lifecycle})
+    assert cli.main(['--state-dir', str(rt.state_dir), 'status']) == 0
+    report = json.loads(capsys.readouterr().out)
+    reported = next(row for row in report['repos'] if row['repo'] == 'demo')
+    assert reported['unresolved_draft_checkpoints'] == [
+        {'cursor': 'draft:refine:original', 'status': 'invalid_checkpoint'}]
+    assert rt.ledger.get_cursor('demo', 'draft:refine:original') == raw
+    assert rt.gateway.calls == []
+    from infermatrix_copilot.kb_service.intake import checkpoint_draft
+    with rt.ledger.lease() as owner, pytest.raises(ModelUnavailable):
+        checkpoint_draft(rt.ledger, owner, unit_key='refine:original', base_sha='original',
+                         accepted_trace=lambda: pytest.fail('trace requested'), repo='demo', generator=GEN,
+                         generate=lambda: pytest.fail('generation dispatched'))
+    assert rt.ledger.get_cursor('demo', 'draft:refine:original') == raw
+
+
+def test_intake_completed_generation_resumes_before_gate_without_redrafting(tmp_path, monkeypatch):
+    from infermatrix_copilot.kb_service import runtime
+    rt, lifecycle = _runtime(tmp_path, ScriptedGateway(_generator_then_judge()))
+    collect_events(rt, lifecycle)
+    gate = runtime.gate_and_stage
+
+    def interrupted(*args, **kwargs):
+        raise OSError('interrupted before gate reservation')
+
+    monkeypatch.setattr(runtime, 'gate_and_stage', interrupted)
+    with pytest.raises(OSError, match='before gate reservation'):
+        run_intake(rt, lifecycle)
+    calls = [call for call in rt.gateway.calls if call[0] == 'generator']
+    assert len(calls) == 1
+    monkeypatch.setattr(runtime, 'gate_and_stage', gate)
+    assert run_intake(rt, lifecycle)
+    assert [call for call in rt.gateway.calls if call[0] == 'generator'] == calls
+
+
+@pytest.mark.parametrize('failure_at', ['judge', 'intent_reply', 'receipt', 'settlement'])
+def test_intake_unknown_gate_keeps_original_draft_and_does_not_redraft(tmp_path, monkeypatch, failure_at):
+    answer = _generator_then_judge()
+
+    def respond(role, prompt):
+        if failure_at == 'judge' and role.name == 'judge':
+            error = ModelUnavailable('native response lost', allow_fallback=False)
+            error.native_call_sent = True
+            error.native_call_completed = False
+            raise error
+        return answer(role, prompt)
+
+    gateway = ScriptedGateway(respond)
+    rt, lifecycle = _runtime(tmp_path, gateway)
+    stage = rt.ledger.stage_intake
+
+    def interrupted(*args, **kwargs):
+        if failure_at == 'settlement' and kwargs.get('expected_status'):
+            raise OSError('settlement lost')
+        result = stage(*args, **kwargs)
+        if failure_at == 'intent_reply' and kwargs['status'] == 'review_pending':
+            raise OSError('intent reply lost')
+        return result
+
+    monkeypatch.setattr(rt.ledger, 'stage_intake', interrupted)
+    if failure_at == 'receipt':
+        def unavailable_receipt(*args, **kwargs):
+            raise OSError('receipt storage unavailable')
+        monkeypatch.setattr('infermatrix_copilot.persistence.immutable_write_bytes', unavailable_receipt)
+    collect_events(rt, lifecycle)
+    with pytest.raises((ModelUnavailable, OSError)):
+        run_intake(rt, lifecycle)
+    pending, = rt.ledger.changesets('demo', ('review_pending',))
+    assert rt.changeset_path(pending['id']).exists()
+    assert not rt.ledger.events('demo', 'pending')
+    assert len(rt.ledger.events('demo', 'drafted')) == 1
+    receipt_path = rt.state_dir / 'gate-results' / f"{pending['id']}.json"
+    if failure_at == 'settlement':
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt['changeset_id'] == pending['id']
+        assert receipt['generation'] == pending['generation']
+        assert receipt['intent_detail'] == pending['detail']
+        assert receipt['draft_sha256'] == hashlib.sha256(rt.changeset_path(pending['id']).read_bytes()).hexdigest()
+        assert receipt['settlement']['detail']['decision']['status'] == 'pass'
+        assert receipt['settlement']['status'] == 'gated'
+        assert receipt['settlement']['verdicts']
+        assert receipt_path.stat().st_mode & 0o777 == 0o600
+    else:
+        assert not receipt_path.exists()
+    before = list(gateway.calls)
+    assert run_intake(rt, lifecycle) is None
+    assert gateway.calls == before
+
+
+@pytest.mark.parametrize('lost_commit_reply', [False, True])
+def test_completed_gate_receipt_matches_committed_decision(tmp_path, monkeypatch, lost_commit_reply):
+    rt, lifecycle = _runtime(tmp_path, ScriptedGateway(_generator_then_judge()))
+    stage = rt.ledger.stage_intake
+
+    def commit(*args, **kwargs):
+        result = stage(*args, **kwargs)
+        if lost_commit_reply and kwargs.get('expected_status'):
+            raise OSError('committed settlement reply lost')
+        return result
+
+    monkeypatch.setattr(rt.ledger, 'stage_intake', commit)
+    collect_events(rt, lifecycle)
+    if lost_commit_reply:
+        with pytest.raises(OSError, match='committed settlement reply lost'):
+            run_intake(rt, lifecycle)
+        committed, = rt.ledger.changesets('demo', ('gated',))
+        changeset_id = committed['id']
+        calls = list(rt.gateway.calls)
+        assert run_intake(rt, lifecycle) is None
+        assert rt.gateway.calls == calls
+    else:
+        changeset_id = run_intake(rt, lifecycle)
+    row = rt.ledger.changeset(changeset_id)
+    raw = (rt.state_dir / 'gate-results' / f'{changeset_id}.json').read_bytes()
+    receipt = json.loads(raw)
+    assert row['detail']['gate_result_sha256'] == hashlib.sha256(raw).hexdigest()
+    assert row['detail']['decision'] == receipt['settlement']['detail']['decision']
+    assert receipt['settlement']['drafted_events'] == receipt['intent_detail']['event_ids']
+    assert receipt['repo'] == row['repo']
+    assert receipt['kind'] == row['kind']
+
+
 # -- calibration -----------------------------------------------------------------------
 
 def test_shipped_calibration_set_is_well_formed():
@@ -586,6 +774,12 @@ def test_conflicting_drafts_stay_pending_and_rejections_are_not_no_rules(tmp_pat
               rt.ledger.events("demo", "pending") + rt.ledger.events("demo", "drafted")
               + rt.ledger.events("demo", "rejected") + rt.ledger.events("demo", "done")}
     assert status == {"1": "drafted", "2": "pending", "3": "rejected"}
+    event, = rt.ledger.events('demo', 'pending')
+    assert json.loads(event['detail'])['draft_attempt'] == 1
+    calls = len([call for call in rt.gateway.calls if call[0] == 'generator'])
+    assert run_intake(rt, lifecycle)
+    assert len([call for call in rt.gateway.calls if call[0] == 'generator']) == calls + 1
+    assert rt.ledger.event(event['id'])['status'] == 'drafted'
 
 
 def test_merged_pr_discovery_paginates_in_merge_order(tmp_path):
@@ -694,9 +888,8 @@ def test_kb_run_uses_the_cli_state_dir(tmp_path, monkeypatch):
                      "--repo", "vllm-omni"]) == 1
     assert seen == {"state_dir": str(chosen)}
     assert os.environ["KB_STATE_DIR"] == str(tmp_path / "wrong")  # env untouched
-    knowledge_steps.use_state_dir(None)
 
-def test_lease_lost_during_judging_writes_nothing(tmp_path):
+def test_lease_lost_during_judging_preserves_original_pending_intent(tmp_path):
     """Deterministic takeover: while the judge is answering, the lease expires
     and another process takes it. The original worker must stage nothing."""
     base_answer = _generator_then_judge()
@@ -715,8 +908,10 @@ def test_lease_lost_during_judging_writes_nothing(tmp_path):
     assert run_intake(rt, lifecycle) is None
     assert state["taken"]
     assert rt.ledger.changesets("demo", ("gated", "failed", "human")) == []
-    assert len(rt.ledger.events("demo", "pending")) == 1       # still claimable by the new holder
-    assert not list((tmp_path / "state" / "changesets").glob("*.json"))  # no orphan files
+    assert not rt.ledger.events("demo", "pending")  # cannot redraft an already dispatched review
+    pending, = rt.ledger.changesets("demo", ("review_pending",))
+    assert rt.changeset_path(pending['id']).exists()
+    assert rt.ledger.events("demo", "drafted")[0]['detail'] == pending['id']
 
 
 def test_lease_keeper_renews_during_long_work(tmp_path):

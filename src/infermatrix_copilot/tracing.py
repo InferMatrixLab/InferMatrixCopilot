@@ -9,7 +9,7 @@ manager used with ``with`` and is safe wrapped around ``await``. Parent/child
 nesting propagates through a ``contextvars.ContextVar``, which is copied per
 asyncio task, so parallel agents get correct, independent trees.
 
-    from agent import tracing
+    from infermatrix_copilot import tracing
     tracing.init(run_id, log_dir / "trace.jsonl")
     with tracing.span("phase", phase="phase2"):
         with tracing.span("agent", label="module:scheduler"):
@@ -21,8 +21,7 @@ asyncio task, so parallel agents get correct, independent trees.
 Enable with env ``AGENT_TRACE=1`` (the default). ``AGENT_TRACE=0`` turns every
 ``span()`` into a zero-cost no-op.
 
-The recorder is shared verbatim by the rebase-agent, the copilot, and the
-personal-agent — keep the three copies identical.
+Copilot owns the recorder; application and worker callers use this package.
 """
 from __future__ import annotations
 
@@ -35,6 +34,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+from .budgeting import usage_observation
 
 _ENABLED = os.environ.get("AGENT_TRACE", "1").strip().lower() not in ("0", "false", "no", "off", "")
 _current: "contextvars.ContextVar[Optional[Span]]" = contextvars.ContextVar("trace_span", default=None)
@@ -302,6 +303,7 @@ def set_usage(sp: Any, usage: Any, stop_reason: str = "") -> None:
         completion_tokens=out,
         cache_read_tokens=c["cache_read_tokens"],
         cache_creation_tokens=c["cache_creation_tokens"],
+        usage=usage_observation(usage),
     )
     if stop_reason:
         sp.set(stop_reason=stop_reason)
@@ -516,12 +518,12 @@ def report(trace_path: os.PathLike | str) -> str:
         comps = [s["attr"].get("completion_tokens", 0) for s in llm]
         cache_read = sum(s["attr"].get("cache_read_tokens", 0) for s in llm)
         cache_write = sum(s["attr"].get("cache_creation_tokens", 0) for s in llm)
-        # `prompt_tokens` is the *uncached* prefill: Anthropic (and the
-        # Anthropic-compatible DeepSeek endpoint) report input_tokens EXCLUDING
-        # cache_read_input_tokens / cache_creation_input_tokens. The cache-hit
-        # denominator is therefore the whole prefill, not just that remainder —
-        # dividing by sum(prompts) alone yields ratios well over 100%.
-        total_in = (sum(prompts) + cache_read + cache_write) or 1
+        # Legacy counters describe uncached prefill. New API observations also
+        # retain providers whose input count already includes the cache split.
+        total_in = sum(s['attr'].get('prompt_tokens', 0) +
+                        (0 if usage_observation(s['attr'].get('usage')).get('input_tokens_include_cache') is True
+                        else s['attr'].get('cache_read_tokens', 0) + s['attr'].get('cache_creation_tokens', 0))
+                       for s in llm) or 1
         inflight = [s["attr"].get("inflight", 1) for s in llm]
         lines.append("\nLLM (inference-engine view)")
         lines.append(f"  calls              {len(llm)}")

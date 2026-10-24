@@ -6,18 +6,18 @@ Only the final source verifier can establish a supported knowledge claim.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 from types import MappingProxyType
 from collections.abc import Mapping
-import uuid
 
 from ..knowledge_service.lifecycle import safe_source_path
 from .knowledge_coverage import SUFFIXES, _LEXICAL_NO_CODE
@@ -286,10 +286,6 @@ def build_depth_index(tree: Path, production: list[str], *, pin: str, policy_sha
         if cache_path.exists():
             return load_depth_index(cache_path, pin=pin, policy_sha256=policy_sha256, production=production)
         data = _build(tree, sorted(set(production)), identity)
-        tmp = cache_path.with_name(cache_path.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            tmp.write_text(json.dumps({"data": data, "sha256": _sha(data)}, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, cache_path)
-        finally:
-            tmp.unlink(missing_ok=True)
+        atomic_write_bytes(cache_path, json.dumps({"data": data, "sha256": _sha(data)},
+                                                 separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     return load_depth_index(cache_path, pin=pin, policy_sha256=policy_sha256, production=production)

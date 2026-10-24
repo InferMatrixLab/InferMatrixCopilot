@@ -7,11 +7,12 @@ and per-model ``modelUsage``; ``--max-turns`` maps our iteration budget
 natively; ``--system-prompt`` (+ ``--exclude-dynamic-system-prompt-
 sections``) replaces the vendor system prompt with our step contract.
 
-Tool governance is fully PREVENTIVE here, unlike cursor: built-in tools are
-denied wholesale via ``--disallowedTools``, and only the MCP tool bridge is
+Built-in tools are disabled as a set via ``--tools \"\"``, and only the MCP tool bridge is
 allowed (``--mcp-config`` + ``--strict-mcp-config`` + ``--allowedTools
 mcp__infermatrix-tools``), so every tool call flows through
-``tools.dispatch`` — no native-tool audit needed. Session tool counts come
+``tools.dispatch``. Native fixture checks cover an empty completion tool set,
+the explicit bridge and rejection of a forced built-in tool call. Inherited
+and managed customization coverage remains separate. Session tool counts come
 from the bridge trace delta.
 
 Env is the shared allowlist (`base.sanitized_env`): the CLI must use its
@@ -24,24 +25,23 @@ from __future__ import annotations
 import json
 import math
 import subprocess
-import sys
 from decimal import Decimal
 from pathlib import Path
 
 from ..agent_loop import AgentOutcome
-from ..llm import Block, Reply
+from ..llm import Reply
 from .base import (
     AgentSessionRequest,
     HarnessTransport,
     SessionUsage,
+    bridge_server,
     flatten_messages,
+    run_cli,
     sanitized_env,
 )
 from .registry import PROVIDERS
 
-# Built-ins denied for every session: the bridge is the only tool surface.
-_BUILTIN_DENY = ("Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,"
-                 "NotebookEdit,Task,TodoWrite")
+# Built-ins are disabled as a set; the explicit bridge is the only tool surface.
 _BRIDGE_SERVER = "infermatrix-tools"
 
 
@@ -60,21 +60,51 @@ class ClaudeCodeTransport(HarnessTransport):
     """claude CLI (headless) as a Strict backend."""
 
     spec = PROVIDERS["claude-code"]
+    supports_native_events = True
     # `--max-budget-usd` (print mode, which _run uses) is checked after each
     # API request completes: it stops the next one, it cannot cut the current
     # one short. A threshold, never a hard cap.
     stops_at_spend = True
 
+    @staticmethod
+    def auth_status_issue(returncode: int, text: str) -> str | None:
+        """Interpret native authentication, without inferring billing mode."""
+        if returncode:
+            return 'claude is not logged in — run: claude auth login'
+        try:
+            status = json.loads(text)
+        except (TypeError, ValueError):
+            return 'claude authentication status is unavailable'
+        if not isinstance(status, dict) or type(status.get('loggedIn')) is not bool:
+            return 'claude authentication status is unavailable'
+        if not status['loggedIn']:
+            return 'claude is not logged in — run: claude auth login'
+        return None
+
+    def auth_gap(self) -> str | None:
+        cli = self.cli_path()
+        if not cli:
+            return None  # availability is reported by the caller
+        try:
+            result = self.auth_probe([cli])
+        except (OSError, subprocess.SubprocessError):
+            return 'claude authentication status is unavailable'
+        return self.auth_status_issue(result.returncode, result.stdout + result.stderr)
+
     # -- process plumbing ----------------------------------------------------
     def _run(self, prompt_text: str, *, system: str, cwd: str,
              timeout_s: float, max_turns: int, model: str = "",
              mcp_config: Path | None = None,
-             max_budget_usd: float | None = None) -> tuple[dict, bool]:
+             max_budget_usd: float | None = None, native_event_sink=None) -> tuple[dict, bool]:
         """One CLI invocation → (parsed result object, timed_out). Prompt on
         stdin (argv has a 128KiB per-arg limit; evidence packs exceed it)."""
         cmd = [self.require_cli(), "-p", "--output-format", "json",
                "--max-turns", str(max_turns),
-               "--disallowedTools", _BUILTIN_DENY]
+               "--tools", "",
+               # Hooks execute outside the model tool set. Preserve native
+               # auth/model configuration and the explicit MCP bridge while
+               # disabling inherited hook commands for governed invocations.
+               "--settings", '{"disableAllHooks":true}']
         if system:
             cmd += ["--system-prompt", system,
                     "--exclude-dynamic-system-prompt-sections"]
@@ -86,18 +116,24 @@ class ClaudeCodeTransport(HarnessTransport):
         if mcp_config is not None:
             cmd += ["--mcp-config", str(mcp_config), "--strict-mcp-config",
                     "--allowedTools", f"mcp__{_BRIDGE_SERVER}"]
-        try:
-            proc = subprocess.run(
-                cmd, input=prompt_text, cwd=cwd, env=sanitized_env(),
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=timeout_s, check=False)
-            stdout = proc.stdout or ""
-        except subprocess.TimeoutExpired as exc:
-            raw = exc.stdout or b""
-            stdout = raw.decode("utf-8", "replace") if isinstance(raw, bytes) \
-                else str(raw)
-            return self._parse(stdout), True
-        return self._parse(stdout), False
+        else:
+            cmd += ["--allowedTools", "", "--strict-mcp-config"]
+        stdout, _, returncode, timed_out = run_cli(cmd, input=prompt_text, cwd=cwd,
+                                          env=sanitized_env(), timeout_s=timeout_s,
+                                          runner=getattr(self, "runner", None))
+        data = self._parse(stdout)
+        if data and native_event_sink is not None:
+            native_event_sink({"type": "native.claude-code.event", "payload": data})
+        # A launch/configuration failure or damaged output is not an empty
+        # successful model response. Keep native error envelopes for callers
+        # that interpret bounded termination (notably max-budget receipts).
+        is_error = data.get("is_error")
+        valid_result = data.get("type") == "result" and (
+            is_error is True or (is_error is False and isinstance(data.get("result"), str)))
+        if not timed_out and (not valid_result or (returncode != 0 and is_error is not True)):
+            raise RuntimeError(
+                f"claude-code exited {returncode} without a valid terminal result")
+        return data, timed_out
 
     @staticmethod
     def _parse(stdout: str) -> dict:
@@ -114,33 +150,44 @@ class ClaudeCodeTransport(HarnessTransport):
 
     @staticmethod
     def _usage(data: dict) -> SessionUsage:
-        raw = data.get("usage") or {}
-        usage = SessionUsage(
-            input_tokens=int(raw.get("input_tokens") or 0),
-            output_tokens=int(raw.get("output_tokens") or 0),
-            cost_usd=(float(data["total_cost_usd"])
-                      if data.get("total_cost_usd") is not None else None))
+        raw = data.get("usage")
+        raw = raw if isinstance(raw, dict) else {}
+        usage = SessionUsage()
+        usage.add_token_usage({key: raw.get(key) for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens")})
+        usage.set_reported_cost(data.get("total_cost_usd"))
         # served model = the modelUsage entry that did the main work (max
         # cost); helper models (haiku sidecars) lose that comparison
         models = data.get("modelUsage") or {}
         if isinstance(models, dict) and models:
-            usage.served_model = max(
-                models, key=lambda m: float(
-                    (models[m] or {}).get("costUSD") or 0))
+            costs = {name: SessionUsage.normalized_cost(value.get("costUSD"))
+                     if isinstance(value, dict) else None
+                     for name, value in models.items()}
+            # Incomplete costs cannot establish which model did the main work.
+            # Do not let malformed identity metadata discard valid token usage.
+            if all(isinstance(name, str) and name and cost is not None
+                   for name, cost in costs.items()):
+                usage.served_model = max(costs, key=costs.get)
         return usage
+
+    @classmethod
+    def native_snapshot(cls, events: list[dict]) -> dict:
+        native = [event["payload"] for event in events
+                  if event.get("type") == "native.claude-code.event"
+                  and isinstance(event.get("payload"), dict)]
+        data = native[-1] if native else {}
+        usage = cls._usage(data)
+        return {"usage": dict(usage.reported_usage or {}),
+                "served_model": usage.served_model, "text": str(data.get("result") or "")}
 
     def _write_mcp_config(self, spec_path: Path) -> Path:
         """The --mcp-config file, next to the bridge spec (never in the
         worktree — claude takes the config by flag, so nothing litters the
         session tree)."""
-        package_root = Path(__file__).resolve().parents[2]
         config = spec_path.with_suffix(".mcp.json")
-        config.write_text(json.dumps({"mcpServers": {_BRIDGE_SERVER: {
-            "command": sys.executable,
-            "args": ["-m", "infermatrix_copilot.tool_bridge",
-                     "--spec", str(spec_path)],
-            "env": {"PYTHONPATH": str(package_root)},
-        }}}, indent=2), encoding="utf-8")
+        config.write_text(json.dumps({"mcpServers": {_BRIDGE_SERVER: bridge_server(spec_path)}},
+                                     indent=2), encoding="utf-8")
         return config
 
     @staticmethod
@@ -168,13 +215,15 @@ class ClaudeCodeTransport(HarnessTransport):
 
     # -- transport contract --------------------------------------------------
     def run_session(self, req: AgentSessionRequest) -> AgentOutcome:
+        self.validate_session(req)
         cwd = str(req.scope.root or req.run_dir)
         mcp_config = (self._write_mcp_config(req.bridge_spec_path)
                       if req.bridge_spec_path is not None else None)
         before = self._trace_lines(req.run_dir)
         data, timed_out = self._run(
             req.prompt, system=req.system, cwd=cwd, timeout_s=req.timeout_s,
-            max_turns=req.max_iters, model=req.model, mcp_config=mcp_config)
+            max_turns=req.max_iters, model=req.model, mcp_config=mcp_config,
+            **({"native_event_sink": req.native_event_sink} if req.native_event_sink is not None else {}))
         usage = self._usage(data)
         tool_calls, tools_used = self._bridge_activity(req.run_dir, before)
         is_error = bool(data.get("is_error"))
@@ -185,20 +234,20 @@ class ClaudeCodeTransport(HarnessTransport):
                 timed_out=timed_out, cost_usd=usage.cost_usd,
                 bridge_tool_calls=tool_calls,
                 served_model=usage.served_model)
-        return AgentOutcome(
-            text=str(data.get("result") or ""),
+        max_turns = (data.get("subtype") == "error_max_turns"
+                     or (not is_error and data.get("stop_reason") == "max_turns"))
+        if is_error and not max_turns:
+            raise RuntimeError("claude-code session errored")
+        return usage.outcome(str(data.get("result") or ""),
             iterations=int(data.get("num_turns") or 0),
-            tool_calls=tool_calls,
-            truncated=timed_out or data.get("stop_reason") == "max_turns",
-            refusals=[],
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            tools_used=tools_used[:40])
+            tool_calls=tool_calls, tools_used=tools_used,
+            truncated=timed_out or max_turns,
+        )
 
     def complete(self, *, system: str, messages: list[dict],
                  model: str = "", max_tokens: int | None = None,
                  role: str = "", effort: str = "",
-                 max_budget_usd: float | None = None) -> Reply:
+                 max_budget_usd: float | None = None, native_event_sink=None) -> Reply:
         """Tool-less one-shot: built-ins denied, no MCP config, two turns
         (one to think, the cap as a backstop). Runs in the run-less scratch
         of the process cwd — with every tool denied there is nothing to
@@ -217,22 +266,16 @@ class ClaudeCodeTransport(HarnessTransport):
             data, timed_out = self._run(
                 flatten_messages("", messages), system=system, cwd=td,
                 timeout_s=self.settings.strict_backend_timeout_s,
-                max_turns=2, model=model, max_budget_usd=max_budget_usd)
-        usage = self._usage(data)
+                max_turns=2, model=model, max_budget_usd=max_budget_usd,
+                **({"native_event_sink": native_event_sink} if native_event_sink is not None else {}))
+        from .audit import assert_tool_less
+
+        assert_tool_less([data])
         over_budget = "budget" in str(data.get("subtype") or "")
+        if data.get("is_error") and not over_budget:
+            raise RuntimeError("claude-code tool-less completion errored")
+        usage = self._usage(data)
         text = "" if over_budget else str(data.get("result") or "")
-        extra = {} if usage.cost_usd is None else {"cost_usd": usage.cost_usd}
-        return Reply(
-            blocks=[Block(type="text", text=text)] if text else [],
+        return usage.reply(text,
             stop_reason=("max_tokens" if timed_out
-                         else "max_budget" if over_budget else "end_turn"),
-            usage={"input_tokens": usage.input_tokens,
-                   "output_tokens": usage.output_tokens,
-                   "cache_read_input_tokens": int(
-                       (data.get("usage") or {}).get(
-                           "cache_read_input_tokens") or 0),
-                   "cache_creation_input_tokens": int(
-                       (data.get("usage") or {}).get(
-                           "cache_creation_input_tokens") or 0),
-                   **extra},
-            model=usage.served_model)
+                         else "max_budget" if over_budget else "end_turn"))

@@ -122,8 +122,13 @@ def test_unchanged_wrong_rule_is_challenged_against_original_code(tmp_path):
     assert all(pin == PIN for pin, _ in source.reads)
     assert SOURCE in rt.gateway.calls[0][1].replace("\\n", "\n")
     # The same bytes and the same applicability pin are not a cached verdict.
-    audit_unit(rt, lifecycle, unit, rt.gateway)
+    repeated = audit_unit(rt, lifecycle, unit, rt.gateway)
     assert len(rt.gateway.calls) == 2
+    receipt = result["quality_receipt"]
+    assert receipt["policy"] == "maintenance-source-audit" and receipt["version"] == 1
+    assert repeated["quality_receipt"]["input_sha256"] == receipt["input_sha256"]
+    changed = audit_unit(rt, lifecycle, {**unit, "text": unit["text"] + " Additional claim."}, rt.gateway)
+    assert changed["quality_receipt"]["input_sha256"] != receipt["input_sha256"]
 
 
 @pytest.mark.parametrize("prose", [False, True])
@@ -378,7 +383,7 @@ def test_maintenance_external_citation_requires_owner_and_never_generic_companio
     _git(origin, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "external rule citation")
     snapshot = rt.knowledge.fetch()
     unit = {**unit, "snapshot": snapshot}
-    monkeypatch.setattr(companion, "stage_companion", lambda *args: pytest.fail("maintenance escaped its budgeted correction path"))
+    monkeypatch.setattr(companion, "prepare_companion", lambda *args: pytest.fail("maintenance escaped its budgeted correction path"))
     finding = audit_unit(rt, lifecycle, unit, rt.gateway)
     store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
     result = propose_correction(rt, lifecycle, store, rt.maintenance, run_id="citation-correction", unit=unit,
@@ -388,6 +393,51 @@ def test_maintenance_external_citation_requires_owner_and_never_generic_companio
     assert cs["detail"]["decision"]["reasons"][0].startswith("references outside knowledge/")
     assert not any(row["kind"] == "companion" for row in changesets(rt))
     assert not (rt.state_dir / "outbox").exists()
+
+
+@pytest.mark.parametrize('publish_result', [True, False])
+@pytest.mark.parametrize('failure_at', ['gate_return', 'settlement'])
+def test_correction_resumes_committed_gate_without_new_model_work(tmp_path, monkeypatch, publish_result, failure_at):
+    from infermatrix_copilot.kb_service import maintenance_correction as module
+    rt, lifecycle, _, unit, _ = configured_runtime(tmp_path, standard_answer)
+    lifecycle = replace(lifecycle, retire_ratio=1.0)
+    rt.registry[lifecycle.repo] = lifecycle
+    finding = audit_unit(rt, lifecycle, unit, rt.gateway)
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+    target, name = ((module, 'gate_and_stage') if failure_at == 'gate_return'
+                    else (rt.ledger, 'stage_intake'))
+    original = getattr(target, name)
+
+    def lost(*args, **kwargs):
+        if failure_at == 'settlement':
+            if kwargs.get('expected_status'):
+                raise OSError('gate return lost')
+            return original(*args, **kwargs)
+        original(*args, **kwargs)
+        raise OSError('gate return lost')
+
+    monkeypatch.setattr(target, name, lost)
+    args = dict(run_id='resume-correction', unit=unit, finding=finding,
+                base=rt.knowledge.knowledge_files(unit['snapshot']), base_sha=unit['snapshot'],
+                publish_result=publish_result)
+    with pytest.raises(OSError, match='gate return lost'):
+        module.propose_correction(rt, lifecycle, store, rt.maintenance, **args)
+    row, = changesets(rt)
+    calls = list(rt.gateway.calls)
+    monkeypatch.setattr(target, name, original)
+    if failure_at == 'settlement':
+        from infermatrix_copilot.kb_service.gate_receipts import settle_gate_result
+        assert row['status'] == 'review_pending'
+        settle_gate_result(rt.ledger, rt.state_dir, rt.lease_owner, row['id'])
+    result = module.propose_correction(rt, lifecycle, store, rt.maintenance, **args)
+    assert result['changeset_id'] == row['id']
+    assert rt.gateway.calls == calls
+    assert len(changesets(rt)) == 1
+    with pytest.raises(ModelUnavailable, match='requires reconciliation'):
+        module.propose_correction(rt, lifecycle, store, rt.maintenance,
+                                  **args, force_human='changed acceptance policy')
+    assert rt.gateway.calls == calls
+    assert len(changesets(rt)) == 1
 
 
 @pytest.mark.parametrize("kind", ["correction", "maintenance_calibration", "rebuild"])
@@ -859,3 +909,174 @@ def test_merged_correction_restores_only_exact_active_bytes_and_keeps_old_contex
     maintenance.advance_corrections(rt)
     assert rt.ledger._conn.execute("SELECT decision FROM maintenance_resolutions WHERE id=?",
         ("restored:" + cs_id,)).fetchone()[0] == "corrected_and_consumers_confirmed"
+
+
+@pytest.mark.parametrize("failure", ["identity", "cache_write"])
+def test_completed_api_reply_keeps_known_overspend_on_rejection(tmp_path, monkeypatch, failure):
+    rt, _, _, unit, _ = configured_runtime(tmp_path, lambda role, prompt: {"answer": "original"})
+    original = rt.gateway.call_json
+
+    def reply(*args, **kwargs):
+        assert kwargs.pop("max_budget_usd") == 1
+        result = original(*args, **kwargs)
+        return replace(result, cost_usd=9.0,
+                       served_model="wrong-family" if failure == "identity" else result.served_model)
+
+    rt.gateway.call_json = reply
+    rt.gateway.maintenance_cost_bound = lambda *args, **kwargs: 1.0
+    config = replace(rt.maintenance, costs={rt.judge.label(): {
+        "kind": "api", "threshold_usd": 1, "in_usd_per_mtok": 5,
+        "out_usd_per_mtok": 10, "max_output_tokens": 1000}})
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+
+    def wrapper():
+        return BudgetGateway(rt, store, config, run_id="overspend", unit=unit, phase="audit")
+
+    if failure == "cache_write":
+        import infermatrix_copilot.kb_service.maintenance_audit as module
+        def fail_write(*args, **kwargs):
+            raise OSError("durable reply write failed")
+        monkeypatch.setattr(module, "atomic_write_json", fail_write)
+    with pytest.raises(ModelUnavailable if failure == "identity" else OSError):
+        wrapper().call_json(rt.judge, system="audit", prompt="data")
+    row = rt.ledger._conn.execute("SELECT * FROM maintenance_budget").fetchone()
+    assert row["status"] == "settled" and row["outcome"] == "failed"
+    assert row["actual_microusd"] == row["charged_microusd"] == 9_000_000
+    with pytest.raises(ModelUnavailable, match="not redispatched"):
+        wrapper().call_json(rt.judge, system="audit", prompt="data")
+    assert len(rt.gateway.calls) == 1
+    assert store.report()["budget"]["accounted_usd"] == 9.0
+
+
+def test_maintenance_cache_replay_preserves_native_quality_receipt(tmp_path):
+    from infermatrix_copilot.kb_service.quality_review import QualityPolicy, review_call
+
+    rt, _, _, unit, _ = configured_runtime(tmp_path, lambda role, prompt: {"answer": "original"})
+    original = rt.gateway.call_json
+
+    def reply(*args, **kwargs):
+        result = original(*args, **kwargs)
+        return replace(result, trace_id="native-trace", reply_sha256=digest(result.text),
+                       usage={"input_tokens": 17, "output_tokens": 3})
+
+    rt.gateway.call_json = reply
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+
+    def review():
+        gateway = BudgetGateway(rt, store, rt.maintenance, run_id="receipt", unit=unit, phase="audit")
+        return review_call(gateway, rt.judge, policy=QualityPolicy("test", archive="verified"),
+                           system="audit", prompt="data", validate=lambda value: None)
+
+    first, cached = review(), review()
+    assert first.quality_receipt == cached.quality_receipt
+    assert cached.trace_id == "native-trace" and cached.reply_sha256 == digest(cached.text)
+    assert cached.usage == {"input_tokens": 17, "output_tokens": 3}
+    assert len(rt.gateway.calls) == 1
+    assert store.report()["budget"]["accounted_usd"] == .5
+
+
+def test_legacy_maintenance_cache_without_native_identity_still_replays(tmp_path):
+    rt, _, _, unit, _ = configured_runtime(tmp_path, lambda role, prompt: {"answer": "original"})
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+
+    def wrapper():
+        return BudgetGateway(rt, store, rt.maintenance, run_id="legacy", unit=unit, phase="audit")
+
+    wrapper().call_json(rt.judge, system="audit", prompt="data")
+    path = next((rt.state_dir / "maintenance" / "calls").glob("*.json"))
+    payload = json.loads(path.read_text())
+    # Reconstruct the old cache and its matching ledger receipt, which never
+    # included native trace fields. Do not invent a trace identity on replay.
+    for key in ("native_trace_id", "native_reply_sha256", "reply_sha256"):
+        payload.pop(key)
+    checksum = digest(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    path.write_text(json.dumps({**payload, "reply_sha256": checksum}))
+    row = rt.ledger._conn.execute("SELECT * FROM maintenance_budget").fetchone()
+    metadata = json.loads(row["metadata"])
+    metadata["settlement"]["reply_sha256"] = checksum
+    rt.ledger._conn.execute("UPDATE maintenance_budget SET metadata=? WHERE id=?",
+                           (json.dumps(metadata), row["id"]))
+    cached = wrapper().call_json(rt.judge, system="audit", prompt="data")
+    assert cached.data == {"answer": "original"}
+    assert cached.trace_id == cached.reply_sha256 == ""
+    assert len(rt.gateway.calls) == 1
+    assert store.report()["budget"]["accounted_usd"] == .5
+
+
+@pytest.mark.parametrize('actual', [9.0, .1, None])
+@pytest.mark.parametrize('kind', ['api', 'subscription'])
+def test_durable_reply_recovery_settles_original_cost_once(tmp_path, monkeypatch, actual, kind):
+    rt, _, _, unit, _ = configured_runtime(tmp_path, lambda role, prompt: {'answer': 'original'})
+    original_call = rt.gateway.call_json
+
+    def reply(*args, **kwargs):
+        kwargs.pop('max_budget_usd', None)
+        return replace(original_call(*args, **kwargs), cost_usd=actual)
+
+    rt.gateway.call_json = reply
+    rt.gateway.maintenance_cost_bound = lambda *args, **kwargs: 1.0
+    price = {'kind': 'api', 'threshold_usd': 1, 'in_usd_per_mtok': 5,
+             'out_usd_per_mtok': 10, 'max_output_tokens': 1000} if kind == 'api' else {
+                 'kind': 'subscription', 'accounted_usd': .5}
+    config = replace(rt.maintenance, costs={rt.judge.label(): price})
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+
+    def wrapper():
+        return BudgetGateway(rt, store, config, run_id='recover-cost', unit=unit, phase='audit')
+
+    settle = store.settle_cost
+    def interrupted(*args, **kwargs):
+        raise OSError('loss after durable reply before settlement')
+    monkeypatch.setattr(store, 'settle_cost', interrupted)
+    with pytest.raises(OSError, match='before settlement'):
+        wrapper().call_json(rt.judge, system='audit', prompt='data')
+    before = dict(rt.ledger._conn.execute('SELECT * FROM maintenance_budget').fetchone())
+    assert before['status'] == 'reserved'
+    assert len(list((rt.state_dir / 'maintenance/calls').glob('*.json'))) == 1
+    monkeypatch.setattr(store, 'settle_cost', settle)
+    recovered = wrapper().call_json(rt.judge, system='audit', prompt='data')
+    after = dict(rt.ledger._conn.execute('SELECT * FROM maintenance_budget').fetchone())
+    expected = int(actual * 1_000_000) if kind == 'api' and actual is not None else None
+    assert after['actual_microusd'] == expected
+    assert after['charged_microusd'] == (before['worst_microusd'] if expected is None else expected)
+    assert after['id'] == before['id'] and after['status'] == 'settled'
+    assert recovered.cost_usd == actual
+    assert wrapper().call_json(rt.judge, system='audit', prompt='data') == recovered
+    assert dict(rt.ledger._conn.execute('SELECT * FROM maintenance_budget').fetchone()) == after
+    assert len(rt.gateway.calls) == 1
+
+
+@pytest.mark.parametrize('changed', ['owner', 'lane', 'allowance', 'cost_kind'])
+@pytest.mark.parametrize('pending', [False, True])
+def test_cached_maintenance_result_requires_original_reservation_binding(tmp_path, changed, pending, monkeypatch):
+    rt, _, _, unit, _ = configured_runtime(tmp_path, lambda role, prompt: {'answer': 'original'})
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+    config = rt.maintenance
+    def wrapper():
+        return BudgetGateway(rt, store, config, run_id='binding', unit=unit, phase='audit')
+    if pending:
+        with monkeypatch.context() as patch:
+            def interrupted(*args, **kwargs):
+                raise OSError('settlement interrupted')
+            patch.setattr(store, 'settle_cost', interrupted)
+            with pytest.raises(OSError, match='settlement interrupted'):
+                wrapper().call_json(rt.judge, system='audit', prompt='data')
+    else:
+        wrapper().call_json(rt.judge, system='audit', prompt='data')
+    before = dict(rt.ledger._conn.execute('SELECT * FROM maintenance_budget').fetchone())
+    path = next((rt.state_dir / 'maintenance/calls').glob('*.json'))
+    cache = path.read_bytes()
+    if changed == 'owner':
+        unit = {**unit, 'owner': 'other-owner'}
+    elif changed == 'lane':
+        unit = {**unit, 'lane': 'fair' if unit.get('lane', 'priority') == 'priority' else 'priority'}
+    elif changed == 'allowance':
+        config = replace(config, costs={rt.judge.label(): {'kind': 'subscription', 'accounted_usd': .6}})
+    else:
+        config = replace(config, costs={rt.judge.label(): {'kind': 'api', 'threshold_usd': 1,
+            'in_usd_per_mtok': 5, 'out_usd_per_mtok': 10, 'max_output_tokens': 1000}})
+        rt.gateway.maintenance_cost_bound = lambda *args, **kwargs: 1.0
+    with pytest.raises(ModelUnavailable, match='reservation provenance'):
+        wrapper().call_json(rt.judge, system='audit', prompt='data')
+    assert dict(rt.ledger._conn.execute('SELECT * FROM maintenance_budget').fetchone()) == before
+    assert path.read_bytes() == cache and len(rt.gateway.calls) == 1

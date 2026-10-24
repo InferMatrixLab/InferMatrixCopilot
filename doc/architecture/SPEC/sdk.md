@@ -57,8 +57,9 @@
   `get_quality_result`；机械信号只是 bounded hints，结果固定绑定 expected head。
   `QualityPollResult.review` 投影类型化质量结果；非法结构触发 `ResultDecodeError`。
 - Knowledge：宿主把不可信输入投影成 `KnowledgeEvidenceEvent` / `KnowledgeEvidenceBatch`，
-  再依次调用 `KnowledgeCurator.build_prompt()`、自己的 model adapter、
-  `validate_proposals()` 与 `apply()`。返回值为 typed
+  调用 `KnowledgeCurator.curate()`，由 Copilot 统一负责有界生成、修复、校验与本地应用。
+  宿主可注入 `generate(prompt, schema)` 接入共享 gateway；`build_prompt()`、
+  `validate_proposals()` 与 `apply()` 保留为委托同一实现的低层接口。校验和应用返回 typed
   `KnowledgeProposalValidation` / `KnowledgeApplyResult`；validator 失败以
   `KnowledgeValidatorError.result` 携带完整、可序列化的失败结果。
 - 所有公开 dataclass 皆 frozen，并有 lossless `to_dict()`。
@@ -110,9 +111,10 @@
   validator 缺失则写前 fail closed，执行失败/超时则逐 byte rollback 全部目标页。
   同一 work checkout 的 writer 以 process 内 mutex 与位于系统临时目录的
   `flock` 串行化；等待后的 SHA 复核让第二个 stale writer 失败，不会覆盖首个结果。
-- **知识出版 orchestration 留在宿主**：SDK 不 clone、调用 model、管理出版 ledger、commit、
+- **知识出版 orchestration 留在宿主**：SDK 不 clone、管理出版 ledger、commit、
   push、开 PR 或 schedule。ReviewBot 必须向 `KnowledgeCurator` 传 dedicated work
-  checkout，并继续拥有重试、artifact 与本地补丁导出；SDK 也绝不写 packaged
+  checkout，并继续拥有业务重试、artifact 与本地补丁导出；模型生成与修复由 Copilot
+  的共享实现负责。SDK 也绝不写 packaged
   knowledge tree。自适应 DirectClient 仅管理知识上下文的运行账本，不代替知识出版治理。
 - SDK、Quality API 版本常量为 `1.0.0`；Direct 为 `1.1.0`，Strict 为 `1.4.0`
   （1.1 新增 `finding_dispositions`；1.2 新增 `findings`；1.3 新增显式 recheck；
@@ -126,13 +128,20 @@
 
 ## 依赖方向
 
-`sdk.v1.models` 为纯 stdlib 模型；`direct` import-time 依赖模型、资源解析与知识上下文／
-containment helper，但不创建运行账本或读取宿主配置，
+`contracts.models` 拥有纯 stdlib 模型，`sdk.v1.models` 保留兼容导出；`direct` import-time
+依赖领域模型、资源解析与知识上下文／containment helper，但不创建运行账本或读取宿主配置，
 函数调用时才向下进入 `direct_routing`；`strict` 构造时才向下进入
 headless `app.RunService`。`sdk.v1.knowledge` 是兼容导出，实际实现位于
-`knowledge_service.curation`；后者只依赖 stdlib、公开模型和显式 work checkout，
-并以 subprocess 运行上述两个固定 validator。任何 server 都不得被 SDK package
+`knowledge_service.curation`；后者依赖 SDK 下层的领域模型、共享 provider 和显式 work checkout，
+通过规范校验入口执行上述两个固定 validator。任何 server 都不得被 SDK package
 initializer 反向 import，provider domain 也不得反向依赖 ReviewBot。
+
+初始化的纯角色策略通过 `knowledge_init_role_error(stage, *, generator_provider,
+generator_model, judge_provider, judge_model, unlimited_subscription=False,
+generator_has_fallback=False, judge_has_fallback=False)` 暴露。它与实际初始化调用同一
+领域实现，返回拒绝原因或 `None`，不探测账户、不派发模型。它只检查角色策略；调用方仍需
+验证工作流选项、provider 能力、账户与执行环境。Discovery 和 unlimited init 的要求不会
+因为评估使用同一个后端而放宽。
 
 ## 测试
 

@@ -75,26 +75,43 @@ class RunReservation:
         fingerprint = idem.spec_fingerprint(spec.model_dump())
         entry = idem.read_entry(self.settings.run_root, key)
         if entry:
-            run_dir = self.settings.run_root / str(entry.get("run_id") or "")
+            run_dir = self.contained_run_dir(str(entry.get("run_id") or ""), must_exist=False)
             # The index is a cache; the persisted request is the authority.
             # A reused key for a different spec must not serve the old run.
             recorded = str(entry.get("spec_fingerprint") or "")
-            if run_dir.exists() and recorded and recorded != fingerprint:
+            if not recorded:
+                recorded = self._request_fingerprint(run_dir)
+            if recorded != fingerprint:
                 raise idem.IdempotencyError(
                     f"idempotency_key {key!r} was already used for a different "
                     "request; use a new key for a new attempt")
             if run_dir.exists() and idem.resolvable(run_dir):
                 return run_dir.name, False
             if run_dir.exists() and idem.relaunchable(run_dir):
+                if self._request_fingerprint(run_dir) != fingerprint:
+                    raise idem.IdempotencyError("reserved request changed; reconcile the original run")
                 # The owner died after publishing the key but before launch.
                 # Re-stamp the queued run so only this retry enqueues it.
                 if rs.reclaim_queued(run_dir, owner_server_id=owner_server_id,
                                      owner_server_pid=owner_server_pid):
                     return run_dir.name, True
                 return run_dir.name, False
+            # A missing directory or damaged status cannot prove that no paid
+            # work occurred. Keep the original binding pending reconciliation.
+            return run_dir.name, False
         run_id = self._reserve_new(spec, owner_server_id, owner_server_pid)
         idem.write_entry(self.settings.run_root, key, run_id, fingerprint)
         return run_id, True
+
+    @staticmethod
+    def _request_fingerprint(run_dir: Path) -> str:
+        try:
+            request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
+            if not isinstance(request, dict):
+                raise ValueError("request is not an object")
+        except (OSError, ValueError) as exc:
+            raise idem.IdempotencyError("reserved request is unreadable; reconcile the original run") from exc
+        return idem.spec_fingerprint(request)
 
     def _reserve_new(
         self, spec: TaskSpec, owner_server_id: str, owner_server_pid: int,
@@ -109,6 +126,11 @@ class RunReservation:
             os.chmod(req, 0o600)
         except OSError:
             pass
+        from .completion_execution import create_completion_pin
+        completion_pin = create_completion_pin(self.settings, run_dir)
         rs.init_queued(run_dir, run_id=run_id, owner_server_id=owner_server_id,
-                       owner_server_pid=owner_server_pid)
+                       owner_server_pid=owner_server_pid,
+                       request_fingerprint=idem.spec_fingerprint(spec.model_dump()),
+                       execution_mode="direct_review" if "direct_review" in spec.params else "workflow",
+                       native_completion_sha256=completion_pin)
         return run_id

@@ -26,8 +26,9 @@ import re
 from dataclasses import replace
 from typing import Iterable, Mapping, Sequence
 
+from ..knowledge_service.format import RULE_ID_PATTERN
 from ..knowledge_service.facts import CODE_SPAN, PATH
-from ..knowledge_service.lifecycle import LifecycleError, Page, Section
+from ..knowledge_service.lifecycle import LifecycleError, Page, Section, safe_source_path
 
 # The ID scanner of the knowledge format (``lifecycle.ANY_RULE_HEADING``) reads
 # ``## Word ...`` as the ID ``Word`` and L1 refuses one ID on two pages, so the
@@ -35,13 +36,15 @@ from ..knowledge_service.lifecycle import LifecycleError, Page, Section
 # needs "Direct" somewhere on the heading line.
 QUICK_MAP_HEADING = "## 代码快速入口（Direct）"
 MARKER = "<!-- kb-init:quick-map -->"
+QUICK_MAP_POLICY_VERSION = 2
 MAX_CHARS = 3000          # what init renders (rows are dropped past it)
 HARD_CAP = 3500           # what Direct serves whole (``_direct_quick_map`` cap)
 MAX_CELL = 80
 MAX_SOURCES = 3
+SOURCE_LABEL = "- 源码："
 _DIRECT = re.compile(r"^##\s+.*Direct", re.IGNORECASE)
 _TRIGGER = re.compile(r"^\s*[-*]\s*(?:\*\*)?触发(?:\*\*)?\s*[:：]\s*(?P<text>.+?)\s*$")
-_TITLE = re.compile(r"^#{2,3}\s+[A-Za-z0-9][A-Za-z0-9-]{1,40}\s+[—-]\s+(?P<title>.+?)\s*$")
+_TITLE = re.compile(rf"^#{{2,3}}\s+{RULE_ID_PATTERN}\s+[—-]\s+(?P<title>.+?)\s*$")
 _HEADER = ("| PR 描述在做什么 | 精确规则 | 第一批 live 源码 |", "|---|---|---|")
 _MORE = "| … | … | … |"
 
@@ -51,17 +54,78 @@ def _cell(text: str, limit: int = MAX_CELL) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
-def _paths_in(text: str, limit: int = MAX_SOURCES) -> list[str]:
+def _representable_source_path(path: str) -> bool:
+    return safe_source_path(path) and path == path.strip() and CODE_SPAN.fullmatch(f"`{path}`") is not None \
+        and not any(c in path for c in "\r\x00")
+
+
+def _source_row_paths(line: str) -> tuple[str, ...]:
+    """Only the formatter's path-only provenance row, never behavior prose."""
+    line = line.strip()
+    if not line.startswith(SOURCE_LABEL):
+        return ()
+    payload = line[len(SOURCE_LABEL):].strip()
+    paths = tuple(match.group("tok") for match in CODE_SPAN.finditer(payload))
+    if not paths or payload != "、".join(f"`{p}`" for p in paths) \
+            or any(not _representable_source_path(p) for p in paths):
+        return ()
+    return paths
+
+
+def rule_body_without_sources(body: str) -> str:
+    """Ignore trailing formatter provenance, preserving prose and inline claims."""
+    lines = body.splitlines(keepends=True)
+    end, found = len(lines), False
+    while end and not lines[end - 1].strip():
+        end -= 1
+    while end and _source_row_paths(lines[end - 1]):
+        found = True
+        end -= 1
+        while end and not lines[end - 1].strip():
+            end -= 1
+    return "".join(lines[:end]) if found else body
+
+
+def _paths_in(text: str, limit: int | None = MAX_SOURCES) -> list[str]:
     """The repository paths (``path`` or ``path::Symbol``) ``text`` names in
     backticks, in order of first appearance."""
     out: list[str] = []
     for match in CODE_SPAN.finditer(text):
         token = match.group("tok").strip()
-        if PATH.fullmatch(token.split("::", 1)[0]) and token not in out:
+        path = token.split("::", 1)[0]
+        end = text.find("\n", match.end())
+        line = text[text.rfind("\n", 0, match.start()) + 1:end if end >= 0 else None]
+        # Explicit source rows also name root files such as Makefile. Their
+        # evidence is checked by the stage before this display text is written.
+        explicit = path in _source_row_paths(line)
+        if (PATH.fullmatch(path) or explicit) and token not in out:
             out.append(token)
-            if len(out) >= limit:
+            if limit is not None and len(out) >= limit:
                 break
     return out
+
+
+def with_rule_sources(section: str, paths: Sequence[str]) -> str:
+    """Persist checked source paths on a NEW rule before lifecycle placement.
+
+    The caller owns pinned evidence validation. Keeping the citation on the
+    rule lets subsequent map refreshes work without the original init record;
+    placement and its capacity simulation then see exactly the same text.
+    Existing inline citations remain unchanged. Never use owner prefixes as
+    evidence or rewrite a pre-existing rule to backfill its missing sources.
+    """
+    present = {token.split("::", 1)[0] for token in _paths_in(section, limit=None)}
+    missing = []
+    for path in paths:
+        if not _representable_source_path(path):
+            raise LifecycleError("checked source path cannot be represented as a rule citation")
+        if path not in present:
+            missing.append(path)
+            present.add(path)
+    if not missing:
+        return section
+    return section.rstrip("\n") + "\n\n" + SOURCE_LABEL + " " + "、".join(
+        f"`{path}`" for path in missing) + "\n"
 
 
 def _trigger(section: Section) -> str:
@@ -75,17 +139,20 @@ def _trigger(section: Section) -> str:
 
 def _sources(paths: Sequence[str], fallback: Sequence[str]) -> str:
     chosen = list(paths) or list(fallback)[:MAX_SOURCES]
-    return "、".join(f"`{p}`" for p in chosen) if chosen else "—"
+    return "、".join("`" + p.replace("|", "\\|") + "`" for p in chosen) if chosen else "—"
 
 
 def render_quick_map(page_text: str, *, signals: Sequence[str], prefixes: Sequence[str],
-                     key_files: Sequence[str] = ()) -> str:
+                     key_files: Sequence[str] = (), policy_version: int = 1) -> str:
     """The Direct section for ``page_text``: one row per active rule on the
-    page (its 触发 line or title, its ID, the paths it names), or one row for
+    page (its 触发 line or title, its ID, the paths it names; no owner-scope fallback for rule evidence), or one row for
     a page without rules (a map card or an entry page: the owner's signals,
     its key files or scope prefixes). Deterministic; at most ``MAX_CHARS``
     (rows are dropped from the end behind a ``…`` row), never over
-    ``HARD_CAP``."""
+    ``HARD_CAP``. Policy 1 preserves retained bytes; policy 2 adds active
+    rule titles/triggers to navigation. Application callers bind the policy."""
+    if type(policy_version) is not int or policy_version not in (1, 2):
+        raise ValueError("unsupported quick-map policy")
     try:
         rules = [s for s in Page.parse(page_text).rules() if s.footer.status == "active"]
     except LifecycleError:
@@ -93,11 +160,23 @@ def render_quick_map(page_text: str, *, signals: Sequence[str], prefixes: Sequen
     rows: list[str] = []
     for section in rules:
         rows.append(f"| {_cell(_trigger(section))} | {section.rule_id} | "
-                    f"{_sources(_paths_in(section.text), prefixes)} |")
+                    f"{_sources(_paths_in(section.text), ())} |")
     if not rows:
         files = list(key_files) or _paths_in(page_text, MAX_SOURCES)
         rows.append(f"| {_cell('、'.join(signals) or '（无触发词）')} | 入口 | {_sources(files, prefixes)} |")
     lead = (("触发词：" + "、".join(_cell(s, 40) for s in list(signals)[:12]) + "。") if signals else "")
+    if policy_version >= 2 and rules:
+        # Navigation only: use the active rule's own title and trigger, never
+        # infer contracts or citations from owner prefixes. The latest rules
+        # stay discoverable even when the bounded table drops trailing rows.
+        terms = []
+        for section in rules[-12:]:
+            title = _TITLE.match(section.heading)
+            for value in ((title.group("title") if title else ""), _trigger(section)):
+                value = _cell(value, 40)
+                if value and value not in terms:
+                    terms.append(value)
+        lead += "规则触发：" + "、".join(terms) + "。"
     lead += "PR 描述或改动命中下表一行时，先读该行的规则，再读页面其余部分。"
 
     def render(kept: list[str], more: bool) -> str:
@@ -168,13 +247,13 @@ def with_quick_map(page_text: str, section_text: str) -> str:
     return replace(page, head=head, sections=(Section(body), *sections)).render()
 
 
-def mapped(page_text: str, *, signals: Sequence[str], prefixes: Sequence[str]) -> str | None:
+def mapped(page_text: str, *, signals: Sequence[str], prefixes: Sequence[str], policy_version: int = 1) -> str | None:
     """``page_text`` with its Direct quick map, or None when the map would
     push the page over the knowledge format's capacity (``page_over_capacity``:
     the caller keeps the page as it is and says so)."""
     from ..knowledge_service.ops import page_over_capacity
 
-    text = with_quick_map(page_text, render_quick_map(page_text, signals=signals, prefixes=prefixes))
+    text = with_quick_map(page_text, render_quick_map(page_text, signals=signals, prefixes=prefixes, policy_version=policy_version))
     return None if page_over_capacity(text) else text
 
 
@@ -195,7 +274,7 @@ def map_inputs(routes_text: str | None, page: str) -> tuple[list[str], list[str]
 
 
 def refresh_quick_maps(head: Mapping[str, str], base: Mapping[str, str], routes_text: str | None, *,
-                       briefing_docs: Iterable[str]) -> tuple[dict[str, str], list[str], list[str]]:
+                       briefing_docs: Iterable[str], policy_version: int = 1) -> tuple[dict[str, str], list[str], list[str]]:
     """``head`` with init's Direct quick map on every owner page of the
     routes file that this change touched or that has no map yet, plus the
     checklist lines and the BLOCKING problems that produced. An owner page
@@ -220,7 +299,7 @@ def refresh_quick_maps(head: Mapping[str, str], base: Mapping[str, str], routes_
         if text == base.get(page) and has_map(text):
             continue
         signals, prefixes = map_inputs(routes_text, page)
-        with_map = mapped(text, signals=signals, prefixes=prefixes)
+        with_map = mapped(text, signals=signals, prefixes=prefixes, policy_version=policy_version)
         if with_map is None:
             problems.append(f"quick map: {page} has no room for its Direct quick map (page capacity): "
                             "split the page by hand, or route another page")

@@ -56,24 +56,23 @@ import json
 import logging
 import os
 import re
-import signal
 import time
-import shutil
 import subprocess
-import sys
 import tempfile
-import threading
 from functools import cached_property
 from pathlib import Path
 
 from ..agent_loop import AgentOutcome
-from ..llm import Block, ModelMismatchError, Reply
+from ..llm import ModelMismatchError, Reply
 from .audit import contained_in
 from .base import (
     AgentSessionRequest,
     HarnessTransport,
     SessionUsage,
+    bridge_server,
     flatten_messages,
+    json_events,
+    run_cli,
     sanitized_env,
 )
 from .registry import PROVIDERS
@@ -109,6 +108,7 @@ _PERSONAL_CONFIG_NAME = "provider_config.json"
 # The Z.AI coding-plan provider the OAuth login provisions; the host's own
 # personal config names it when one exists, settings can override it.
 _DEFAULT_PROVIDER_ID = "account:bigmodel-individual-coding-plan"
+_CREDENTIAL_RUNTIME_VERSION = '0.16.9'  # audited native tool names and coding-account format
 _REASONING_LEVELS = ("low", "high", "max")
 # Model ids as zcode 0.16.9 spells them (its own catalog list): the CLI
 # selects a configured model by case-sensitive equality.
@@ -172,6 +172,7 @@ class ZCodeTransport(HarnessTransport):
 
     supports_native_events = True
     spec = PROVIDERS["zcode"]
+    completion_worker_settings = ('zcode_provider_id', 'zcode_reasoning_level')
 
     @cached_property
     def _selected_provider_id(self) -> str:
@@ -184,7 +185,64 @@ class ZCodeTransport(HarnessTransport):
 
         Billing mode is not a measured zero-dollar call cost.
         """
+        configured = self._configured_subscription_billing()
+        if configured is not None:
+            return configured
         return self._selected_provider_id == _DEFAULT_PROVIDER_ID
+
+    def credential_snapshot(self, path, *, owner_uid=None, options=None):
+        from .zcode_credentials import login_snapshot
+        return login_snapshot(path, owner_uid=owner_uid, provider_id=(options or {}).get('zcode_provider_id'))
+
+    def subscription_credential_identity(self, credentials):
+        expiry = credentials.get('expires_at')
+        return (credentials.get('kind') == 'zcode-coding-plan'
+                and (expiry is None or type(expiry) is int and expiry > time.time()))
+
+    def authentication_command(self, native_cli):
+        return ['/usr/local/bin/python', '-I', '-B', '-m', 'infermatrix_copilot.providers.zcode_credentials']
+
+    @staticmethod
+    def subscription_auth_status(returncode, text):
+        try:
+            data = json.loads(text)
+            return (returncode == 0 and isinstance(data, dict)
+                and set(data) == {'schema', 'provider', 'authenticated', 'native_version'}
+                and data['schema'] == 'zcode-account-status/1' and data['provider'] == _DEFAULT_PROVIDER_ID
+                and data['authenticated'] is True and ZCodeTransport.credential_runtime_supported(data['native_version']))
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def credential_runtime_supported(version):
+        return isinstance(version, str) and version.strip() == _CREDENTIAL_RUNTIME_VERSION
+
+    def auth_probe(self, command=None, *, env=None, timeout_s=15, execution_profile=None):
+        if execution_profile is None:
+            return super().auth_probe(command, env=env, timeout_s=timeout_s)
+        if command is not None or env or getattr(self, 'runner', None) is not None:
+            raise ValueError('sandbox authentication cannot inherit a host command or environment')
+        from .provider_options import configured_settings
+        settings = configured_settings(self.settings, self.spec.id)
+        execution_profile.validate()
+        argv = self.authentication_command(execution_profile.native_cli)
+        result = execution_profile.execute(argv, cwd='/tmp/work', env={},
+            input=json.dumps({'provider_id': settings.zcode_provider_id, 'native_cli': execution_profile.native_cli}),
+            deadline=time.monotonic() + timeout_s)
+        if result.reason is not None:
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        return subprocess.CompletedProcess(argv, result.returncode, result.stdout, result.stderr)
+
+    def _check_credential_provider(self, events):
+        from .zcode_credentials import snapshot_home
+        if snapshot_home() is None:
+            return
+        providers = [(event.get('payload') or {}).get('providerId') for event in events
+                     if event.get('type') == 'session.updated' and isinstance(event.get('payload'), dict)
+                     and 'providerId' in event['payload']]
+        if not providers or any(provider != self._selected_provider_id for provider in providers):
+            from ..sandbox.context import ContextChanged
+            raise ContextChanged('zcode did not attest the selected native account provider')
 
     def auth_gap(self) -> str | None:
         """zcode has no login-status command; the OAuth login writes
@@ -201,17 +259,11 @@ class ZCodeTransport(HarnessTransport):
     # -- process plumbing ----------------------------------------------------
     @staticmethod
     def _write_mcp_config(session: Path, spec_path: Path) -> None:
-        package_root = Path(__file__).resolve().parents[2]
         config = session / ".zcode" / "config.json"
         config.parent.mkdir()
         config.write_text(json.dumps({"features": {"memory": False}, "memory": {"use": False},
                                      "mcp": {"servers": {_BRIDGE_SERVER: {
-            "type": "stdio",
-            "command": sys.executable,
-            "args": ["-m", "infermatrix_copilot.tool_bridge",
-                     "--spec", str(spec_path)],
-            "env": {"PYTHONPATH": str(package_root)},
-        }}}}, indent=2), encoding="utf-8")
+                                         "type": "stdio", **bridge_server(spec_path)}}}}, indent=2), encoding="utf-8")
 
     @staticmethod
     def _write_oneshot_config(session: Path) -> None:
@@ -300,9 +352,18 @@ class ZCodeTransport(HarnessTransport):
         cmd = [self.require_cli()]
         disallowed = list(_DISALLOWED)
         oversized = len(text.encode("utf-8")) > _ARG_BUDGET
+        from .zcode_credentials import snapshot_home
+        credentialed = snapshot_home() is not None
+        argument = None
+        if tool_less and oversized and credentialed:
+            from .node_arguments import NodeArgument
+            argument = NodeArgument(session, text, prefix='--prompt=')
         if tool_less:
-            disallowed += ["Grep", "Glob"] + ([] if oversized else ["Read"])
-        if oversized:
+            disallowed += (sorted(_READ_TOOLS) if credentialed else
+                           ["Grep", "Glob"] + ([] if oversized else ["Read"]))
+        if argument is not None:
+            cmd += [argument.argument]
+        elif oversized:
             prompt_file = session / "PROMPT.md"
             prompt_file.write_text(text, encoding="utf-8")
             cmd += [f"--prompt=Your complete instructions are in the attached "
@@ -321,32 +382,29 @@ class ZCodeTransport(HarnessTransport):
                     if k in os.environ})
         if model:
             env[_PERSONAL_CONFIG_ENV] = str(self._write_model_config(session, model))
+        if credentialed:
+            started = time.monotonic()
+            version = self.version_probe(env=env, timeout_s=min(timeout_s, 10))
+            if version.returncode or not self.credential_runtime_supported(version.stdout):
+                raise ValueError('native CLI does not support the audited credential tool policy')
+            timeout_s = max(0, timeout_s - (time.monotonic() - started))
+        if argument is not None:
+            env.update(argument.env)
+            started = time.monotonic()
+            stdout, _, code, timed_out = run_cli([cmd[0], '--version'], cwd=str(session), env=env,
+                timeout_s=min(timeout_s, 15), stdin=subprocess.DEVNULL)
+            argument.accept_probe(stdout, code, timed_out)
+            timeout_s = max(0, timeout_s - (time.monotonic() - started))
         if native_event_sink is not None:
-            return self._stream_run(cmd, session, env, timeout_s, native_event_sink)
-        timed_out = False
-        returncode, stderr = 0, ""
-        try:
-            proc = subprocess.run(
-                cmd, cwd=str(session), env=env,
-                stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout_s,
-                check=False)
-            stdout = proc.stdout or ""
-            returncode, stderr = proc.returncode, proc.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            raw = exc.stdout or b""
-            stdout = raw.decode("utf-8", "replace") if isinstance(raw, bytes) \
-                else str(raw)
-        events: list[dict] = []
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            result = self._stream_run(cmd, session, env, timeout_s, native_event_sink)
+            if argument is not None:
+                argument.validate_events(result[0])
+            return result
+        stdout, stderr, returncode, timed_out = run_cli(cmd, cwd=str(session), env=env,
+                                                      stdin=subprocess.DEVNULL, timeout_s=timeout_s)
+        events = json_events(stdout)
+        if argument is not None:
+            argument.validate_events(events)
         if not timed_out and (returncode != 0 or not any(
                 e.get("type") == "result" for e in events)):
             # Known model failure events have stable, content-free recovery
@@ -372,10 +430,11 @@ class ZCodeTransport(HarnessTransport):
         POSIX regular-file writes are synchronous in Node; anonymous files
         keep the full output while we journal it at the sink's own pace.
         """
-        events, stderr, buffers = [], [], {"stdout": b"", "stderr": b""}
+        from .process import run_process
 
-        def line(channel, raw):
-            text = raw.decode("utf-8", "replace")
+        events, stderr = [], []
+
+        def line(channel, text):
             if channel == "stdout":
                 try:
                     event = json.loads(text)
@@ -389,108 +448,16 @@ class ZCodeTransport(HarnessTransport):
                 stderr.append(text)
             sink({"type": "native." + channel, "text": text})
 
-        # TemporaryFile creates mode-0600 anonymous files in our session;
-        # no named raw-output file persists or enters session attachments.
-        with tempfile.TemporaryFile(mode="w+b", buffering=0, dir=session) as stdout, \
-                tempfile.TemporaryFile(mode="w+b", buffering=0, dir=session) as stderr_file:
-            spools = {"stdout": stdout, "stderr": stderr_file}
-            offsets = {channel: 0 for channel in spools}
-            proc = subprocess.Popen(cmd, cwd=str(session), env=env, stdin=subprocess.DEVNULL,
-                                    stdout=stdout, stderr=stderr_file, start_new_session=True)
-            timed_out = False
-            group_stopped = False
-            stop_lock = threading.Lock()
-
-            def kill(*, at_deadline=False):
-                nonlocal group_stopped, timed_out
-                with stop_lock:
-                    if group_stopped or (at_deadline and proc.poll() is not None):
-                        return
-                    group_stopped = True
-                    if at_deadline:
-                        timed_out = True
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-
-            # A slow sink must neither postpone a real producer timeout nor
-            # turn draining an already-exited producer into a false timeout.
-            watchdog = threading.Timer(timeout_s, lambda: kill(at_deadline=True))
-            watchdog.daemon = True
-            watchdog_started = False
-
-            def emit(channel, raw, *, best_effort=False):
-                if not best_effort:
-                    line(channel, raw)
-                    return
-                try:
-                    line(channel, raw)
-                except BaseException:
-                    pass  # retain the original interruption / sink failure
-
-            def drain(channel, *, best_effort=False):
-                # pread must not move the shared child descriptor's offset:
-                # seek/read on it could make the CLI overwrite prior output.
-                chunk = os.pread(spools[channel].fileno(), 65536, offsets[channel])
-                offsets[channel] += len(chunk)
-                buffers[channel] += chunk
-                while b"\n" in buffers[channel]:
-                    raw, buffers[channel] = buffers[channel].split(b"\n", 1)
-                    emit(channel, raw, best_effort=best_effort)
-                return bool(chunk)
-
-            def tails(*, best_effort=False):
-                for channel in buffers:
-                    raw, buffers[channel] = buffers[channel], b""
-                    if raw:
-                        emit(channel, raw, best_effort=best_effort)
-
-            try:
-                watchdog.start()
-                watchdog_started = True
-                while True:
-                    alive = proc.poll() is None
-                    if not alive:
-                        # The leader has finished; no owned descendant may
-                        # keep growing a spool after its completed invocation.
-                        kill()
-                    changed = False
-                    for channel in spools:
-                        changed = drain(channel) or changed
-                    if not alive and not changed:
-                        tails()
-                        break
-                    if not changed:
-                        time.sleep(0.02)
-                proc.wait()
-            except BaseException:
-                # Stop production first, then preserve all bytes already
-                # spooled, including tails lacking a final newline. Sink
-                # failures must never replace the original interruption.
-                kill()
-                proc.wait()
-                for channel in spools:
-                    try:
-                        while drain(channel, best_effort=True):
-                            pass
-                    except BaseException:
-                        pass
-                tails(best_effort=True)
-                raise
-            finally:
-                # This process group belongs only to this invocation.
-                watchdog.cancel()
-                if watchdog_started:
-                    watchdog.join()
-                kill()
-                proc.wait()
-        if not timed_out and (proc.returncode != 0 or not any(e.get("type") == "result" for e in events)):
+        result = run_process(cmd, cwd=str(session), env=env,
+                             deadline=time.monotonic() + timeout_s,
+                             output="spool", on_line=line)
+        timed_out = bool(result.reason)
+        if not timed_out and (result.returncode != 0 or not any(e.get("type") == "result" for e in events)):
             known = _known_model_failure(events)
             if known is not None:
                 raise known
             detail = " ".join(stderr[-3:])[:400]
-            raise RuntimeError(f"zcode exited {proc.returncode} without a result event"
+            raise RuntimeError(f"zcode exited {result.returncode} without a result event"
                                + (f": {detail}" if detail else ""))
         return events, timed_out
 
@@ -509,29 +476,25 @@ class ZCodeTransport(HarnessTransport):
             if event.get("type") == "session.updated" \
                     and isinstance(payload, dict) and payload.get("modelId"):
                 usage.served_model = str(payload["modelId"])
-            if event.get("type") == "result" \
-                    and isinstance(event.get("usage"), dict):
-                raw = event["usage"]
-                usage.input_tokens = int(raw.get("inputTokens") or 0)
-                usage.output_tokens = int(raw.get("outputTokens") or 0)
+            if event.get("type") == "result":
+                raw = event.get("usage")
+                raw = raw if isinstance(raw, dict) else {}
+                # Result usage is a cumulative snapshot, not a per-turn delta.
+                usage = SessionUsage(served_model=usage.served_model)
+                usage.add_token_usage({target: raw.get(source) for source, target in (
+                    ("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
+                    ("cacheReadInputTokens", "cache_read_input_tokens"),
+                    ("cacheCreationInputTokens", "cache_creation_input_tokens"))})
+                usage.set_reported_cost(raw.get("costUsd"))
+        if usage.reported_usage is None:
+            usage.reported_usage = {}
         return usage
 
     @classmethod
     def native_snapshot(cls, events: list[dict]) -> dict:
         """Reported native facts; omitted counters and invoice cost are unknown."""
-        usage, served_model = {}, ""
-        keys = {"inputTokens": "input_tokens", "outputTokens": "output_tokens",
-                "cacheReadInputTokens": "cache_read_input_tokens",
-                "cacheCreationInputTokens": "cache_creation_input_tokens", "costUsd": "cost_usd"}
-        for event in events:
-            payload = event.get("payload")
-            if event.get("type") == "session.updated" and isinstance(payload, dict) and payload.get("modelId"):
-                served_model = str(payload["modelId"])
-            if event.get("type") == "result" and isinstance(event.get("usage"), dict):
-                raw = event["usage"]
-                usage = {target: raw[source] for source, target in keys.items()
-                         if isinstance(raw.get(source), (int, float)) and not isinstance(raw[source], bool)}
-        return {"served_model": served_model, "usage": usage,
+        usage = cls._usage(events)
+        return {"served_model": usage.served_model, "usage": dict(usage.reported_usage),
                 "text": cls._final_text(events)}
 
     @staticmethod
@@ -604,9 +567,36 @@ class ZCodeTransport(HarnessTransport):
                            "%s, zcode served %s", requested, served)
 
     # -- transport contract --------------------------------------------------
+    def validate_completion(self):
+        if getattr(self, 'native_recovery_only', False):
+            from .completion_profiles import CompletionPolicyError
+            raise CompletionPolicyError('original result transport cannot dispatch another model call')
+        profile = getattr(self, 'completion_profile', None)
+        if profile is None:
+            return super().validate_completion()
+        from ..sandbox import SandboxCompletionProfile
+        if not isinstance(profile, SandboxCompletionProfile) or getattr(self, 'runner', None) is not None:
+            raise ValueError('unsupported ZCode completion profile')
+        profile.validate()
+
+    def validate_completion_request(self, request):
+        if getattr(self, 'completion_profile', None) is not None:
+            if request.get('readonly') or request.get('output_schema') is not None:
+                raise ValueError('ZCode sandbox native schema/session execution is unsupported')
+            if request.get('max_budget_usd') is not None:
+                raise ValueError('zcode cannot stop a call at a spend threshold')
+            if request.get('idle_timeout_s') is not None:
+                raise ValueError('ZCode native byte-idle deadline is unsupported')
+
+    @classmethod
+    def process_receipt(cls, outcome):
+        from .completion_worker import process_receipt
+        return process_receipt(outcome, native_snapshot=cls.native_snapshot)
+
     def run_session(self, req: AgentSessionRequest) -> AgentOutcome:
-        session = Path(tempfile.mkdtemp(prefix="imc-zcode-session-"))
-        try:
+        self.validate_session(req)
+        with tempfile.TemporaryDirectory(prefix="imc-zcode-session-", ignore_cleanup_errors=True) as scratch:
+            session = Path(scratch)
             if req.bridge_spec_path is not None:
                 self._write_mcp_config(session, req.bridge_spec_path)
             header = ""
@@ -618,9 +608,8 @@ class ZCodeTransport(HarnessTransport):
             events, timed_out = self._run(
                 f"{header}{req.system}\n\n{req.prompt}", session=session,
                 timeout_s=req.timeout_s,
-                model=req.model or self.settings.strict_backend_model)
-        finally:
-            shutil.rmtree(session, ignore_errors=True)
+                model=req.model or self.settings.strict_backend_model,
+                **({"native_event_sink": req.native_event_sink} if req.native_event_sink is not None else {}))
         usage = self._usage(events)
         calls = self._tool_calls(events)
         used = [name for name, _ in calls]
@@ -638,34 +627,40 @@ class ZCodeTransport(HarnessTransport):
                 served_model=usage.served_model)
         self._check_model(req.model or self.settings.strict_backend_model,
                           usage.served_model, req.trace)
-        return AgentOutcome(
-            text=self._final_text(events),
-            iterations=0,  # zcode does not expose a turn budget
-            tool_calls=len(used),
-            truncated=timed_out,
-            refusals=[f"audit: {v}" for v in violations],
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            tools_used=used[:40])
+        # Zcode does not expose a turn budget.
+        return usage.outcome(self._final_text(events), tool_calls=len(used), tools_used=used,
+                             truncated=timed_out, refusals=[f"audit: {v}" for v in violations])
 
     def complete(self, *, system: str, messages: list[dict],
                  model: str = "", max_tokens: int | None = None,
                  role: str = "", effort: str = "",
-                 max_budget_usd: float | None = None, native_event_sink=None) -> Reply:
+                 max_budget_usd: float | None = None, native_event_sink=None,
+                 frozen_inputs=None, idle_timeout_s=None, absolute_deadline=None,
+                 output_schema=None, readonly=False) -> Reply:
         """Tool-less one-shot in an empty scratch cwd with no bridge. Every
         native read is removed, except `Read` when the prompt is too big for
         argv and rides an attachment — then any read outside the scratch dir
         (the input here can be untrusted text) fails the call."""
-        session = Path(tempfile.mkdtemp(prefix="imc-zcode-oneshot-"))
-        try:
+        self.validate_completion_request(dict(system=system, messages=messages, readonly=readonly,
+            output_schema=output_schema, max_budget_usd=max_budget_usd, idle_timeout_s=idle_timeout_s))
+        if getattr(self, 'completion_profile', None) is not None:
+            self.validate_completion()
+            from .completion_worker import complete
+            return complete(self, dict(system=system, messages=messages, model=model,
+                max_tokens=max_tokens, role=role, effort=effort, max_budget_usd=max_budget_usd),
+                frozen_inputs=frozen_inputs, idle_timeout_s=idle_timeout_s,
+                absolute_deadline=absolute_deadline, native_event_sink=native_event_sink)
+        if (frozen_inputs is not None or output_schema is not None or readonly
+                or idle_timeout_s is not None or absolute_deadline is not None):
+            raise ValueError('explicit sandbox inputs require a ZCode completion profile')
+        with tempfile.TemporaryDirectory(prefix="imc-zcode-oneshot-", ignore_cleanup_errors=True) as scratch:
+            session = Path(scratch)
             self._write_oneshot_config(session)
             events, timed_out = self._run(
                 flatten_messages(system, messages), session=session,
                 timeout_s=self.settings.strict_backend_timeout_s,
                 tool_less=True, model=model or self.settings.strict_backend_model,
                 **({"native_event_sink": native_event_sink} if native_event_sink is not None else {}))
-        finally:
-            shutil.rmtree(session, ignore_errors=True)
         violations = self._audit(self._tool_calls(events),
                                  roots=(str(session),), cwd=str(session))
         if violations:
@@ -674,9 +669,12 @@ class ZCodeTransport(HarnessTransport):
         usage = self._usage(events)
         self._check_model(model or self.settings.strict_backend_model,
                           usage.served_model)
-        text = self._final_text(events)
-        return Reply(
-            blocks=[Block(type="text", text=text)] if text else [],
-            stop_reason="max_tokens" if timed_out else "end_turn",
-            usage=self.native_snapshot(events)["usage"],
-            model=usage.served_model)
+        self._check_credential_provider(events)
+        return usage.reply(self._final_text(events), stop_reason="max_tokens" if timed_out else "end_turn")
+
+    def get_completion_result(self, *, recover=False):
+        """Read the original sandbox binding; do not reconstruct model inputs."""
+        if getattr(self, 'completion_profile', None) is None:
+            raise ValueError('original sandbox completion profile is required')
+        from .completion_worker import read_result
+        return read_result(self, recover=recover)

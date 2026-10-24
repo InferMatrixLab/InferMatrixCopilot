@@ -39,8 +39,7 @@ _FORBIDDEN = re.compile(
     r"|worker_runner|model_executor|online_serving|input_output"
     r"|dev/vllm-align|releases/v0"              # branch names
     r"|wheels\.vllm\.ai"                        # wheel host
-    r"|vllm-omni-rebase(?!-agent)"              # pipeline slug (the
-    # -agent sibling default in config.py is ceilinged delegation)
+    r"|vllm-omni-rebase"                       # pipeline/external-agent names
     r"|gpu_1_queue|gpu_4_queue|mithril"         # queue names
     r"|VLLM_PRECOMPILED_WHEEL_COMMIT",          # pin env var
 )
@@ -72,7 +71,7 @@ _VOCAB_CEILINGS = {
     "rebase_engine/worktree.py": 2,
     "engine/steps/rebase_v3.py": 14,
     # ceilinged v1-era defaults (also under test_repo_neutral_core)
-    "config.py": 4,      # agent-root sibling name (orchestrator cmd: PR7)
+    "config.py": 2,      # default_repo; no external-agent default or exemption
     "task_spec.py": 2,   # default_repo literal
     "intent.py": 4,      # default_repo parameter defaults
     "__init__.py": 2,    # package docstring

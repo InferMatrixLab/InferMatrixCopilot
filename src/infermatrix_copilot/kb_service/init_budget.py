@@ -29,9 +29,12 @@ import json
 import math
 import os
 import threading
-from contextlib import contextmanager
+import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
+
+from ..budgeting import request_cost_bound, reservation_fits, reserved_call, settlement_charge
 
 PRICES_ENV = "KB_INIT_PRICES"
 CACHE_WRITE_FACTOR = 1.25
@@ -102,8 +105,8 @@ def worst_request_usd(price: Price, input_bytes: int) -> float:
     cache-write rate) plus a full-length reply."""
     if input_bytes < 0:
         raise ValueError("input_bytes must be >= 0")
-    return (input_bytes * CACHE_WRITE_FACTOR * price.in_usd_per_mtok
-            + price.max_output_tokens * price.out_usd_per_mtok) / 1_000_000
+    return request_cost_bound(input_bytes, price.in_usd_per_mtok, price.max_output_tokens,
+                              price.out_usd_per_mtok, cache_factor=CACHE_WRITE_FACTOR)
 
 
 def generator_reservation(price: Price, threshold_usd: float, input_bytes: int) -> float:
@@ -113,25 +116,34 @@ def generator_reservation(price: Price, threshold_usd: float, input_bytes: int) 
 class Reservation:
     """One reserved amount; ``charge`` records what the call actually cost."""
 
-    def __init__(self, amount: float):
+    def __init__(self, amount: float, identity: str = "", accounting: str = "actual"):
         self.amount = amount
+        self.identity = identity
+        self.accounting = accounting
         self.charged: float | None = None
 
     def charge(self, actual: float | None) -> None:
         """Record the call's cost; None (unknown) charges the full reservation.
         A reported cost above the reservation is charged as reported."""
-        if actual is None or isinstance(actual, bool) or not isinstance(actual, (int, float)) \
-                or not math.isfinite(actual) or actual < 0:
-            self.charged = self.amount
-        else:
-            self.charged = float(actual)
+        # Fixed judge accounting is an allowance, not the provider's reported
+        # API cost. Native cost and unknown usage remain in the trace receipt.
+        self.charged = settlement_charge(self.amount, self.amount if self.accounting == "fixed" else actual)
 
 
 class Budget:
     """A finite stage ceiling, or explicit None for uncapped accounting.
-    Reservations are atomic; independent native calls may share one budget."""
+    Reservations and optional checkpoints share one lock; model calls do not.
 
-    def __init__(self, limit_usd: float | None, *, spent_usd: float = 0.0):
+    The checkpoint receives settled spend and outstanding reservations before
+    dispatch and after settlement. A checkpoint failure propagates and charges
+    the affected reservation conservatively, so an outer record save cannot
+    erase a reservation that the failing callback may already have persisted.
+    Further dispatch requires recovery into a new budget instance.
+    """
+
+    def __init__(self, limit_usd: float | None, *, spent_usd: float = 0.0,
+                 checkpoint: Callable[[float, float], None] | None = None,
+                 calls: dict | None = None):
         if limit_usd is not None and (not math.isfinite(limit_usd) or limit_usd <= 0):
             raise ValueError("limit_usd must be a finite number > 0")
         if not math.isfinite(spent_usd) or spent_usd < 0:
@@ -140,6 +152,26 @@ class Budget:
         self.spent_usd = float(spent_usd)
         self._reserved = 0.0
         self._lock = threading.RLock()
+        self._checkpoint = checkpoint
+        self._checkpoint_failed = False
+        self.calls = calls
+        if calls is not None:
+            if not isinstance(calls, dict):
+                raise ValueError("invalid init budget call journal")
+            for identity, entry in calls.items():
+                if (not isinstance(identity, str) or len(identity) != 32
+                        or any(c not in '0123456789abcdef' for c in identity)
+                        or not isinstance(entry, dict) or entry.get('status') not in ('reserved', 'settled')
+                        or ('accounting' in entry and entry['accounting'] not in ('actual', 'fixed'))
+                        or any(isinstance(entry.get(key), bool) or not isinstance(entry.get(key), (int, float))
+                               or not math.isfinite(entry[key]) or entry[key] < 0
+                               for key in ('reserved_usd', 'accounted_usd'))):
+                    raise ValueError("invalid init budget call journal")
+                if entry['status'] == 'reserved' and entry['accounted_usd'] < entry['reserved_usd']:
+                    raise ValueError("unresolved init budget call lost its reservation")
+            # Some legacy stage saves round their public total to six decimals.
+            if math.fsum(entry['accounted_usd'] for entry in calls.values()) > spent_usd + 1e-6:
+                raise ValueError("init budget total is below its recorded calls")
 
     @property
     def remaining_usd(self) -> float | None:
@@ -150,25 +182,110 @@ class Budget:
         """An explicit None ceiling keeps accounting without limiting calls."""
         if not math.isfinite(amount) or amount < 0:
             raise ValueError("a reservation must be a finite number >= 0")
-        remaining = self.remaining_usd
-        return remaining is None or amount <= remaining + 1e-12
+        with self._lock:
+            return reservation_fits(self.limit_usd, self.spent_usd, max(0, self._reserved), amount)
+
+    def checkpoint_now(self, update: Callable[[], None] | None = None) -> None:
+        """Apply and save domain state under the reservation checkpoint lock."""
+        with self._lock:
+            if self._checkpoint_failed:
+                raise RuntimeError("budget checkpoint failed; recover durable state before dispatch")
+            try:
+                if update is not None:
+                    update()
+                if self._checkpoint is not None:
+                    self._checkpoint(self.spent_usd, self._reserved)
+            except BaseException:
+                self._checkpoint_failed = True
+                raise
 
     @contextmanager
-    def reserve(self, amount: float) -> Iterator[Reservation]:
+    def reserve(self, amount: float, *, accounting: str = "actual") -> Iterator[Reservation]:
         """Hold ``amount`` for one call. Raises ``BudgetExhausted`` before the
         call when it does not fit. On exit the charge (or, when the block did
         not charge, e.g. because the call raised, the whole reservation) is
         added to what was spent."""
-        with self._lock:
-            if not self.can_reserve(amount):
-                raise BudgetExhausted(
-                    f"reserving ${amount:.4f} would exceed the budget "
-                    f"(spent ${self.spent_usd:.4f} of ${self.limit_usd:.2f})")
-            reservation = Reservation(amount)
-            self._reserved += amount
-        try:
-            yield reservation
-        finally:
+        if accounting not in ("actual", "fixed"):
+            raise ValueError("unknown init budget accounting policy")
+
+        def acquire():
+            with self._lock:
+                if self._checkpoint_failed:
+                    raise RuntimeError("budget checkpoint failed; recover durable state before dispatch")
+                if not self.can_reserve(amount):
+                    raise BudgetExhausted(
+                        f"reserving ${amount:.4f} would exceed the budget "
+                        f"(spent ${self.spent_usd:.4f} of ${self.limit_usd:.2f})")
+                self._reserved += amount
+                reservation = Reservation(amount, uuid.uuid4().hex if self.calls is not None else "", accounting)
+                if self.calls is not None:
+                    self.calls[reservation.identity] = {"status": "reserved", "reserved_usd": amount,
+                                                        "accounted_usd": amount, "accounting": accounting}
+                try:
+                    if self._checkpoint is not None:
+                        self._checkpoint(self.spent_usd, self._reserved)
+                except BaseException:
+                    self._reserved -= amount
+                    self.spent_usd += amount
+                    self._checkpoint_failed = True
+                    raise
+                return reservation
+
+        def finish(call):
             with self._lock:
                 self._reserved -= amount
-                self.spent_usd += reservation.charged if reservation.charged is not None else amount
+                charged = settlement_charge(amount, call["reservation"].charged)
+                self.spent_usd += charged
+                entry = self.calls[call["reservation"].identity] if self.calls is not None else None
+                if entry is not None:
+                    entry.update(status="settled" if call["reservation"].charged is not None else "reserved",
+                                 accounted_usd=charged)
+                try:
+                    if self._checkpoint is not None:
+                        self._checkpoint(self.spent_usd, self._reserved)
+                except BaseException:
+                    self.spent_usd += max(amount - charged, 0.0)
+                    if entry is not None:
+                        entry.update(status="reserved", accounted_usd=max(amount, charged))
+                    self._checkpoint_failed = True
+                    raise
+
+        with reserved_call(acquire, finish) as call:
+            from ..trace_store import trace_context
+            reservation = call["reservation"]
+            with trace_context(init_budget={"reservation_id": reservation.identity,
+                                            "reserved_usd": amount, "accounting": accounting}) if self.calls is not None else nullcontext():
+                yield reservation
+
+    def reconcile(self, identity: str, *, actual_usd, receipt: dict) -> dict:
+        """Settle a proven original outcome; application code validates evidence.
+
+        This operates on a resumed, idle account and never reserves another call.
+        Unreported cost retains the original conservative accounted amount.
+        """
+        from copy import deepcopy
+        with self._lock:
+            if self._reserved or self._checkpoint_failed:
+                raise ValueError("reload the original idle budget before reconciliation")
+            if self.calls is None or identity not in self.calls:
+                raise ValueError("original budget reservation is missing")
+            entry = self.calls[identity]
+            if entry.get("accounting") not in ("actual", "fixed"):
+                raise ValueError("original accounting policy is missing")
+            charged = (entry["reserved_usd"] if entry["accounting"] == "fixed" else
+                       settlement_charge(entry["accounted_usd"], actual_usd))
+            if entry["status"] == "settled":
+                if entry["accounted_usd"] != charged or entry.get("receipt", receipt) != receipt:
+                    raise ValueError("original budget settlement is immutable")
+                return deepcopy(entry)
+            before, spent = deepcopy(entry), self.spent_usd
+            self.spent_usd += charged - entry["accounted_usd"]
+            entry.update(status="settled", accounted_usd=charged, receipt=deepcopy(receipt))
+            try:
+                self.checkpoint_now()
+            except BaseException:
+                self.spent_usd = spent
+                entry.clear()
+                entry.update(before)
+                raise
+            return deepcopy(entry)

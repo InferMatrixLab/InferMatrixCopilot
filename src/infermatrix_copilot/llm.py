@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from . import trace_store
 from .config import Settings
+from .budgeting import call_budget, valid_token_counts
 
 logger = logging.getLogger("infermatrix_copilot")
 
@@ -138,19 +139,13 @@ class LLM:
         the member's model/base_url/api_key. The member's key/base_url never
         leave the client object — logs and traces render `member.label()`
         (model@host) only."""
-        clone = object.__new__(LLM)
-        clone.settings = self.settings
-        clone._client = None
-        clone._default_model = ""
-        clone._provider = getattr(self, "_provider",
-                                  self.settings.resolved_llm_provider)
-        api_key = getattr(member, "api_key", "") or self.settings.shared_api_key
-        base = getattr(member, "base_url", "") or self.settings.shared_base_url
-        clone._endpoint_host = urlparse(base).netloc if base \
-            else _default_host(clone._provider)
-        if api_key:
-            clone._client = _build_client(clone._provider, api_key, base)
-        return clone
+        from .config import ResolvedTarget
+
+        return self.for_target(ResolvedTarget(
+            "moa_member", getattr(member, "model", ""),
+            getattr(member, "base_url", "") or self.settings.shared_base_url,
+            getattr(member, "api_key", "") or self.settings.shared_api_key,
+            "mixture", getattr(self, "_provider", self.settings.resolved_llm_provider)))
 
     def for_target(self, target: Any) -> "LLM":
         """Per-`ResolvedTarget` client (dual-path split, plan v2): the target's
@@ -204,83 +199,60 @@ class LLM:
             max_tokens=max_tokens or self.settings.llm_max_tokens,
         )
         from . import tracing
-        from .improve.budget import current_governor
-
         started = time.monotonic()
-        # the weekly envelope (design §10): the worst case is reserved BEFORE
-        # the request leaves the process; a refusal never sends it
-        governor = current_governor()
-        reservation = None
-        if governor is not None:
-            from .improve.budget import request_bytes
-
-            reservation = governor.reserve_call(kwargs["model"], request_bytes(kwargs),
-                                                int(kwargs["max_tokens"] or 0), purpose=role or "")
-        sent = False          # once True, a failure may already have been billed
-        usage = None          # set as soon as the provider's usage is known
-        try:
-            with tracing.span("llm", model=kwargs["model"],
-                              n_tools=len(kwargs["tools"]),
-                              **({"role": role} if role else {})) as _sp:
-                tracing.event("llm.request", span=_sp, model=kwargs["model"],
-                              n_tools=len(kwargs["tools"]), role=role or "",
-                              system=kwargs.get("system", ""),
-                              payload=tracing.summarize_messages(kwargs["messages"]))
-                sent = True
-                if provider == "anthropic" and on_text is not None:
-                    with self._client.messages.stream(**kwargs) as stream:
-                        for delta in stream.text_stream:
-                            _sp.mark_ttft()  # first streamed token = prefill done
-                            on_text(delta)
-                        resp = stream.get_final_message()
-                    blocks, stop_reason, usage, served, request_id = \
-                        self._normalize_anthropic(resp)
-                elif provider == "openai":
-                    resp = self._create_openai(**kwargs)
-                    blocks, stop_reason, usage, served, request_id = \
-                        self._normalize_openai(resp)
-                    if on_text is not None:
-                        _sp.mark_ttft()
-                        text = "".join(
-                            b.text for b in blocks if b.type == "text")
-                        if text:
-                            on_text(text)
-                else:
-                    resp = self._client.messages.create(**kwargs)
-                    blocks, stop_reason, usage, served, request_id = \
-                        self._normalize_anthropic(resp)
-                tracing.set_usage(_sp, usage, stop_reason=stop_reason)
-        except Exception as exc:
-            if governor is not None and reservation is not None:
-                if usage is not None:
-                    # the provider answered (usage known) and something after
-                    # that failed, e.g. on_text: real spend, settled as such
-                    governor.settle_call(reservation, usage, kwargs["model"])
-                elif sent:
-                    # sent, no usage: billing may have happened — charge the
-                    # whole reservation rather than discard real spend
-                    governor.forfeit_call(reservation)
-                else:
-                    governor.release_call(reservation)
-            # a failed provider call is still a model_call record (error set):
-            # forensics must see the request that never got a reply
-            capture_model_call(kwargs, role, provider, None,
-                               time.monotonic() - started, error=str(exc))
-            raise
-        tracing.event("llm.response", span=_sp,
-                      stop_reason=stop_reason,
-                      text="".join(b.text for b in blocks if b.type == "text"),
-                      tool_calls=[{"name": b.name, "id": b.id, "input": b.input}
-                                  for b in blocks if b.type == "tool_use"],
-                      # the endpoint exposes no token ids, so the replayable
-                      # record is this text plus the counts for the same call
-                      **tracing.usage_counts(usage))
-        reply = Reply(blocks=blocks, stop_reason=stop_reason,
-                      usage=usage, model=served, request_id=request_id)
-        capture_model_call(kwargs, role, provider, reply,
-                           time.monotonic() - started)
-        if governor is not None and reservation is not None:
-            governor.settle_call(reservation, usage, kwargs["model"])  # a breach raises: fail closed
+        usage = None
+        with call_budget({**kwargs, "role": role, "kind": "api"}) as call:
+            try:
+                with tracing.span("llm", model=kwargs["model"],
+                                  n_tools=len(kwargs["tools"]),
+                                  **({"role": role} if role else {})) as _sp:
+                    tracing.event("llm.request", span=_sp, model=kwargs["model"],
+                                  n_tools=len(kwargs["tools"]), role=role or "",
+                                  system=kwargs.get("system", ""),
+                                  payload=tracing.summarize_messages(kwargs["messages"]))
+                    call["sent"] = True
+                    if provider == "anthropic" and on_text is not None:
+                        with self._client.messages.stream(**kwargs) as stream:
+                            for delta in stream.text_stream:
+                                _sp.mark_ttft()  # first streamed token = prefill done
+                                on_text(delta)
+                            resp = stream.get_final_message()
+                        blocks, stop_reason, usage, served, request_id = \
+                            self._normalize_anthropic(resp)
+                    elif provider == "openai":
+                        resp = self._create_openai(**kwargs)
+                        blocks, stop_reason, usage, served, request_id = \
+                            self._normalize_openai(resp)
+                        call["usage"] = usage
+                        if on_text is not None:
+                            _sp.mark_ttft()
+                            text = "".join(
+                                b.text for b in blocks if b.type == "text")
+                            if text:
+                                on_text(text)
+                    else:
+                        resp = self._client.messages.create(**kwargs)
+                        blocks, stop_reason, usage, served, request_id = \
+                            self._normalize_anthropic(resp)
+                    call["usage"] = usage
+                    tracing.set_usage(_sp, usage, stop_reason=stop_reason)
+            except Exception as exc:
+                capture_model_call(kwargs, role, provider, None,
+                                   time.monotonic() - started, error=str(exc))
+                raise
+            tracing.event("llm.response", span=_sp,
+                          stop_reason=stop_reason,
+                          text="".join(b.text for b in blocks if b.type == "text"),
+                          tool_calls=[{"name": b.name, "id": b.id, "input": b.input}
+                                      for b in blocks if b.type == "tool_use"],
+                          # the endpoint exposes no token ids, so the replayable
+                          # record is this text plus the counts for the same call
+                          **tracing.usage_counts(usage))
+            reply = Reply(blocks=blocks, stop_reason=stop_reason,
+                          usage=usage, model=served, request_id=request_id)
+            call.update(reply=reply, outcome="completed")
+            capture_model_call(kwargs, role, provider, reply,
+                               time.monotonic() - started)
         self._guard_served_model(kwargs["model"], reply, _sp)
         return reply
 
@@ -297,7 +269,8 @@ class LLM:
                     type="tool_use", id=b.id, name=b.name,
                     input=dict(b.input)))
         usage = None
-        if getattr(resp, "usage", None) is not None:
+        if valid_token_counts(getattr(getattr(resp, "usage", None), "input_tokens", None),
+                              getattr(getattr(resp, "usage", None), "output_tokens", None)):
             usage = {
                 "input_tokens": getattr(resp.usage, "input_tokens", 0),
                 "output_tokens": getattr(resp.usage, "output_tokens", 0),
@@ -414,10 +387,12 @@ class LLM:
         }.get(raw_stop, raw_stop or "end_turn")
         raw_usage = getattr(resp, "usage", None)
         usage = None
-        if raw_usage is not None:
+        if valid_token_counts(getattr(raw_usage, "prompt_tokens", None),
+                              getattr(raw_usage, "completion_tokens", None)):
             details = getattr(raw_usage, "prompt_tokens_details", None)
             usage = {
                 "input_tokens": getattr(raw_usage, "prompt_tokens", 0) or 0,
+                "input_tokens_include_cache": True,
                 "output_tokens": getattr(
                     raw_usage, "completion_tokens", 0) or 0,
                 "cache_read_input_tokens": getattr(
@@ -475,20 +450,13 @@ class LLM:
 
 
 def parse_json_reply(text: str) -> dict | None:
-    """Extract a JSON object from an LLM reply (fenced or bare)."""
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidates = [fence.group(1)] if fence else []
-    brace = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace:
-        candidates.append(brace.group(0))
-    for c in candidates:
-        try:
-            obj = json.loads(c)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            continue
-    return None
+    """Compatibility policy: the first fenced object, then the outer braces."""
+    from .structured_output import decode_json_object
+
+    try:
+        return decode_json_object(text, policy="first_fence")
+    except ValueError:
+        return None
 
 
 MESSAGES_FORMAT = "messages/1"
@@ -496,20 +464,35 @@ MESSAGES_FORMAT = "messages/1"
 
 def capture_model_call(kwargs: dict, role: str, provider: str,
                        reply: "Reply | None", seconds: float,
-                       error: str = "", extra_result: dict | None = None) -> None:
+                       error: str = "", extra_result: dict | None = None,
+                       reported_usage: dict | None = None, served_model: str = "",
+                       store=None, strict=False, extra_outputs: dict | None = None) -> dict | None:
     """trace/1 ``model_call`` capture for every provider path (the API loop,
-    the harness one-shot, a harness session) when a store is bound; never
-    raises. Full fidelity so the request can be reconstructed: ``inputs.system``,
+    the harness one-shot, a harness session) when a store is bound. Legacy
+    capture is best effort; ``strict`` propagates durable recording failures.
+    Full fidelity so the request can be reconstructed: ``inputs.system``,
     ``inputs.messages`` (the structured conversation, JSON) and
     ``inputs.tools`` (the tool definitions offered, JSON); ``result.format``
     names the shape so readers never confuse it with the knowledge service's
     single-string ``inputs.prompt`` records. A failed call has no outputs at
     all: forensics reads "no reply blob and a non-empty error" as the
-    dropped-call shape."""
-    store = trace_store.current_store()
-    if store is None:
-        return
+    dropped-call shape. ``reported_usage`` and ``served_model`` retain native
+    billing facts independently of whether a reply was accepted."""
+    store = store if store is not None else trace_store.current_store()
     try:
+        identity = {"role": role or "", "provider": provider,
+                    "model": kwargs.get("model", "") or "",
+                    **({"effort": kwargs["effort"]} if kwargs.get("effort") else {}),
+                    "served_model": served_model or (getattr(reply, "model", "") if reply is not None else "") or ""}
+        observed_usage = dict(reported_usage if reported_usage is not None else
+                              (getattr(reply, "usage", None) if reply is not None else None) or {})
+        if store is None:
+            from uuid import uuid4
+            from .model_usage import observe_model_call
+            observe_model_call(trace_store._redact_obj({"id": "usage-" + uuid4().hex,
+                "context": trace_store.current_context(), "model": identity,
+                "usage": observed_usage, "result": extra_result or {}}))
+            return
         blocks = list(getattr(reply, "blocks", None) or []) if reply is not None else []
         text = "".join(getattr(b, "text", "") for b in blocks if getattr(b, "type", "") == "text")
         tool_calls = [{"name": b.name, "id": b.id, "input": b.input}
@@ -519,17 +502,15 @@ def capture_model_call(kwargs: dict, role: str, provider: str,
                                          ensure_ascii=False, default=str)}
         if kwargs.get("tools"):
             inputs["tools"] = json.dumps(kwargs["tools"], ensure_ascii=False, default=str)
-        store.append(
+        return store.append(
             "model_call",
             inputs=inputs,
-            outputs=({"reply": text,
+            outputs={**({"reply": text,
                       "tool_calls": json.dumps(tool_calls, ensure_ascii=False,
                                                default=str)}
-                     if reply is not None else {}),
-            model={"role": role or "", "provider": provider,
-                   "model": kwargs.get("model", "") or "",
-                   "served_model": (getattr(reply, "model", "") if reply is not None else "") or ""},
-            usage=dict((getattr(reply, "usage", None) if reply is not None else None) or {}),
+                     if reply is not None else {}), **(extra_outputs or {})},
+            model=identity,
+            usage=observed_usage,
             seconds=round(seconds, 6),
             result={"format": MESSAGES_FORMAT,
                     "stop_reason": (getattr(reply, "stop_reason", "") if reply is not None else "") or "",
@@ -538,5 +519,7 @@ def capture_model_call(kwargs: dict, role: str, provider: str,
                     "n_tool_calls": len(tool_calls),
                     **(extra_result or {})},
             error=error)
-    except Exception:  # noqa: BLE001 - capture never breaks a model call
-        pass
+    except Exception:  # legacy capture is best effort; durable execution opts in
+        if strict:
+            raise
+        return None

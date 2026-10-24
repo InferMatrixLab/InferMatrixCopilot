@@ -27,6 +27,8 @@ Code and Codex each launch their own server):
 
 from __future__ import annotations
 
+from .persistence import atomic_write_bytes
+
 import json
 import os
 import time
@@ -52,6 +54,11 @@ STATUS_NAME = "run_status.json"
 _LOCK_NAME = "run_status.json.lock"
 
 
+def mutable_status_paths() -> tuple[str, str]:
+    """Lifecycle metadata touched by readers/writers, not immutable step input."""
+    return STATUS_NAME, _LOCK_NAME
+
+
 def status_path(run_dir: str | Path) -> Path:
     """Path to the run's status file."""
     return Path(run_dir) / STATUS_NAME
@@ -64,8 +71,9 @@ def read_status(run_dir: str | Path) -> Optional[dict]:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (ValueError, OSError):
         return None
 
 
@@ -93,9 +101,7 @@ def _locked_update(run_dir: str | Path,
             now = time.time()
             new = {**cur, **updates, "updated": now}
             new.setdefault("created", now)
-            tmp = run_dir / f".{STATUS_NAME}.{os.getpid()}.tmp"
-            tmp.write_text(json.dumps(new, indent=2, default=str), encoding="utf-8")
-            os.replace(tmp, status_path(run_dir))
+            atomic_write_bytes(status_path(run_dir), json.dumps(new, indent=2, default=str).encode("utf-8"))
             return new
         finally:
             if fcntl is not None:
@@ -104,13 +110,17 @@ def _locked_update(run_dir: str | Path,
 
 # ── writers ───────────────────────────────────────────────────────────────────
 def init_queued(run_dir: str | Path, *, run_id: str, owner_server_id: str,
-                owner_server_pid: int) -> dict:
+                owner_server_pid: int, request_fingerprint: str = "",
+                execution_mode: str = "", native_completion_sha256: str = "") -> dict:
     """Server-side initial write (before the child exists): `queued` + the
     ownership stamps used later for reconciliation. `child_pid` starts null."""
     return _locked_update(run_dir, lambda _cur: {
         "run_id": run_id, "state": QUEUED,
         "owner_server_id": owner_server_id, "owner_server_pid": int(owner_server_pid),
         "child_pid": None, "note": "",
+        **({"request_fingerprint": request_fingerprint, "execution_mode": execution_mode}
+           if request_fingerprint else {}),
+        **({"native_completion_sha256": native_completion_sha256} if native_completion_sha256 else {}),
     })  # type: ignore[return-value]
 
 
@@ -149,7 +159,7 @@ def claim_for_execution(run_dir: str | Path, *, child_pid: int) -> bool:
         recorded = cur.get("child_pid")
         if cur.get("state") == PLANNING and recorded == int(child_pid):
             return None  # already ours: idempotent, nothing to change
-        if cur.get("state") != QUEUED or recorded not in (None, int(child_pid)):
+        if cur.get("state") != QUEUED or "child_pid" not in cur or recorded not in (None, int(child_pid)):
             return None  # someone else owns it, or it already ran
         return {"child_pid": int(child_pid), "state": PLANNING}
 
@@ -173,15 +183,19 @@ def reclaim_queued(run_dir: str | Path, *, owner_server_id: str,
     Callers hold the per-key idempotency lock across this, so a second retry
     observing `queued` with a live owner is told the run already exists and does
     not enqueue it again."""
+    rearmed = False
+
     def _rearm(cur: dict) -> Optional[dict]:
-        if cur.get("state") != INTERRUPTED or cur.get("child_pid") is not None:
+        nonlocal rearmed
+        if cur.get("state") != INTERRUPTED or "child_pid" not in cur or cur.get("child_pid") is not None:
             return None
+        rearmed = True
         return {"state": QUEUED, "note": "",
                 "owner_server_id": owner_server_id,
                 "owner_server_pid": int(owner_server_pid)}
 
     after = _locked_update(run_dir, _rearm) or {}
-    return after.get("state") == QUEUED and after.get("child_pid") is None
+    return rearmed and after.get("state") == QUEUED and after.get("child_pid") is None
 
 
 def mark(run_dir: str | Path, state: str, *, note: str = "") -> dict:

@@ -11,6 +11,7 @@ dependencies = [
     "openai>=1.50",
     "rich>=13.0",
     "markdown-it-py>=3",
+    "jsonschema>=4",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,8 @@ dev = ["pytest>=8.0"]
 mcp = ["mcp>=1.8,<2"]
 # Knowledge service (signing, verdict envelopes).
 kb = ["cryptography>=42"]
+# Composition-based DeepSeek adapter: later SDKs removed cordis/session_root.
+deepseek = ["deepseek-harness-sdk==0.1.0rc6"]
 
 [project.scripts]
 infermatrix-copilot = "infermatrix_copilot.cli:main"
@@ -40,6 +43,8 @@ packages = ["src/infermatrix_copilot"]
 "playbooks" = "infermatrix_copilot/_runtime/playbooks"
 "adapters" = "infermatrix_copilot/_runtime/adapters"
 "skills" = "infermatrix_copilot/_runtime/skills"
+"doc/knowledge/SCHEMA.md" = "infermatrix_copilot/_runtime/knowledge-schema.md"
+"doc/knowledge" = "infermatrix_copilot/doc/knowledge"
 "plugins/infermatrix-copilot/skills" = "infermatrix_copilot/_runtime/host_skills"
 "doc/features/rfc-service.md" = "infermatrix_copilot/_runtime/docs/rfc-service.md"
 

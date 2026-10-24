@@ -77,11 +77,10 @@ def _ledger_dir(ctx: StepContext) -> Path:
 
 @step("improve.coordinate", "deterministic", "read", "Run the shared resumable improvement/evolution coordinator.")
 async def _coordinate(ctx: StepContext) -> StepResult:
-    import asyncio
-    from ...improve.coordinator import run
+    from ...improve.coordinator import run_async
     store = _trace_store(ctx)
     if store is None: return StepResult(False, FailureKind.BLOCKED, "no trace store")
-    report = await asyncio.to_thread(run, ctx.settings, store, llm=ctx.llm)
+    report = await run_async(ctx.settings, store, llm=ctx.llm)
     updates = {"improve_cycle": report.get("stages", {}).get("lint", {}), "improve_evolution": report.get("stages", {}).get("evolve", {})}
     ctx.state.update(updates)
     return StepResult(True, summary=f"evolution coordinator: {report.get('state')}", outputs={"report": report, "state_updates": updates})

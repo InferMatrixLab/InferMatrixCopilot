@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from ..budgeting import native_outcome_unknown
+
 import json
 import re
-import hashlib
 
 from .gate import DIMENSIONS
 from .models import ModelGateway, ModelUnavailable
@@ -52,7 +53,7 @@ missing test cannot be promoted into a guarantee or a verified-absence claim.
 """
 
 
-def review_facets(rt, budget, init, *, feature, pin, blocks, existing, evidence, acceptance_modes=None):
+def facet_review_contract(blocks, acceptance_modes=None):
     from .knowledge_depth import _validation_kind, depth_acceptance_mode
 
     facets = set(blocks)
@@ -70,45 +71,37 @@ def review_facets(rt, budget, init, *, feature, pin, blocks, existing, evidence,
                        for facet, mode in acceptance_modes.items()):
             raise ValueError("review acceptance_modes must bind each stored facet mode")
 
-    def valid_result(result):
-        dimensions = result.get("dimensions") if isinstance(result, dict) else None
-        return isinstance(result, dict) and isinstance(result.get("reason"), str) and bool(result["reason"].strip()) \
-            and isinstance(dimensions, dict) and set(dimensions) == set(DIMENSIONS["prose"]) \
-            and all(value in ("yes", "no", "unsure") for value in dimensions.values())
+    return modes, validation_kinds
 
-    def validate(data):
-        results = data.get("facets")
-        if not isinstance(results, dict) or not facets.intersection(results):
-            raise ValueError("depth review has no requested facet results")
-        if all(mode == "strict" for mode in modes.values()) and (
-                set(results) != facets or not all(valid_result(result) for result in results.values())):
-            raise ValueError("strict depth review needs the complete valid facet packet")
 
-    payload = {"feature": feature, "pin": pin,
-               "sections": {f: re.sub(r"<!--.*?-->", "", text, flags=re.S).strip() for f, text in blocks.items()},
-               "existing_knowledge": existing, "evidence": evidence,
-               "acceptance_modes": modes, "validation_kinds": validation_kinds}
-    receipt = {}
-    with budget.reserve(init.judge_call_usd) as reservation:
-        try:
-            if getattr(rt, "unlimited_subscription", False) and not rt.gateway.subscription_billing(rt.judge):
-                raise ModelUnavailable("unlimited depth review requires an authenticated subscription judge")
-            reply = rt.gateway.call_json(rt.judge, system=SYSTEM_DEPTH_REVIEW,
-                                         prompt="<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace(
-                                             "<", "\\u003c") + "\n</untrusted_data>", validate=validate)
-            if getattr(rt, "unlimited_subscription", False) and isinstance(rt.gateway, ModelGateway) \
-                    and (not reply.trace_id or not re.fullmatch(r"[0-9a-f]{64}", reply.reply_sha256)):
-                raise ModelUnavailable("native review archive receipt unavailable; draft retained for rejudging")
-            results, model = reply.data["facets"], reply.served_model or rt.judge.label()
-            receipt = {"native_trace_id": reply.trace_id,
-                       "native_reply_sha256": reply.reply_sha256 or hashlib.sha256(reply.text.encode()).hexdigest()}
-        except ModelUnavailable as exc:
-            results = {f: {"verdict": "unjudged", "reason": str(exc)} for f in facets}
-            model = rt.judge.label()
-        reservation.charge(init.judge_call_usd)
+def facet_review_binding(text_sha256, blocks, role, acceptance_modes=None):
+    modes, kinds = facet_review_contract(blocks, acceptance_modes)
+    return {"text_sha256": text_sha256, "requested": role.label(), "role": role.name,
+            "acceptance_modes": modes, "validation_kinds": kinds}
+
+
+def _valid_result(result):
+    dimensions = result.get("dimensions") if isinstance(result, dict) else None
+    return isinstance(result, dict) and isinstance(result.get("reason"), str) and bool(result["reason"].strip()) \
+        and isinstance(dimensions, dict) and set(dimensions) == set(DIMENSIONS["prose"]) \
+        and all(value in ("yes", "no", "unsure") for value in dimensions.values())
+
+
+def validate_facet_review(data, modes):
+    facets = set(modes)
+    results = data.get("facets")
+    if not isinstance(results, dict) or not facets.intersection(results):
+        raise ValueError("depth review has no requested facet results")
+    if all(mode == "strict" for mode in modes.values()) and (
+            set(results) != facets or not all(_valid_result(result) for result in results.values())):
+        raise ValueError("strict depth review needs the complete valid facet packet")
+
+
+def _facet_review_result(results, model, modes, validation_kinds, receipt):
+    facets = set(modes)
     normalized = {}
-    packet_valid = set(results) == facets and all(valid_result(result) for result in results.values())
-    for facet in blocks:
+    packet_valid = set(results) == facets and all(_valid_result(result) for result in results.values())
+    for facet in modes:
         result = results.get(facet)
         if isinstance(result, dict) and result.get("verdict") == "unjudged" and "dimensions" not in result:
             normalized[facet] = {**result, "acceptance_mode": modes[facet]}
@@ -118,7 +111,7 @@ def review_facets(rt, budget, init, *, feature, pin, blocks, existing, evidence,
                                  "acceptance_mode": modes[facet]}
             continue
         dimensions = result.get("dimensions") if isinstance(result, dict) else None
-        if not valid_result(result):
+        if not _valid_result(result):
             normalized[facet] = {"verdict": "unjudged", "reason": "missing or malformed independent facet judgment",
                                  "acceptance_mode": modes[facet]}
             continue
@@ -130,3 +123,43 @@ def review_facets(rt, budget, init, *, feature, pin, blocks, existing, evidence,
         normalized[facet]["validation_kind"] = kind
     return {"facets": normalized, "model": model, "acceptance_modes": modes,
             "validation_kinds": validation_kinds, **receipt}
+
+
+def facet_review_result(reply, role, modes, validation_kinds):
+    from .quality_review import native_receipt
+    results, model = reply.data["facets"], reply.served_model or role.label()
+    native = native_receipt(reply)
+    receipt = {"native_trace_id": native['trace_id'],
+               "native_reply_sha256": native['reply_sha256'],
+               **({"quality_receipt": reply.quality_receipt} if getattr(reply, "quality_receipt", None) else {})}
+    return _facet_review_result(results, model, modes, validation_kinds, receipt)
+
+
+def review_facets(rt, budget, init, *, feature, pin, blocks, existing, evidence, acceptance_modes=None):
+    modes, validation_kinds = facet_review_contract(blocks, acceptance_modes)
+    facets = set(blocks)
+    payload = {"feature": feature, "pin": pin,
+               "sections": {f: re.sub(r"<!--.*?-->", "", text, flags=re.S).strip() for f, text in blocks.items()},
+               "existing_knowledge": existing, "evidence": evidence,
+               "acceptance_modes": modes, "validation_kinds": validation_kinds}
+    receipt = {}
+    from .quality_review import QualityPolicy, review_call
+
+    try:
+        unlimited = getattr(rt, "unlimited_subscription", False)
+        reply = review_call(rt.gateway, rt.judge,
+            policy=QualityPolicy("depth-facets", subscription=unlimited,
+                                 archive="present" if unlimited and isinstance(rt.gateway, ModelGateway) else "optional"),
+            system=SYSTEM_DEPTH_REVIEW,
+            prompt="<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace(
+                "<", "\\u003c") + "\n</untrusted_data>", validate=lambda data: validate_facet_review(data, modes),
+            budget=budget, charge_usd=init.judge_call_usd)
+        return facet_review_result(reply, rt.judge, modes, validation_kinds)
+    except ModelUnavailable as exc:
+        if native_outcome_unknown(exc):
+            raise  # Keep the dispatch intent; uncertainty is not a new correction round.
+        results = {f: {"verdict": "unjudged", "reason": str(exc)} for f in facets}
+        model = rt.judge.label()
+        if getattr(exc, "quality_receipt", None):
+            receipt["quality_receipt"] = exc.quality_receipt
+    return _facet_review_result(results, model, modes, validation_kinds, receipt)

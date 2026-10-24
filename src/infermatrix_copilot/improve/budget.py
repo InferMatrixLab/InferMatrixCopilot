@@ -44,12 +44,16 @@ import json
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 from ..trace_store import current_store, file_lock
+from ..budgeting import bind_call_budget, request_cost_bound, reservation_fits, settlement_charge, usage_cost
+from ..persistence import atomic_write_bytes
 
 _GOVERNOR: contextvars.ContextVar["Governor | None"] = contextvars.ContextVar("improve_governor", default=None)
+_JUDGE_ACCOUNT = contextvars.ContextVar('improve_judge_account', default=None)
 
 
 class BudgetRefused(RuntimeError):
@@ -85,22 +89,40 @@ def worst_case_usd(model: str, req_bytes: int, max_tokens: int, settings: Any = 
     input_bound = max(req_bytes, limit)
     read_factor = float(getattr(settings, "cache_read_price_factor", 0) or 0) or CACHE_READ_FACTOR
     input_factor = max(1.0, CACHE_CREATE_FACTOR, read_factor)
-    return input_bound / 1e6 * pin * input_factor + max(0, int(max_tokens or 0)) / 1e6 * pout
+    return request_cost_bound(input_bound, pin, max(0, int(max_tokens or 0)), pout,
+                              cache_factor=input_factor)
 
 
-def actual_usd(model: str, usage: dict | None, settings: Any = None) -> float:
+def actual_usd(model: str, usage: dict | None, settings: Any = None) -> float | None:
     """The cache-aware cost of a call, as `metrics.cost_from_spans` prices it."""
+    if isinstance(usage, dict) and 'cost_usd' in usage:
+        return usage_cost(usage, 0, 0)  # reported amounts do not require a price table
     from ..metrics import CACHE_CREATE_FACTOR, CACHE_READ_FACTOR, model_price
 
     pin, pout = model_price(model, settings)
     read_f = float(getattr(settings, "cache_read_price_factor", 0) or 0) or CACHE_READ_FACTOR
-    u = usage or {}
-    tin = int(u.get("input_tokens") or 0)
-    tout = int(u.get("output_tokens") or 0)
-    cread = int(u.get("cache_read_input_tokens") or u.get("cache_read_tokens") or 0)
-    ccreate = int(u.get("cache_creation_input_tokens") or u.get("cache_creation_tokens") or 0)
-    return (tin / 1e6 * pin + tout / 1e6 * pout + cread / 1e6 * pin * read_f
-            + ccreate / 1e6 * pin * CACHE_CREATE_FACTOR)
+    return usage_cost(usage, pin, pout, cache_read_factor=read_f, cache_create_factor=CACHE_CREATE_FACTOR)
+
+
+def record_usd(record: dict, settings: Any = None) -> float | None:
+    """Read reported cost or price complete API facts; legacy aliases are not bills."""
+    from ..budgeting import normalized_cost
+    from ..metrics import model_price_known
+
+    result, usage = record.get('result') or {}, record.get('usage') or {}
+    if 'cost_usd' in result:
+        return normalized_cost(result['cost_usd'])
+    if 'cost_usd' in usage:
+        return normalized_cost(usage['cost_usd'])
+    identity = record.get('model') or {}
+    if (str(identity.get('provider') or '').startswith('harness:')
+            or any(key in result for key in ('native_subscription', 'subscription', 'native_attempt_id'))
+            or result.get('session')):
+        return None  # tokens and account conventions cannot price a native invoice
+    model = str(identity.get('served_model') or identity.get('model') or '')
+    if not model_price_known(model, settings):
+        return None
+    return normalized_cost(actual_usd(model, usage, settings))
 
 
 class Governor:
@@ -130,12 +152,10 @@ class Governor:
 
     def _save(self, week: str, state: dict) -> None:
         path = self._path(week)
-        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:6]}.tmp")
-        tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_bytes(path, json.dumps(state, indent=1).encode("utf-8"))
 
     @contextmanager
-    def _locked(self, week: str) -> Iterator[dict]:
+    def _locked(self, week: str, *, write=True) -> Iterator[dict]:
         with file_lock(self.dir / "budget.lock", blocking=True, timeout=30.0) as held:
             if not held:
                 raise BudgetRefused("the budget ledger is locked by another process")
@@ -143,7 +163,8 @@ class Governor:
             try:
                 yield state
             finally:
-                self._save(week, state)   # a refusal counted before the raise is state too
+                if write:
+                    self._save(week, state)   # a refusal counted before the raise is state too
 
     @staticmethod
     def _reserved(state: dict) -> float:
@@ -172,56 +193,132 @@ class Governor:
         """Reserve the worst case for one model call in the current week;
         the id pins the week. Raises BudgetRefused."""
         est = worst_case_usd(model, req_bytes, max_tokens, self.settings)
+        return self.reserve_amount(model, est, purpose=purpose)
+
+    def reserve_amount(self, model: str, est: float, *, purpose: str = '', native_binding=None) -> str:
+        """Reserve a domain-attested bound through the original dollar journal."""
+        from ..budgeting import normalized_cost
+        est = normalized_cost(est)
+        if est is None:
+            raise BudgetRefused('invalid dollar reservation bound')
         week = self.week()
         with self._locked(week) as state:
             self._stop_if_breached(state)
-            if state["usd_settled"] + self._reserved(state) + est > self.usd_week + 1e-12:
+            if not reservation_fits(self.usd_week, state["usd_settled"], self._reserved(state), est):
                 state["refused"] += 1
                 raise BudgetRefused(
                     f"reserving ${est:.4f} for {model} would exceed the weekly envelope "
                     f"(${self.usd_week:.2f}; settled ${state['usd_settled']:.4f}, reserved ${self._reserved(state):.4f})")
             rid = f"{week}|{uuid.uuid4().hex[:10]}"
             state["reservations"][rid] = {"usd": est, "model": model, "at": self._clock(), "purpose": purpose}
+            if native_binding is not None:
+                state['reservations'][rid]['native_binding'] = dict(native_binding)
         return rid
 
     @staticmethod
     def _week_of(reservation_id: str) -> str:
         return reservation_id.split("|", 1)[0]
 
-    def settle_call(self, reservation_id: str, usage: dict | None, model: str) -> float:
-        """Replace the reservation by the actual cache-aware cost, in the
-        reservation's week; a cost above the reservation is a breach
-        (persisted, governor marked, exception)."""
-        actual = actual_usd(model, usage, self.settings)
+    def _finish_call(self, reservation_id, actual, model, outcome, *, native_binding=None):
         week = self._week_of(reservation_id)
         breached = False
         with self._locked(week) as state:
-            reservation = state["reservations"].pop(reservation_id, None)
-            state["usd_settled"] += actual
-            if reservation is not None and actual > float(reservation["usd"]) + 1e-9:
+            receipts = state.setdefault("settlements", {})
+            identity = {"actual": actual, "model": model, "outcome": outcome}
+            previous = receipts.get(reservation_id)
+            if previous is not None:
+                if native_binding is not None and previous.get('native_binding') != native_binding:
+                    raise BudgetRefused('original settlement binding changed during recovery')
+                if any(previous[key] != value for key, value in identity.items()):
+                    raise BudgetRefused("reservation already has a different settlement")
+                if previous["breached"]:
+                    raise BudgetBreach("settlement exceeded its reservation: cycle aborted")
+                return previous["charged"]
+            reservation = state["reservations"].get(reservation_id)
+            if reservation is None:
+                raise BudgetRefused("unknown reservation: no settlement authority")
+            if native_binding is not None and reservation.get('native_binding') != native_binding:
+                raise BudgetRefused('original reservation binding changed during recovery')
+            if model and model != reservation["model"]:
+                raise BudgetRefused("settlement model differs from reservation")
+            charged = 0.0 if outcome == "released" else settlement_charge(reservation["usd"], actual, outcome=outcome)
+            breached = charged > float(reservation["usd"]) + 1e-9
+            receipts[reservation_id] = {**identity, "charged": charged, "breached": breached}
+            if 'native_binding' in reservation:
+                receipts[reservation_id]['native_binding'] = reservation['native_binding']
+            del state["reservations"][reservation_id]
+            state["usd_settled"] += charged
+            if breached:
                 state["breaches"].append({"reservation": reservation_id, "reserved": reservation["usd"],
-                                          "actual": actual, "model": model, "at": self._clock()})
-                breached = True
+                                          "actual": charged, "model": model, "at": self._clock()})
         if breached:
             self.breached = True
-            self._record_breach(reservation_id, model, actual)
-            raise BudgetBreach(f"settlement ${actual:.4f} exceeded its reservation for {model}: cycle aborted")
-        return actual
+            self._record_breach(reservation_id, model, charged)
+            raise BudgetBreach(f"settlement ${charged:.4f} exceeded its reservation for {model}: cycle aborted")
+        return charged
+
+    def settle_call(self, reservation_id: str, usage: dict | None, model: str) -> float:
+        """Settle once in the reserved week; absent usage retains the full amount."""
+        return self._finish_call(reservation_id, actual_usd(model, usage, self.settings), model, "completed")
 
     def release_call(self, reservation_id: str) -> None:
         """Drop a reservation for a call that failed BEFORE it was sent."""
-        with self._locked(self._week_of(reservation_id)) as state:
-            state["reservations"].pop(reservation_id, None)
+        self._finish_call(reservation_id, None, "", "released")
 
     def forfeit_call(self, reservation_id: str) -> float:
-        """A call that was sent but whose usage is unknown (an interrupted
-        stream, a transport error after billing may have happened): the whole
-        reservation is charged as spent — the conservative side."""
-        with self._locked(self._week_of(reservation_id)) as state:
-            reservation = state["reservations"].pop(reservation_id, None)
-            charged = float(reservation["usd"]) if reservation else 0.0
-            state["usd_settled"] += charged
-        return charged
+        """Retain the whole reservation when dispatch may have been billed."""
+        return self._finish_call(reservation_id, None, "", "unknown")
+
+    def reconcile_native(self, reservation_id: str, *, offline_confirmed=False):
+        """Settle only the original bound terminal record, without model dispatch."""
+        from ..budgeting import normalized_cost
+        import re
+        if not isinstance(reservation_id, str) or not re.fullmatch(r'\d{4}-W\d{2}\|[0-9a-f]{10}', reservation_id):
+            raise BudgetRefused('invalid original native reservation identity')
+        week = self._week_of(reservation_id)
+        with self._locked(week, write=False) as state:
+            authority = state['reservations'].get(reservation_id) or state.get('settlements', {}).get(reservation_id)
+            binding = (authority or {}).get('native_binding')
+            if not isinstance(binding, dict):
+                raise BudgetRefused('original reservation has no native binding; it cannot be reinterpreted')
+            binding = dict(binding)
+        with self._native_outcome(binding, offline_confirmed=offline_confirmed) as (record, attempt):
+            result = record.get('result', {})
+            sent, amount = result['native_call_sent'], result.get('cost_usd')
+            if amount is not None and normalized_cost(amount) is None:
+                raise BudgetRefused('original native amount is invalid')
+            charged = self._finish_call(reservation_id, amount if sent else None,
+                binding['model']['model'] if sent else '', 'completed' if sent else 'released', native_binding=binding)
+            return {'reservation_id': reservation_id, 'trace_id': record['id'],
+                    'native_attempt_id': attempt['id'], 'native_cost_usd': amount, 'accounted_usd': charged}
+
+    @staticmethod
+    @contextmanager
+    def _native_outcome(binding, *, offline_confirmed):
+        """Validate one original receipt for either domain account policy."""
+        from ..trace_store import TraceStore
+        if binding.get('schema') != 'native-budget-binding/1':
+            raise BudgetRefused('original reservation has an unsupported native binding schema')
+        root = Path(binding['trace_root'])
+        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+            raise BudgetRefused('original native trace store is unavailable')
+        store = TraceStore(root)
+        with store._migration_lock():
+            store._require_paused(None, offline_confirmed)
+            records = [record for record, _ in store.iter_records(kind='model_call')
+                       if record.get('result', {}).get('native_attempt_id') == binding['attempt_id']]
+            if len(records) != 1:
+                raise BudgetRefused('original native outcome is missing or ambiguous; keep reservation pending')
+            record = records[0]
+            attempt = store.validate_native_attempt(record, allow_failed=True)
+            if attempt['id'] != binding['attempt_id'] \
+                    or any(attempt.get(key) != binding.get(key) for key in ('model', 'context', 'env', 'inputs')):
+                raise BudgetRefused('original native outcome differs from reservation binding')
+            result = record.get('result', {})
+            sent, pending = result.get('native_call_sent'), result.get('native_outcome_pending')
+            if type(sent) is not bool or type(pending) is not bool or pending:
+                raise BudgetRefused('original native dispatch is unknown or pending; no replacement is authorized')
+            yield record, attempt
 
     # -- named (planned) reservations -----------------------------------------------------
     def reserve_named(self, name: str, usd: float) -> None:
@@ -231,7 +328,7 @@ class Governor:
         with self._locked(week) as state:
             self._stop_if_breached(state)
             already = float(state["named"].get(name, 0.0))
-            if state["usd_settled"] + self._reserved(state) - already + float(usd) > self.usd_week + 1e-12:
+            if not reservation_fits(self.usd_week, state["usd_settled"], max(0, self._reserved(state) - already), float(usd)):
                 state["refused"] += 1
                 raise BudgetRefused(f"holding ${float(usd):.2f} for {name} would exceed the weekly envelope")
             state["named"][name] = float(usd)
@@ -243,23 +340,65 @@ class Governor:
 
     # -- judge calls ----------------------------------------------------------------------
     def reserve_judge_call(self) -> str:
-        """Reserve one judge call in the current week; returns a token that
-        pins the week, so a call crossing the boundary settles where it was
-        reserved."""
+        """Reserve one judge call; the token retains its original ISO week."""
         week = self.week()
+        token = f"{week}|judge|{uuid.uuid4().hex[:8]}"
         with self._locked(week) as state:
             self._stop_if_breached(state)
-            if state["judge_calls"] + state["judge_reserved"] + 1 > self.judge_calls_week:
+            if not reservation_fits(self.judge_calls_week, state["judge_calls"], state["judge_reserved"], 1, tolerance=0):
                 state["refused"] += 1
                 raise BudgetRefused(f"the weekly judge-call envelope ({self.judge_calls_week}) is exhausted")
             state["judge_reserved"] += 1
-        return f"{week}|judge|{uuid.uuid4().hex[:8]}"
+            state.setdefault("judge_tokens", {})[token] = "reserved"
+        return token
 
-    def settle_judge_call(self, token: str | None = None) -> None:
+    def bind_judge_call(self, token: str, native_binding: dict) -> None:
+        """Bind the existing count reservation before dispatch; never replace it."""
+        if not isinstance(native_binding, dict) or native_binding.get('schema') != 'native-budget-binding/1':
+            raise BudgetRefused('judge reservation requires an original durable attempt binding')
+        with self._locked(self._week_of(token)) as state:
+            if state.get('judge_tokens', {}).get(token) != 'reserved':
+                raise BudgetRefused('judge reservation is not pending')
+            bindings = state.setdefault('judge_bindings', {})
+            if token in bindings and bindings[token] != native_binding:
+                raise BudgetRefused('original judge reservation already has a different binding')
+            bindings[token] = dict(native_binding)
+
+    def settle_judge_call(self, token: str | None = None, *, native_binding=None) -> None:
         week = self._week_of(token) if token else self.week()
         with self._locked(week) as state:
-            state["judge_reserved"] = max(0, state["judge_reserved"] - 1)
+            tokens = state.setdefault("judge_tokens", {})
+            if token is None:
+                token = next((key for key, value in tokens.items() if value == "reserved"), None)
+                if token is None and state["judge_reserved"] > 0:
+                    # Legacy files recorded only the count, without token identities.
+                    state["judge_reserved"] -= 1
+                    state["judge_calls"] += 1
+                    return
+            if token not in tokens:
+                raise BudgetRefused("unknown judge reservation")
+            if native_binding is not None and state.get('judge_bindings', {}).get(token) != native_binding:
+                raise BudgetRefused('original judge reservation binding changed during recovery')
+            if tokens[token] == "settled":
+                return
+            tokens[token] = "settled"
+            state["judge_reserved"] -= 1
             state["judge_calls"] += 1
+
+    def reconcile_judge(self, token: str, *, offline_confirmed=False):
+        """Count the original terminal judge attempt once, without another call."""
+        import re
+        if not isinstance(token, str) or not re.fullmatch(r'\d{4}-W\d{2}\|judge\|[0-9a-f]{8}', token):
+            raise BudgetRefused('invalid original judge reservation identity')
+        with self._locked(self._week_of(token), write=False) as state:
+            binding = state.get('judge_bindings', {}).get(token)
+            if state.get('judge_tokens', {}).get(token) not in ('reserved', 'settled') or not isinstance(binding, dict):
+                raise BudgetRefused('original judge reservation has no native binding; it cannot be reinterpreted')
+            binding = dict(binding)
+        with self._native_outcome(binding, offline_confirmed=offline_confirmed) as (record, attempt):
+            self.settle_judge_call(token, native_binding=binding)
+            return {'reservation_id': token, 'trace_id': record['id'],
+                    'native_attempt_id': attempt['id'], 'accounted_judge_calls': 1}
 
     def clear_breach(self, week: str | None = None) -> None:
         """Operator action: forget the week's breach records."""
@@ -279,11 +418,129 @@ class Governor:
             pass
 
 
+@dataclass
+class NativeReservation:
+    model: str
+    reservation: str | None = None
+    prepare_required: bool = True
+    capture_root: str = ''
+
+
+@dataclass
+class JudgeReservation:
+    token: str
+    capture_root: str
+    prepare_required: bool = True
+    bound: bool = False
+
+
+@contextmanager
+def judge_governed(governor):
+    """Declare the existing CLI judge-count policy, without claiming an invoice."""
+    token = _JUDGE_ACCOUNT.set(governor)
+    def acquire(request):
+        reservation = governor.reserve_judge_call()
+        if not isinstance(governor, Governor):
+            return reservation  # legacy host adapters retain their count-only contract
+        store = current_store()
+        root = store.root if store else getattr(governor.settings, 'trace_store_root', '') or governor.dir / 'native-traces'
+        return JudgeReservation(reservation, str(Path(root).expanduser().resolve()))
+
+    def prepare(ticket, request, execution):
+        if isinstance(ticket, JudgeReservation):
+            binding = execution.get('native_binding')
+            if not isinstance(binding, dict) or not binding.get('attempt_id') or not binding.get('trace_root'):
+                raise BudgetRefused('judge reservation requires an original durable attempt binding')
+            governor.bind_judge_call(ticket.token, binding)
+            ticket.bound = True
+        return {}
+
+    def finish(ticket, facts):
+        if isinstance(ticket, JudgeReservation):
+            if getattr(facts, 'native_outcome_pending', False) or (ticket.bound and facts['sent']
+                    and not getattr(facts, 'native_receipt_complete', False)):
+                return
+            ticket = ticket.token
+        governor.settle_judge_call(ticket)
+    try:
+        with bind_call_budget('improve-judge', acquire if governor else None, finish, prepare=prepare):
+            yield
+    finally:
+        _JUDGE_ACCOUNT.reset(token)
+
+
 @contextmanager
 def governed(governor: "Governor | None") -> Iterator["Governor | None"]:
+    def acquire(request):
+        if request.get("kind", "api") != "api":
+            root = getattr(governor.settings, 'trace_store_root', '') or str(governor.dir / 'native-traces')
+            return None if _JUDGE_ACCOUNT.get() is governor else NativeReservation(
+                request.get('model') or '', capture_root=str(Path(root).expanduser().resolve()))
+        model = request["model"]
+        return (governor.reserve_call(model, request_bytes(request),
+                                      int(request.get("max_tokens") or 0),
+                                      purpose=request.get("role") or ""), model)
+
+    def prepare(ticket, request, execution):
+        if not isinstance(ticket, NativeReservation):
+            return {}
+        if execution.get('subscription_admitted') is True:
+            return {}  # domain waiver, not an assertion of zero native cost
+        provider = execution.get('provider_id') or ''
+        limits = getattr(governor.settings, 'improve_native_call_limits', {}) or {}
+        limit = limits.get(f'{provider}:{ticket.model}')
+        if not limit:
+            raise BudgetRefused('native dollar account requires an exact provider/model stop and overshoot bound')
+        if execution.get('stops_at_spend') is not True:
+            raise BudgetRefused('native execution cannot enforce the dollar account stop threshold')
+        from ..budgeting import normalized_cost
+        threshold, overshoot = normalized_cost(limit.get('stop_usd')), normalized_cost(limit.get('overshoot_usd'))
+        if threshold is None or threshold <= 0 or overshoot is None or overshoot <= 0:
+            raise BudgetRefused('invalid native dollar account bounds')
+        if 'max_budget_usd' in request:
+            requested = normalized_cost(request['max_budget_usd'])
+            if requested is None or requested <= 0:
+                raise BudgetRefused('invalid requested native stop threshold')
+            threshold = min(threshold, requested)
+        binding = execution.get('native_binding')
+        if not isinstance(binding, dict) or not binding.get('attempt_id') or not binding.get('trace_root'):
+            raise BudgetRefused('native dollar reservation requires an original durable attempt binding')
+        ticket.reservation = governor.reserve_amount(ticket.model, threshold + overshoot,
+                                                      purpose=request.get('role') or '', native_binding=binding)
+        return {'max_budget_usd': threshold}
+
+    def finish(ticket, facts):
+        if ticket is None:
+            return
+        native = isinstance(ticket, NativeReservation)
+        if native:
+            if getattr(facts, 'native_outcome_pending', False):
+                return  # original binding and funds remain pending for offline reconciliation
+            reservation, model = ticket.reservation, ticket.model
+            if reservation is None:
+                return
+        else:
+            reservation, model = ticket
+        usage = facts["usage"]
+        if native:
+            if not facts['sent']:
+                governor.release_call(reservation)
+                return
+            # Native token counts and missing cost reports cannot establish USD.
+            from ..budgeting import normalized_cost
+            amount = normalized_cost((usage or {}).get('cost_usd'))
+            governor.settle_call(reservation, {'cost_usd': amount}, model)
+        elif usage is not None:
+            governor.settle_call(reservation, usage, model)
+        elif facts["sent"]:
+            governor.forfeit_call(reservation)
+        else:
+            governor.release_call(reservation)
+
     token = _GOVERNOR.set(governor)
     try:
-        yield governor
+        with bind_call_budget("improve-weekly", acquire if governor else None, finish, prepare=prepare):
+            yield governor
     finally:
         _GOVERNOR.reset(token)
 

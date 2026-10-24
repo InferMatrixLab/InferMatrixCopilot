@@ -148,30 +148,16 @@ def test_for_target_reuses_shared_client_and_sets_default_model():
 
 def test_mismatch_settles_moa_budget():
     from infermatrix_copilot.engine.agent_runtime.moa import (
-        BudgetedLLM,
         Member,
         MoaBudget,
     )
 
     s = _settings()
     budget = MoaBudget.start(s)
-    paid = Reply(blocks=[], usage={"input_tokens": 1_000_000,
-                                   "output_tokens": 0,
-                                   "cache_creation_input_tokens": 0},
-                 model="deepseek-v4-pro")
-
-    class _MismatchClient:
-        settings = s
-        available = True
-
-        def create(self, **kw):
-            raise ModelMismatchError(requested="x", served="y",
-                                     endpoint="h", reply=paid)
-
-    wrapped = BudgetedLLM(Member(model="deepseek-v4-pro"), _MismatchClient(),
-                          budget)
-    with pytest.raises(ModelMismatchError):
-        wrapped.create(system="s", messages=[], max_tokens=10)
+    llm = _fake_llm(s, "claude-sonnet-5")
+    with budget.bind(Member(model="deepseek-v4-pro")):
+        with pytest.raises(ModelMismatchError):
+            llm.create(model="deepseek-v4-pro", system="s", messages=[], max_tokens=10)
     assert budget.spent() > 0  # settled actual spend, not released
     assert not budget._reserved  # and the reservation is gone
 

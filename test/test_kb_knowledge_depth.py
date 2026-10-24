@@ -223,7 +223,7 @@ def test_target_foundation_late_facet_precedes_other_owner_pages():
     assert sum(len(text.encode()) for text in context.values()) <= 4000
 
 
-def test_interrupted_judge_reuses_completed_extraction(world):
+def test_interrupted_judge_preserves_draft_without_redispatch(world):
     _baseline(world)
     gateway = DepthGateway(interrupt=True)
     with pytest.raises(KeyboardInterrupt):
@@ -232,8 +232,12 @@ def test_interrupted_judge_reuses_completed_extraction(world):
     assert checkpoint.depth["features"]["step0"]["status"] == "extracted"
     assert checkpoint.spent_usd == 0.5
     after = _run(world, gateway)
-    assert after.status == "dry_run", after.problems
-    assert len(gateway.depth_calls) == 1 and after.spent_usd == 1.0
+    assert after.status == "empty", after.problems  # no accepted judgment yet
+    assert len(gateway.depth_calls) == 1 and after.spent_usd == 0.5
+    entry = after.depth["features"]["step0"]
+    assert entry["draft"] == checkpoint.depth["features"]["step0"]["draft"]
+    assert entry["status"] == "pending" and entry["review_dispatched"]
+    assert "checked" not in entry and not after.depth["done"]
 
 
 def test_rejected_depth_stays_out_of_pages_and_retry_preserves_spend(world):
@@ -520,7 +524,7 @@ def test_repair_prioritizes_features_without_accepted_depth(world):
     assert record.coverage["semantic_depth"]["features"]["step1"]["complete"]
 
 
-def test_interrupted_repair_judge_reuses_its_completed_draft(world):
+def test_interrupted_repair_judge_preserves_draft_and_prior_acceptance(world):
     _baseline(world)
 
     class InterruptedRepair(DepthGateway):
@@ -545,11 +549,14 @@ def test_interrupted_repair_judge_reuses_its_completed_draft(world):
     assert len(gateway.depth_calls) == 2
     record = _run(world, gateway)
     assert record.status == "dry_run", record.problems
-    assert record.coverage["semantic_depth"]["complete_features"] == 1
-    assert len(gateway.depth_calls) == 2
+    assert record.coverage["semantic_depth"]["complete_features"] == 0
+    assert record.coverage["semantic_depth"]["covered_facets"] == 6
+    assert record.depth["features"]["step0"]["draft"] == saved.depth["features"]["step0"]["draft"]
+    assert len(gateway.depth_calls) == 2 and gateway.reviews == 2
+    assert not record.depth["done"]
 
 
-def test_interrupted_last_extraction_stays_explicit_until_retry(world):
+def test_interrupted_last_extraction_cannot_be_replayed_by_explicit_retry(world):
     _baseline(world)
 
     class InterruptedExtraction(DepthGateway):
@@ -570,13 +577,16 @@ def test_interrupted_last_extraction_stays_explicit_until_retry(world):
     record = _run(world, gateway)
     assert record.status == "dry_run", record.problems
     entry = record.depth["features"]["step0"]
-    assert entry["status"] == "interrupted" and entry["attempts"] == 2
+    assert entry["status"] == "pending" and entry["attempts"] == 2
     assert record.coverage["semantic_depth"]["covered_facets"] == 6
     assert gateway.generations == 2 and record.spent_usd == 0.5
     gateway.reject = False
     retried = _run(world, gateway, retry=True)
-    assert retried.coverage["semantic_depth"]["complete_features"] == 1
-    assert gateway.generations == 3 and retried.spent_usd == 1
+    assert retried.coverage["semantic_depth"]["complete_features"] == 0
+    assert retried.coverage["semantic_depth"]["covered_facets"] == 6
+    assert gateway.generations == 2 and retried.spent_usd == 0.5
+    assert retried.depth["features"]["step0"]["extraction_dispatched"]
+    assert not retried.depth["done"]
 
 
 def test_explicit_retry_prioritizes_features_without_accepted_depth(world):

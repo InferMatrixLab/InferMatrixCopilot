@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import re
 import time
@@ -93,15 +94,7 @@ class SharedZcodePacer:
         return data
 
     def _save(self, data):
-        tmp = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as handle:
-                json.dump(data, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, self.path)
-        finally:
-            tmp.unlink(missing_ok=True)
+        atomic_write_bytes(self.path, json.dumps(data, sort_keys=True).encode("utf-8"))
 
     def prepare(self):
         with self._locked():

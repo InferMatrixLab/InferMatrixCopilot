@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import hashlib
 import json
 import shutil
@@ -159,9 +161,7 @@ class KnowledgeStore:
         record = {"schema_version": 1, "repo_id": self.repo_id, "source_pin": source_pin,
                   "publication_head": _pin(publication_head), "scope_sha256": digest(scope), "acceptance": acceptance}
         self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.acceptance_path.with_suffix(".tmp")
-        temporary.write_bytes(canonical_json(record))
-        temporary.replace(self.acceptance_path)
+        atomic_write_bytes(self.acceptance_path, canonical_json(record))
         return record
 
     def _bound_acceptance(self, source_pin: str, publication_head: str) -> dict | None:
@@ -196,9 +196,7 @@ class KnowledgeStore:
         # Validate every destination before writing any member.
         for target, data in prepared.items():
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".kb-tmp")
-            temporary.write_bytes(data)
-            temporary.replace(target)
+            atomic_write_bytes(target, data)
 
     def identity(self, *, source_pin: str, publication_head: str) -> dict:
         if not self.root.is_dir():

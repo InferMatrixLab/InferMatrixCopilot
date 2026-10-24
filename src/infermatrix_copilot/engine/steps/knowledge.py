@@ -12,24 +12,14 @@ from __future__ import annotations
 from ..step import FailureKind, StepContext, StepResult
 from ._common import step
 
-_RUNTIME = None
-_STATE_DIR = None
-
-
-def use_state_dir(state_dir) -> None:
-    """Pin the state directory the steps' runtime uses (``kb --state-dir``)."""
-    global _RUNTIME, _STATE_DIR
-    if _STATE_DIR != state_dir:
-        _STATE_DIR, _RUNTIME = state_dir, None
-
-
 def _runtime(ctx: StepContext):
-    global _RUNTIME
-    if _RUNTIME is None:
-        from ...kb_service.runtime import KbRuntime
+    if ctx.runtime is not None:
+        return ctx.runtime
+    from ...kb_service.runtime import KbRuntime
+    from ...kb_service.cli import DEFAULT_STATE_DIR
+    from pathlib import Path
 
-        _RUNTIME = KbRuntime.from_env(ctx.settings, state_dir=_STATE_DIR)
-    return _RUNTIME
+    return KbRuntime.from_env(ctx.settings, state_dir=Path(ctx.params.get("state_dir") or DEFAULT_STATE_DIR))
 
 
 def _lifecycle(ctx: StepContext):
@@ -159,40 +149,48 @@ def _init_runtime(ctx: StepContext):
     from ...kb_service.cli import DEFAULT_STATE_DIR
     from ...kb_service.init_support import InitRuntime
 
-    return InitRuntime.from_env(ctx.settings, state_dir=Path(_STATE_DIR or DEFAULT_STATE_DIR))
+    if ctx.runtime is not None:
+        return ctx.runtime
+    return InitRuntime.from_env(ctx.settings, state_dir=Path(ctx.params.get("state_dir") or DEFAULT_STATE_DIR))
+
+
+def init_options(params):
+    """Decode the unchanged CLI/playbook parameter surface once."""
+    dry_run = str(params.get("dry_run", "true")).lower() not in ("0", "false", "no")
+    pin = str(params.get("pin") or "") or None
+    count = params.get("pr_count")
+    kwargs = {"pr_count": int(count)} if count not in (None, "") else {}
+    ceiling = params.get("budget_usd")
+    if ceiling not in (None, ""):
+        kwargs["budget_usd"] = float(ceiling)
+    for option in ("from_existing", "subscription_generator", "retry_unfinished", "unlimited_subscription"):
+        if str(params.get(option, "false")).lower() in ("1", "true", "yes"):
+            kwargs[option] = True
+    if params.get("acceptance_mode"):
+        kwargs["acceptance_mode"] = str(params["acceptance_mode"])
+    if params.get("foundation_mode"):
+        kwargs["foundation_mode"] = str(params["foundation_mode"])
+    if params.get("foundation_record"):
+        from pathlib import Path
+        kwargs["foundation_record_path"] = Path(params["foundation_record"])
+    return {"dry_run": dry_run, "pin": pin, **kwargs}
 
 
 @step("knowledge.init", kind="agent", risk="knowledge",
+      checkpoint=False,
       description="kb init: bootstrap one repository's knowledge base, one human-merged stage at a time")
 async def init_stage(ctx: StepContext) -> StepResult:
-    from ...kb_service.init_stages import run_stage
+    from ...kb_service.init_stages import run_stage_async
     from ...kb_service.init_support import InitError
 
     repo = str(ctx.params.get("repo") or ctx.state.get("kb_repo") or "")
     stage = str(ctx.params.get("stage") or "")
-    dry_run = str(ctx.params.get("dry_run", "true")).lower() not in ("0", "false", "no")
-    pin = str(ctx.params.get("pin") or "") or None
     try:
         rt = _init_runtime(ctx)
         lifecycle = rt.registry.get(repo)
         if lifecycle is None:
             return StepResult(False, FailureKind.BLOCKED, f"no adapter declares knowledge repo {repo!r}")
-        count = ctx.params.get("pr_count")
-        kwargs = {"pr_count": int(count)} if count not in (None, "") else {}
-        ceiling = ctx.params.get("budget_usd")
-        if ceiling not in (None, ""):
-            kwargs["budget_usd"] = float(ceiling)
-        for option in ("from_existing", "subscription_generator", "retry_unfinished", "unlimited_subscription"):
-            if str(ctx.params.get(option, "false")).lower() in ("1", "true", "yes"):
-                kwargs[option] = True
-        if ctx.params.get("acceptance_mode"):
-            kwargs["acceptance_mode"] = str(ctx.params["acceptance_mode"])
-        if ctx.params.get("foundation_mode"):
-            kwargs["foundation_mode"] = str(ctx.params["foundation_mode"])
-        if ctx.params.get("foundation_record"):
-            from pathlib import Path
-            kwargs["foundation_record_path"] = Path(ctx.params["foundation_record"])
-        record = run_stage(rt, lifecycle, stage, dry_run=dry_run, pin=pin, **kwargs)
+        record = await run_stage_async(rt, lifecycle, stage, **init_options(ctx.params))
     except (InitError, NotImplementedError, ValueError) as exc:
         return StepResult(False, FailureKind.BLOCKED, str(exc))
     updates = {"kb_init_stage": stage, "kb_init_status": record.status, "kb_init_pr": dict(record.pr)}
@@ -202,3 +200,10 @@ async def init_stage(ctx: StepContext) -> StepResult:
                           outputs={"state_updates": updates})
     return StepResult(True, summary=f"kb init {stage} for {repo}: {record.status}",
                       outputs={"state_updates": updates})
+
+
+from ...kb_service.init_execution import step_specs
+from ._common import register_step
+
+for _spec in step_specs():
+    register_step(_spec)

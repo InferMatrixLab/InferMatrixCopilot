@@ -97,6 +97,49 @@ def assert_deferred_capture_only(world):
     assert objectives.rows(world.settings, WORKFLOW) == []
 
 
+@pytest.mark.parametrize('fault', ['crash', 'unknown_exception'])
+def test_evolved_dispatch_is_not_repeated_after_interruption(intake, monkeypatch, fault):
+    calls = []
+
+    def interrupted(*args, **kwargs):
+        calls.append(1)
+        if fault == 'crash':
+            raise KeyboardInterrupt('evolved worker interrupted')
+        raise OSError('evolved worker response lost')
+
+    monkeypatch.setattr(improve_runtime, 'execute', interrupted)
+    if fault == 'crash':
+        with pytest.raises(KeyboardInterrupt):
+            kb_runtime.run_intake(intake.rt, intake.lifecycle)
+    else:
+        assert kb_runtime.run_intake(intake.rt, intake.lifecycle) is None
+    assert calls == [1] and not intake.drafts
+    assert kb_runtime.run_intake(intake.rt, intake.lifecycle) is None
+    assert calls == [1] and not intake.drafts
+
+
+def test_completed_evolved_result_survives_interruption_before_event_settlement(intake, monkeypatch):
+    calls = []
+
+    def completed(*args, **kwargs):
+        calls.append(1)
+        return {'operations': [], 'rationale': 'no rule needed'}
+
+    settle = intake.rt.ledger.set_event_statuses
+    monkeypatch.setattr(improve_runtime, 'execute', completed)
+
+    def interrupted(*args, **kwargs):
+        raise OSError('event settlement interrupted')
+
+    monkeypatch.setattr(intake.rt.ledger, 'set_event_statuses', interrupted)
+    with pytest.raises(OSError, match='event settlement interrupted'):
+        kb_runtime.run_intake(intake.rt, intake.lifecycle)
+    monkeypatch.setattr(intake.rt.ledger, 'set_event_statuses', settle)
+    assert kb_runtime.run_intake(intake.rt, intake.lifecycle) is None
+    assert calls == [1] and not intake.drafts
+    assert intake.rt.ledger.event(intake.event_id)['status'] == 'done'
+
+
 @pytest.mark.parametrize("entry", [
     {},
     {"workflows": ["pr-review.agent.review_diff"]},

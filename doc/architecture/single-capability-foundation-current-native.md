@@ -1,0 +1,40 @@
+# 当前Foundation独立真实比较（9375）
+
+框架交付保持封存；本轮推进后续P1质量验收。原coordinator已exit0；两臂应用完成，宿主判定完整案例质量仍未通过。以下启动登记保留原时间范围，最终结论见末尾。原始run与所有旧失败／unknown保留，不能因观测超时重启first-dispatch。
+
+## 冻结范围
+
+候选为正常安装wheel93753974f8549c0a1e674e844f4de1948a73c9a77d43e93b1f4338755084d166；对照原始安装baseline，测量完整capped Foundation生成、逐facet质量审查、验证、产物及已完成恢复。不是把unlimited验收改成capped；unlimited correction仍是单独后续范围。使用原未改foundation_native_arm／init_native_arm，不强制固定模型措辞或pass计数，发布关闭。
+
+原revision-cache语料、README／guide、source tree、oracle及私有标签不变。标签要求逐项检查12个owner/facet槽位，并核对四项正向源码契约与负向边界；不是要求为缺少证据的facet编造内容。候选新增提供真实相关测试是已明示的软件输入策略差异：脚本控制中core收到tests/test_cache.py、baseline没有；tooling没有匹配测试，两边均空。源码输入差异不等于隐藏更改原源码／标签，也不据单次输出声称因果改善。
+
+实际remote正常安装及image `sha256:c1ba44a01b646865beb8768c3ee0d8efce18f32a6b83ac81968a95daf4a31811`各2334payload逐字节匹配当前wheel，无source-product注入。Codex二进制628e3548及所选账号控制、固定CONNECT/TLS和越界拒绝通过；不是推理权限或served-model attestation。Structured-only策略沿用原受限completion协议，统一provider／沙箱抽象派发，不另建vendor调用。
+
+## 显式额度与准入
+
+revision foundation-current-20261017保留371全部保守分配，增加每臂14、共28，总399 CLI invocation；不是USD或内部turns。旧计划不能使用新上限，原未用额度不释放。硬限额不证明最坏调用次数足够，拒绝、未完成审查或缺少原标签要求的内容都不能算质量通过。
+
+170项协议／账本／guard／共享执行／init驱动检查通过。当前安装110项证据仍保持其代码切片范围。两臂零模型wiring各2次脚本生成、12次脚本审查、恢复不增加调用；精确tree ec32d6be与measured pin70031508匹配原fixture，私有标签不进入实测packet。脚本批准是连通性控制，不是质量证据。
+
+manifest SHA256 c2ca5a537925d6ce0b036ef7b2e5a80933df1864936158bb96941590da081dd4，5215绑定文件。native180秒／host300秒／workflow4230秒／phase4530秒／outer4560秒，两臂串行，candidate在先。账号有效期覆盖该等待范围。原coordinator句柄40361、PID 2129085，仅启动一次；当前stage running、首个native调用已reserved，尚无应用／语义通过结论。
+
+准入包native-quality-foundation-current-20261017/foundation-current-admission-review.tar.gz，SHA256 18e0cdfe5f96febaf53ba006aab31a9ce484c69d6bc544c32250b34b8802cd96，封包时0付费派发。当前运行结果另记，不回写准入包／旧样本。eval runtime仅新增显式revision+1行／+2AST，产品wheel与Bot未改。
+
+后续判定必须阅读实际最终树、逐facet裁判、原生完整回执和源码契约，不把dry_run或judge pass替代质量。原Direct b7e6、Strict e3eb和旧Foundation233报告不重绑定。其余knowledge strata、深层恢复、其他后端和最终配对发布验收继续开放；完整目标active，未commit／push／pin／发布／部署。
+
+
+## 原执行终态与不通过结论
+
+原40361返回0、PID2129085退出。两臂stage complete／0，各11个完整native回执（2生成＋9judge），共22、pending0；5215输入绑定、原产物hash和付费行逻辑不变，原driver的完成恢复未新增调用。所有原请求与回复均保留，不重新派发或替换样本。
+
+两臂都返回通过应用验证的dry_run接受树。candidate原判7pass／2unsure、baseline8pass／1unsure；各有3个未提出facet，所有非pass段落仍排除。记录／native回复多重集一致，22条回执唯一且complete，marker／接受树一致，私有标签未进入实际packet。旧baseline11条ModelGateway记录没有新dispatch flags，不能据此当作没有派发；外层账本提供原生证明。
+
+宿主阅读两臂接受树、原源码／README／guide／oracle及四项冻结正向契约后，判定完整案例仍不通过。两边说明了stale／repeat结果和capacity异常，但没有充分解释stale且oversized这类条件交叠的优先级；冲突／拒绝写入时entry与byte accounting同时保持不变也未充分展开。Detached observation与accounting边界仍需更清楚的解释。跨core和tooling页面能联系observed-revision removal依赖，但局部输入不足不能变成整个pin缺少实现的断言。这里不要求固定措辞或pass数，也不把正确源码链接当缺失解释的替代。
+
+输入修复的实际效果已观察：candidate收到test_cache.py并生成validation段落。但它把test_context的“测试未执行”输入元数据写进源码引用支持的可复用知识，原judge unsure，段落未入树。Tooling/API的byte单位仍因duck-typed helper代码不证明payload为bytes而unsure；baseline/configuration因局部源码不能证明全局没有其他配置／优先级而unsure。原裁判和样本都不改写，无自动付费重试。
+
+此外，独立控制probe证实：标准已完成Foundation预览被删除元数据后，恢复仍返回被改坏的dry_run树，fake调用14→14、native0，原付费状态未碰。generic preview读取与portable独立hash检查尚未统一。observed-followups.json登记P1最终发布前以一个canonical preview receipt／reader覆盖cache、chain与portable，并保留legacy／不重派／不迁写检查；以及提取策略区分临时provenance与可复用source claims。框架不因此重开。
+
+Usage：candidate input62772／output4461／cache35840；baseline input62785／output4670／cache39424，input已含cache，不能再加。actual USD和served model在22条记录均未观察到；requested gpt-6-sol/high不替代attestation。两次小样本输出不证明统计无回归、因果改善或费用优势。
+
+399全部保守分配保留，新增28实际用22、剩6不释放。原unknown环境／账本不动。权威终态为terminal-audit.json、adjudication.json和terminal-observation.json；live-observation及启动登记是历史。后续先收敛上述已复现缺口，再继续其他质量／恢复／后端／最终发布门禁。未新增产品改动、commit／push／pin／发布／部署；完整目标继续active。

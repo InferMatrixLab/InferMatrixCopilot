@@ -6,6 +6,8 @@ receipt by hashing its own JSON. Neither registry lives in a knowledge tree.
 """
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import hashlib
 import json
 import math
@@ -125,21 +127,7 @@ def atomic_json(path, value):
     path = Path(path)
     if path.is_symlink():
         raise ContainmentError("containment artifacts cannot be symlinks")
-    fd, temporary = tempfile.mkstemp(prefix=".containment-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(canonical_json(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    atomic_write_bytes(path, canonical_json(value), mode=0o600)
 
 
 @contextmanager

@@ -6,6 +6,8 @@ is a curator/human action. Facts recorded freely, knowledge promoted via gates.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import json
 import os
 import time
@@ -70,24 +72,8 @@ def _write_durable(path: Path, text: str) -> None:
     impossible — and the unique temp name means two concurrent writers can
     never truncate each other's inode or install a half-written payload
     (last rename wins whole)."""
-    import tempfile
-
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".",
-                               suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    _fsync_dir(path.parent)
+    atomic_write_bytes(path, text.encode("utf-8"), mode=0o600, directory_fsync=_fsync_dir)
 
 
 def _fsync_dir(directory: Path) -> None:

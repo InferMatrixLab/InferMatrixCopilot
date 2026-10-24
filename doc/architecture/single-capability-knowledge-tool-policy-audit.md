@@ -1,0 +1,7 @@
+# 知识工具机制与策略边界审计
+
+read/search的低层机制已共享KnowledgeDocs，未发现bridge另有独立解析／文件读取循环；纯输出格式包装不是自动删除目标。
+
+实际策略路线有区别：进程内_repo_docs_tool在有repo binding且选择adaptive时使用KnowledgeContextService，legacy分支使用KnowledgeDocs；bridge直接构造KnowledgeDocs，_bridge_ctx未投影params／context policy。这里只确认源代码路线不同，尚未证明public/native契约要求所有路径采用同一adaptive检索策略，不能把这一观察直接宣告为已修复缺陷或完整策略一致性。
+
+下一步核对public/native工具契约及调用方策略，再补conformance证据；如需迁移，保持低层读取唯一所有者、领域预算账本权威及已有输出兼容，不在transport内添加领域预算业务循环。此项与框架已完成的低层机制共享区分记录，不改写旧交付。源文件hash与事实见 `/data/zhoutaichang/copilot/output/single-capability-completion-20261012/knowledge-tool-policy-audit-20261017/result.json`。本次仅审计，无生产改动。

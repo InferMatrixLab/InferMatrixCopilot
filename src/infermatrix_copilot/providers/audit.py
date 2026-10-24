@@ -60,6 +60,26 @@ def contained_in(path: str, roots: tuple[str, ...]) -> bool:
                for r in (os.path.realpath(r) for r in roots if r))
 
 
+def assert_tool_less(events: list[dict]) -> None:
+    """Blind completions may not use even read-only tools or unknown blocks."""
+    used = set()
+    for event in events:
+        kind = str(event.get("type", ""))
+        if "tool" in kind.lower():
+            used.add(kind)
+        message = event.get("message") or {}
+        for block in (message.get("content") or []) if isinstance(message, dict) else []:
+            if isinstance(block, dict) and block.get("type") not in (None, "text"):
+                used.add(str(block.get("type")))
+        item = event.get("item")
+        if isinstance(item, dict):
+            kind = str(item.get("item_type") or item.get("type") or "")
+            if kind and "agent_message" not in kind and "reasoning" not in kind:
+                used.add(kind)
+    if used:
+        raise RuntimeError(f"tool-less completion attempted tool calls {sorted(used)[:3]} — reply discarded")
+
+
 def audit_events(events: list[dict], *, roots: tuple[str, ...],
                  read_only: bool = True, cwd: str = "") -> SessionAudit:
     """Audit a cursor-agent stream-json event list. Each tool_call event

@@ -418,6 +418,42 @@ def test_completed_judge_checkpoint_resumes_without_another_model_call(world, mo
     assert completed.coverage["semantic_depth"]["recognized_facets"] == 7
 
 
+@pytest.mark.parametrize("phase", ["extract", "judge"])
+@pytest.mark.parametrize("crash", [False, True])
+def test_depth_unknown_dispatch_cannot_be_retried_as_a_correction(world, phase, crash):
+    from infermatrix_copilot.kb_service.depth_judge import SYSTEM_DEPTH_REVIEW
+    from infermatrix_copilot.kb_service.init_knowledge_depth import SYSTEM_DEPTH
+    from infermatrix_copilot.kb_service.init_support import InitRecord
+    from infermatrix_copilot.kb_service.models import ModelUnavailable
+
+    _baseline(world)
+    calls = []
+
+    class UnknownGateway(DepthGateway):
+        def call_json(self, role, **kwargs):
+            if kwargs["system"] == (SYSTEM_DEPTH if phase == "extract" else SYSTEM_DEPTH_REVIEW):
+                calls.append(1)
+                if crash:
+                    raise KeyboardInterrupt()
+                error = ModelUnavailable("response lost")
+                error.native_call_sent = True
+                raise error
+            return super().call_json(role, **kwargs)
+
+    gateway = UnknownGateway()
+    if crash:
+        with pytest.raises(KeyboardInterrupt):
+            _run(world, gateway)
+    else:
+        _run(world, gateway)
+    record = InitRecord.load(world["tmp"] / "depth", "toy", "knowledge-deepen")
+    entry = record.depth["features"]["step0"]
+    assert entry["extraction_dispatched" if phase == "extract" else "review_dispatched"] is True
+    resumed = _run(world, gateway, retry=True)
+    assert calls == [1]
+    assert resumed.depth["done"] is False
+
+
 @pytest.mark.parametrize("body", ["const helper = () => 2; return helper();", "helper = () => 2; return helper();"])
 def test_client_flow_cannot_use_a_rebound_global_callable(tmp_path, body):
     from infermatrix_copilot.kb_service.knowledge_depth import verify_trace

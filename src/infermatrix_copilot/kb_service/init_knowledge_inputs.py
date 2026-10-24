@@ -74,15 +74,59 @@ making a new claim, and cite exact shown intervals without bridging gaps.
 """
 
 
+FOUNDATION_GENERATION_POLICY_VERSION = 1
+
+SOURCE_EXPLANATION_POLICY = """
+
+Reusable knowledge must describe the pinned repository, not this initialization
+run. Numbered source/document lines can support product behavior and existing
+checks. Localization hints, missing-facet labels, reviewer feedback, attempt or
+budget counters and this run's observations are workflow context, not repository
+facts. Do not copy that provenance into knowledge or cite source lines for it.
+Source inspection does not establish whether a test ran. For validation, describe the concrete checks and their demonstrated scope;
+do not turn source inspection into an execution result or global absence claim.
+
+Within the existing size and evidence limits, make a chosen claim a connected
+observable contract, rather than just a list of names or isolated outcomes.
+Where the shown implementation supports them, explain relevant conditions and
+ordering, effects and preserved state on rejection, ownership and copy/alias
+boundaries, lifecycle, and propagated failures. Do not infer concurrency or
+atomicity guarantees from a single local path. Select the useful relationships
+for this component; do not force every category into every facet.
+Keep each relationship grounded in the exact offered intervals. Partial inputs
+are not a repository-wide inventory. Omit an unsupported facet instead of
+inventing a setting, test, guarantee or rationale to fill it. Existing knowledge
+and feedback locate questions; they do not supply evidence for new claims.
+"""
+
+
 def knowledge_system(payload: dict) -> str:
     """Historical jobs retain their exact native system and evidence protocol."""
     version = payload.get("foundation_prompt_version")
     if version is None:
-        return SYSTEM_KNOWLEDGE
-    if version not in (4, 5):
+        system = SYSTEM_KNOWLEDGE
+    elif version in (4, 5):
+        system = SYSTEM_KNOWLEDGE_V5 if version == 5 else SYSTEM_KNOWLEDGE_V4
+    else:
         from .init_support import InitError
         raise InitError("unsupported foundation prompt version")
-    return SYSTEM_KNOWLEDGE_V5 if version == 5 else SYSTEM_KNOWLEDGE_V4
+    if "foundation_generation_policy_version" not in payload:
+        return system
+    policy_version = payload["foundation_generation_policy_version"]
+    if type(policy_version) is not int or policy_version != FOUNDATION_GENERATION_POLICY_VERSION:
+        from .init_support import InitError
+        raise InitError("unsupported foundation generation policy version")
+    return system + SOURCE_EXPLANATION_POLICY
+
+
+def foundation_uses_full_packet(payload: dict) -> bool:
+    """One evidence-protocol selector; preserve legacy cited-only requests.
+
+    Generation guidance does not silently upgrade evidence/acceptance contracts.
+    Unsupported policy identities refuse before a worker can invoke a model.
+    """
+    knowledge_system(payload)
+    return payload.get("foundation_prompt_version") in (4, 5)
 
 
 def foundation_evidence(stage, payload: dict) -> list[dict]:
@@ -136,7 +180,8 @@ def knowledge_prompt(payload: dict) -> str:
                           for item in payload.get(kind, [])]
     readable["existing_knowledge"] = {path: text.splitlines()
                                       for path, text in payload.get("existing_knowledge", {}).items()}
-    return _fence(readable)
+    # Durable requests sort mapping keys; replay must reproduce identical bytes.
+    return _fence(readable, sort_keys=True)
 
 def source_owners(paths: list[str], owners: list[Owner], policy) -> dict[str, Owner]:
     """Fill legacy route gaps from unambiguous, explicit feature ownership.

@@ -1,0 +1,13 @@
+# Lease PR 的 Direct／Strict 调用边界核验
+
+Direct已通过两套安装包的真实入口控制：原review_case_arm＋arm_entry、冻结source／host证据／知识snapshot，只有模型CLI被替换。有效完整回复两臂成功，畸形回复两臂失败；四条路径均恰好调用脚本CLI一次。当前有效路径还执行原reserve两次同run、find/get-result恢复，无额外CLI调用。首稿直接-I运行driver未经过arm_entry，helper导入失败、CLI0次；保留失败后使用实际原入口，不改变产品模块导入路径。
+
+源码解释与控制一致：原CodexRunner只有一次subprocess.run；当前Codex json_output_file路径一次invoke，Cursor的session repair循环不适用于它；Direct的model handler异常被通用executor转为BLOCKED而非typed RETRYABLE，因此不会自动重派发。当前验证仅适用于review_case_arm选择的Codex command profile，不推广到execution_config或Cursor。Native CLI进程调用数也不等于厂商内部每次模型请求／工具回合数。
+
+因此可为新Direct配对声明每臂1次、共2次；保留原233额度后新总额将为235，本轮尚未创建新协议或准入记录。脚本回复／fake finding只用于接线和边界证明，不能作为真实发现能力或质量证据。
+
+Strict不能沿用这个数字。标准模式包含多调查pass、零产出重试、合并及格式修复、promotion、第二轮和逐候选验证。最终8条评论预算在refinement之后才应用；当前canonical _verify_comments在1／8／13／25个脚本候选下实际调度相同数量verify step，原样保留不可用验证后的候选。这个控制只证明验证fanout，不等于完整Strict原生调用总数；一个verify step还可能需要输出修复。旧13是硬配额，而非已证明覆盖完整调用图的上界，不能据此承诺阶段一定能结束。
+
+Strict后续必须明确预算耗尽策略、动态候选验证的费用边界及对应workflow/phase期限；不关闭验证、第二轮或repair来让预算看似足够，也不以原未知样本重新派发验证。所需MCP仍只允许冻结仓的grep/list_dir/read_file，与provider/沙箱位置分离。当前尚未新建Strict模型执行协议。
+
+本次未修改生产代码或wheel，无原生模型调用。证据目录：`output/single-capability-completion-20261012/lease-direct-bound-20261017`，完整目标继续。

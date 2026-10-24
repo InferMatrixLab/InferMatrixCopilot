@@ -1,4 +1,4 @@
-"""Public embedded facade for the durable Strict run lifecycle."""
+"""Public embedded owner of durable Direct and Strict review runs."""
 
 from __future__ import annotations
 
@@ -21,83 +21,28 @@ from .models import (
     StrictReviewRequest,
     StrictRunHandle,
     StrictRuntimeConfig,
+    DirectReviewRunRequest,
+    ReviewRunRequest,
+    ReviewFinding,
+    ReviewResult,
 )
 
 
-def _object_rows(raw: Any, field: str) -> tuple[dict[str, Any], ...]:
-    if raw is None:
-        return ()
-    if not isinstance(raw, list) or any(not isinstance(row, dict) for row in raw):
-        raise ResultDecodeError(f"{field} must be an array of objects")
-    return tuple(raw)
+from ...review.result_decode import (
+    _object_rows, _diagnostics, _review_result, _quality_result,
+    decode_review_result, strict_finding,
+)
 
 
-def _diagnostics(raw: Any) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ResultDecodeError("diagnostics must be an object")
-    return raw
+class ReviewRuntime:
+    """Own the reservation, execution and polling lifecycle for review modes."""
 
-
-def _review_result(raw: Any) -> StrictReviewResult | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ResultDecodeError("Strict result must be an object")
-    rechecks = []
-    for row in _object_rows(raw.get("finding_rechecks"), "finding_rechecks"):
-        outcome = row.get("outcome")
-        if not isinstance(outcome, str) or outcome not in {"fixed", "still_affected", "unverified"}:
-            raise ResultDecodeError("finding recheck outcome is invalid")
-        try:
-            rechecks.append(FindingRecheck(**row))
-        except (TypeError, ValueError) as exc:
-            raise ResultDecodeError(f"invalid finding recheck: {exc}") from exc
-    missing = raw.get("recheck_missing") or []
-    if not isinstance(missing, list) or any(not isinstance(item, str) for item in missing):
-        raise ResultDecodeError("recheck_missing must be an array of strings")
-    complete = raw.get("rechecks_complete", False)
-    if not isinstance(complete, bool):
-        raise ResultDecodeError("rechecks_complete must be a boolean")
-    return StrictReviewResult(
-        contract_version=str(raw.get("contract_version") or ""),
-        reviewed_head_sha=str(raw.get("reviewed_head_sha") or ""),
-        verdict=str(raw.get("verdict") or ""),
-        summary_markdown=str(raw.get("summary_markdown") or ""),
-        comments=_object_rows(raw.get("comments"), "comments"),
-        findings=_object_rows(raw.get("findings"), "findings"),
-        finding_rechecks=tuple(rechecks),
-        rechecks_complete=complete,
-        recheck_missing=tuple(missing),
-        stale=bool(raw.get("stale", False)),
-        diagnostics=_diagnostics(raw.get("diagnostics")),
-    )
-
-
-def _quality_result(raw: Any) -> QualityReviewResult | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ResultDecodeError("quality result must be an object")
-    return QualityReviewResult(
-        contract_version=str(raw.get("contract_version") or ""),
-        reviewed_head_sha=str(raw.get("reviewed_head_sha") or ""),
-        verdict=str(raw.get("verdict") or ""),
-        confidence=str(raw.get("confidence") or ""),
-        summary=str(raw.get("summary") or ""),
-        reasons=_object_rows(raw.get("reasons"), "reasons"),
-        stale=bool(raw.get("stale", False)),
-        diagnostics=_diagnostics(raw.get("diagnostics")),
-    )
-
-
-class StrictRuntime:
-    """Own a durable local Strict runtime without exposing MCP internals."""
+    worker_call_identity = 'agent-step/1'
 
     def __init__(
         self, *, config: StrictRuntimeConfig | None = None,
         settings_overrides: dict[str, Any] | None = None,
+        worker_prefix: tuple[str, ...] | None = None,
     ):
         # Lazy imports keep Direct-only consumers independent of server startup
         # and make this module, not the consumer, the implementation boundary.
@@ -112,6 +57,11 @@ class StrictRuntime:
             if not checkout.is_relative_to(root):
                 raise InvalidRequestError("checkout is outside the allowed root")
             alias = config.repository.alias
+            if not config.repository.full_name:
+                from ...kb_service.repo_spec import resolve_snapshot_repo
+                from ...knowledge_view import KnowledgeView
+                if resolve_snapshot_repo(KnowledgeView.current(), alias) is None:
+                    raise InvalidRequestError("Strict runtime needs a registered repository or forge full name")
             overrides: dict[str, Any] = {
                 "_env_file": None,
                 "repo_paths": {alias: str(checkout)},
@@ -136,7 +86,9 @@ class StrictRuntime:
             settings = EmbeddedSettings(**overrides)
         else:
             settings = Settings(**overrides)
-        self._core = RunService(settings)
+        self._core = RunService(settings, **({'worker_prefix': worker_prefix}
+                                            if worker_prefix is not None else {}))
+        self._core.direct_profiles = config.direct_profiles if config is not None else {}
         self._knowledge_maintenance = config.knowledge_maintenance or None if config is not None else None
         self._core.knowledge_maintenance = self._knowledge_maintenance
 
@@ -151,7 +103,13 @@ class StrictRuntime:
         return tuple(self._core.strict_readiness(repo, repo_path))
 
     @with_containment
-    def reserve_review(self, request: StrictReviewRequest) -> StrictRunHandle:
+    def reserve_review(self, request: ReviewRunRequest) -> StrictRunHandle:
+        """Reserve either review strategy through the shared durable service."""
+        if isinstance(request, DirectReviewRunRequest):
+            run_id, created = self._core.reserve_direct_review(request)
+            return StrictRunHandle(run_id=str(run_id), created=bool(created))
+        if not isinstance(request, StrictReviewRequest):
+            raise InvalidRequestError("review requires a typed Direct or Strict request")
         from .rechecks import validate_carried
 
         carried = [item.to_dict() for item in request.carried_findings]
@@ -166,12 +124,38 @@ class StrictRuntime:
             "repo_path": request.repo_path,
             "idempotency_key": request.idempotency_key,
         }
+        if request.business_context:
+            payload["params"]["business_context"] = request.business_context
         run_id, created = self._core.reserve_strict_review(payload)
         return StrictRunHandle(run_id=str(run_id), created=bool(created))
 
-    def start_review(self, request: StrictReviewRequest) -> StrictRunHandle:
+    def start_review(self, request: ReviewRunRequest) -> StrictRunHandle:
         """Alias for hosts that name the reserve-and-enqueue operation start."""
         return self.reserve_review(request)
+
+    def reserve_direct_review(self, request: DirectReviewRunRequest) -> StrictRunHandle:
+        """Compatibility spelling; Direct uses the common review lifecycle."""
+        return self.reserve_review(request)
+
+    def find_review(self, idempotency_key, *, expected_head_sha):
+        run_id = self._core.find_review(idempotency_key, expected_head_sha)
+        return StrictRunHandle(run_id=run_id, created=False) if run_id else None
+
+    @staticmethod
+    def run_session(prompt, **kwargs):
+        """Run a bounded read-only classification or candidate session.
+
+        Reviews use ``reserve_direct_review`` for durable identity and recovery.
+        """
+        from ...providers.json_session import run_readonly_json
+
+        return run_readonly_json(prompt, **kwargs)
+
+    @staticmethod
+    def decode_session_json(text):
+        from ...providers.json_session import decode_object
+
+        return decode_object(text)
 
     def quality_readiness(self, repo: str, repo_path: str = "") -> tuple[str, ...]:
         """Return setup gaps for the dedicated review-readiness workflow."""
@@ -250,3 +234,6 @@ class StrictRuntime:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+StrictRuntime = ReviewRuntime

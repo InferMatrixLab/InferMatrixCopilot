@@ -52,7 +52,7 @@ def test_one_rejected_facet_has_four_lifetime_attempts_and_preserves_other_passe
     assert resumed.depth["features"]["step0"]["facets"]["api"]["total_attempts"] == 4
 
 
-def test_interrupted_dispatched_review_uses_next_round_without_regenerating(world):
+def test_interrupted_dispatched_review_retains_original_round_until_reconciled(world):
     policy = _baseline(world)
     _complete_breadth(world, policy)
     gateway = LightGateway(interrupt=True)
@@ -63,8 +63,12 @@ def test_interrupted_dispatched_review_uses_next_round_without_regenerating(worl
     assert len(gateway.depth_calls) == 1
     record = run_light(world, gateway)
     assert len(gateway.depth_calls) == 1
-    assert record.coverage["semantic_depth"]["lightweight_recognized_facets"] == 7
-    assert all(slot["total_attempts"] == 2 for slot in record.depth["features"]["step0"]["facets"].values())
+    assert record.coverage["semantic_depth"]["lightweight_recognized_facets"] == 0
+    entry = record.depth["features"]["step0"]
+    assert entry["review_dispatched"] and "checked" not in entry
+    assert entry["draft"] == pending.depth["features"]["step0"]["draft"]
+    assert all(slot["total_attempts"] == 1 for slot in entry["facets"].values())
+    assert not record.depth["done"]
 
 
 def test_stop_before_dispatch_keeps_zero_attempts(world):

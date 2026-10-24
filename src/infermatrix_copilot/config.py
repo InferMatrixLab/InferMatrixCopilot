@@ -176,6 +176,7 @@ class Settings(BaseSettings):
     # CLI holds the subscription auth.
     strict_backend: str = ""             # "" | api | cursor | claude-code | codex | deepseek | zcode
     strict_backend_model: str = ""       # model id INSIDE the harness (optional)
+    strict_backend_effort: str = ""      # optional native default; unsupported transports refuse
     # dsh is the one API-keyed harness (providers/deepseek.py): the other
     # three hold subscription auth inside the vendor CLI, so `tier_target`
     # blanks credentials for harness backends and dsh must source its own.
@@ -187,6 +188,10 @@ class Settings(BaseSettings):
     strict_backend_concurrency: int = 2  # concurrent harness sessions
     strict_backend_cli: str = ""         # binary path override (else PATH)
     strict_backend_timeout_s: float = 1800.0  # per-session wall-clock ceiling
+    # Trusted local execution only; not accepted through model/review requests.
+    # Each configured completion gets its own durable trace attempt/profile.
+    native_completion_profiles: dict[str, dict] = {}
+    native_session_profiles: dict[str, dict] = {}
     # zcode pins the served model per run through a personal provider config
     # written into the session dir (providers/zcode.py): the provider the
     # entry names (empty: the host's own configured provider, else the Z.AI
@@ -237,10 +242,15 @@ class Settings(BaseSettings):
     github_token: str = ""
     pr_debug_max_groups: int = 6
 
-    # External locked rebase pipeline (the existing 5-phase orchestrator)
-    # Sibling checkout by default, derived from this file's location — never a
-    # hardcoded machine path. Override with REBASE_AGENT_ROOT if it lives elsewhere.
-    rebase_agent_root: Path = _REPO_ROOT.parent / "vllm-omni-rebase-agent"
+    # Deprecated path expansion for explicitly configured legacy data imports.
+    # Rebase execution is internal; no external checkout is discovered by default.
+    rebase_agent_root: Path | None = None
+
+    @field_validator("rebase_agent_root", mode="before")
+    @classmethod
+    def _optional_rebase_agent_root(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
+
     rebase_poll_interval: int = 30
     # v3 module-agent plan reviewer (rebase_engine/plan_review.py): empty =
     # review on the run's own tier model — never silently skipped
@@ -522,6 +532,12 @@ class Settings(BaseSettings):
                 f"(or unset), got {v!r}")
         return v
 
+    @field_validator("native_completion_profiles", "native_session_profiles")
+    @classmethod
+    def _validate_completion_profiles(cls, value):
+        from .providers.completion_profiles import normalize_completion_profiles
+        return normalize_completion_profiles(value)
+
     @field_validator("strict_max_workers")
     @classmethod
     def _validate_strict_max_workers(cls, v):
@@ -613,6 +629,20 @@ class Settings(BaseSettings):
     # Exact requested model -> provider context ceiling. Reserve this many
     # input tokens when gateways add hidden prompts beyond the visible bytes.
     improve_input_context_limits: dict[str, int] = {}
+    # Trusted domain bounds: exact "provider:model" -> stop plus one request's overshoot.
+    improve_native_call_limits: dict[str, dict[str, float]] = {}
+
+    @field_validator('improve_native_call_limits', mode='before')
+    @classmethod
+    def _valid_improve_native_call_limits(cls, value):
+        from .budgeting import normalized_cost
+        if not isinstance(value, dict) or any(
+                not isinstance(key, str) or ':' not in key or not all(key.split(':', 1))
+                or not isinstance(limit, dict) or set(limit) != {'stop_usd', 'overshoot_usd'}
+                or any(normalized_cost(amount) is None or amount <= 0
+                       for amount in limit.values()) for key, limit in value.items()):
+            raise ValueError('native call limits require exact provider:model and positive finite stop/overshoot USD')
+        return value
 
     @field_validator("improve_input_context_limits", mode="before")
     @classmethod

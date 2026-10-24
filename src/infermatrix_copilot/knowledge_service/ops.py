@@ -33,29 +33,22 @@ from typing import Iterable, Mapping
 
 import yaml
 
+from .format import (
+    RULE_PAGE as _RULE_PAGE, MAX_SECTION_CHARS as _MAX_SECTION_CHARS,
+    PAGE_MAX_BYTES, PAGE_MAX_LINES, page_over_capacity,
+)
+
 from .lifecycle import (
-    ANY_RULE_HEADING, RETIRE_REASONS, Footer, LifecycleError, Page, Section, expected_sources,
+    RETIRE_REASONS, Footer, LifecycleError, Page, Section, expected_sources,
+    first_taken_rule_id, rule_heading_ids,
 )
 
 KNOWLEDGE_OPS_API_VERSION = "2.0.0"
 OP_KINDS = ("add", "edit_same_meaning", "replace", "retire", "purge")
 TOMBSTONES_NAME = "_tombstones.yaml"
 INDEX_NAME = "_index.md"
-_RULE_PAGE = re.compile(r"rules(?:-[a-z0-9][a-z0-9-]*)?\.md")
+
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_MAX_SECTION_CHARS = 16 * 1024
-# Mirrors knowledge/tools/check_knowledge_tree.py's split gate (>= 32 KiB or
-# >= 500 non-empty lines fails the whole tree).
-PAGE_MAX_BYTES = 32 * 1024
-PAGE_MAX_LINES = 500
-
-
-def page_over_capacity(text: str) -> str:
-    size = len(text.encode("utf-8"))
-    lines = sum(1 for line in text.splitlines() if line.strip())
-    if size >= PAGE_MAX_BYTES or lines >= PAGE_MAX_LINES:
-        return f"{size} bytes / {lines} non-empty lines (limit < {PAGE_MAX_BYTES} / < {PAGE_MAX_LINES})"
-    return ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +80,28 @@ class OperationsResult:
     files: dict[str, str]            # every created or changed path -> new text
     touched_rules: tuple[str, ...]   # rule IDs whose sections changed
     created_pages: tuple[str, ...] = field(default_factory=tuple)
+
+
+def model_operations(data: dict, *, kinds: tuple[str, ...], limit: int | None = None,
+                     strings: bool = False, kind_error: str = "") -> list[KnowledgeOperation]:
+    """Parse model operations without granting protected-rule or publication rights."""
+    items = data.get("operations")
+    if not isinstance(items, list) or (limit is not None and len(items) > limit):
+        raise ValueError("operations must be a list" + (f" of at most {limit}" if limit is not None else ""))
+    result = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("kind") not in kinds:
+            raise ValueError(kind_error or f"operation kind must be one of {kinds}")
+        if item.get("allow_protected"):
+            raise ValueError("the generator may not request the human path")
+        if strings:
+            if not item.get("page") or not item.get("rule_id"):
+                raise ValueError("every operation needs page and rule_id")
+            for key in KnowledgeOperation.__dataclass_fields__:
+                if key not in ("kind", "allow_protected") and key in item and not isinstance(item[key], str):
+                    raise ValueError(f"{key} must be a string")
+        result.append(KnowledgeOperation.from_dict(item))
+    return result
 
 
 def repo_scope(page: str) -> str:
@@ -138,8 +153,8 @@ def all_rule_ids(files: Mapping[str, str]) -> dict[str, int]:
     for path, text in files.items():
         if not path.endswith(".md"):
             continue
-        for match in ANY_RULE_HEADING.finditer(_without_fences(text)):
-            counts[match.group("rule")] = counts.get(match.group("rule"), 0) + 1
+        for rule_id in rule_heading_ids(_without_fences(text)):
+            counts[rule_id] = counts.get(rule_id, 0) + 1
     return counts
 
 
@@ -253,13 +268,6 @@ def apply_operations(
         touched_pages.setdefault(path, page.sources() if path not in created else [])
         return page
 
-    def fresh_id(rule_id: str) -> None:
-        if rule_id in original_ids or rule_id in added_ids:
-            raise LifecycleError(f"rule ID already exists in the tree: {rule_id}")
-        if rule_id in tombstoned:
-            raise LifecycleError(f"rule ID was purged and is reserved forever: {rule_id}")
-        added_ids.add(rule_id)
-
     def active(page: Page, rule_id: str, op: KnowledgeOperation) -> Section:
         section = page.rule(rule_id)
         footer = section.footer
@@ -269,15 +277,31 @@ def apply_operations(
             raise LifecycleError(f"rule {rule_id} is protected; only the human path may change it")
         return section
 
+    def fresh_section(markdown: str, rule_id: str) -> Section:
+        section = _check_section(markdown, rule_id)
+        ids = (rule_id, *(nested for nested in section.nested_rule_ids if nested != rule_id))
+        taken = first_taken_rule_id(ids, original_ids, added_ids, tombstoned)
+        if taken:
+            reason = "was purged and is reserved forever" if taken in tombstoned else "already exists in the tree"
+            raise LifecycleError(f"rule ID {reason}: {taken}")
+        added_ids.update(ids)
+        return section
+
+    def retire(page: Page, old: Section, op: KnowledgeOperation, reason: str, successor: str = "") -> None:
+        footer = old.footer
+        retired = old.with_footer(Footer(
+            status="retired", since=footer.since, retired_at=release,
+            reason=reason, evidence=op.evidence,
+            supersedes=footer.supersedes,  # keep the chain A -> B -> C
+            superseded_by=successor, protected=footer.protected,
+        ))
+        work[op.page] = page.replace_section(op.rule_id, retired).render()
+
     for op in operations:
         if op.kind not in OP_KINDS:
             raise LifecycleError(f"unknown operation kind: {op.kind}")
         if op.kind == "add":
-            section = _check_section(op.section_markdown, op.rule_id)
-            fresh_id(op.rule_id)
-            for nested in section.nested_rule_ids:
-                if nested != op.rule_id:
-                    fresh_id(nested)
+            section = fresh_section(op.section_markdown, op.rule_id)
             page = page_of(op.page, create_title=op.page_title)
             page = page.append_section(section.with_footer(Footer(status="active", since=release)))
             work[op.page] = page.render()
@@ -301,18 +325,8 @@ def apply_operations(
                 raise LifecycleError("replace needs evidence")
             page = page_of(op.page)
             old = active(page, op.rule_id, op)
-            section = _check_section(op.section_markdown, op.new_rule_id)
-            fresh_id(op.new_rule_id)
-            for nested in section.nested_rule_ids:
-                if nested != op.new_rule_id:
-                    fresh_id(nested)
-            retired = old.with_footer(Footer(
-                status="retired", since=old.footer.since, retired_at=release,
-                reason="superseded", evidence=op.evidence,
-                supersedes=old.footer.supersedes,  # keep the chain A -> B -> C
-                superseded_by=op.new_rule_id, protected=old.footer.protected,
-            ))
-            work[op.page] = page.replace_section(op.rule_id, retired).render()
+            section = fresh_section(op.section_markdown, op.new_rule_id)
+            retire(page, old, op, "superseded", op.new_rule_id)
             target = op.new_page or op.page
             target_page = page_of(target, create_title=op.page_title)
             successor = section.with_footer(Footer(
@@ -326,12 +340,7 @@ def apply_operations(
                 raise LifecycleError("retire needs evidence")
             page = page_of(op.page)
             old = active(page, op.rule_id, op)
-            retired = old.with_footer(Footer(
-                status="retired", since=old.footer.since, retired_at=release,
-                reason=op.reason, evidence=op.evidence,
-                supersedes=old.footer.supersedes, protected=old.footer.protected,
-            ))
-            work[op.page] = page.replace_section(op.rule_id, retired).render()
+            retire(page, old, op, op.reason)
             touched_rules.append(op.rule_id)
         elif op.kind == "purge":
             page = page_of(op.page)

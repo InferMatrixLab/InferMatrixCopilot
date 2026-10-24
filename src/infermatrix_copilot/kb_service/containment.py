@@ -428,8 +428,8 @@ def _verify_restoration(rt, unit_id, proof):
         raise ContainmentError("correction proof does not bind a gated merged ledger changeset")
     audit = detail["source_audit"]
     lifecycle = rt.registry[changeset["repo"]]
-    from .maintenance import _required_ci
-    if proof.get("ci") != _required_ci(rt, changeset):
+    from .maintenance_policy import required_ci
+    if proof.get("ci") != required_ci(rt, changeset):
         raise ContainmentError("correction exact-head CI proof changed")
     observed = source_evidence(rt, lifecycle, original)
     if audit.get("outcome") != "contradicted" or audit.get("original_source_checked") is not True \

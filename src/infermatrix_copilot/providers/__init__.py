@@ -10,14 +10,14 @@ Public surface: the registry (`PROVIDERS`, `resolve_provider`,
 
 from __future__ import annotations
 
-from .base import AgentSessionRequest, HarnessTransport, ProviderSpec
+from .base import AgentSessionRequest, HarnessTransport, ProviderSpec, native_budget_facts
 from .harness_llm import HarnessLLM
 from .registry import PROVIDERS, resolve_provider, transport_for
 
 __all__ = [
     "PROVIDERS", "AgentSessionRequest", "HarnessLLM", "HarnessTransport",
     "ProviderSpec", "llm_for", "resolve_provider", "run_harness_step",
-    "transport_for",
+    "transport_for", "run_harness_session",
 ]
 
 
@@ -73,44 +73,33 @@ def run_harness_step(ctx, target, *, step_name: str, system: str, prompt: str,
     spec = ctx.state.get("task_spec") or {}
     bridge_spec = write_bridge_spec(
         run_dir=ctx.run_dir, step_name=step_name, scope=scope,
-        repo=str(spec.get("repo") or ctx.settings.default_repo))
-    import time
+        repo=str(spec.get("repo") or ctx.settings.default_repo),
+        knowledge_dir=getattr(ctx.settings, "knowledge_dir", None))
+    request = AgentSessionRequest(
+        system=system, prompt=prompt, scope=scope, model=model or target.model,
+        max_iters=max_iters, timeout_s=ctx.settings.strict_backend_timeout_s,
+        run_dir=ctx.run_dir, step_name=step_name,
+        bridge_spec_path=bridge_spec, trace=ctx.trace)
+    return run_harness_session(transport, request)
 
-    from ..llm import capture_model_call
 
-    # the session is one model_call record (a harness runs the whole loop
-    # inside its CLI: the reply is the final answer, the usage the session's);
-    # the bridge subprocess records the tool calls under the same unit context
-    kwargs = {"system": system, "messages": [{"role": "user", "content": prompt}],
-              "model": model or target.model, "max_tokens": None, "tools": []}
-    provider = f"harness:{getattr(getattr(transport, 'spec', None), 'id', provider_id or '')}"
-    started = time.monotonic()
-    try:
-        outcome = transport.run_session(AgentSessionRequest(
-            system=system, prompt=prompt, scope=scope,
-            model=model or target.model,
-            max_iters=max_iters, timeout_s=ctx.settings.strict_backend_timeout_s,
-            run_dir=ctx.run_dir, step_name=step_name,
-            bridge_spec_path=bridge_spec, trace=ctx.trace))
-    except Exception as exc:
-        capture_model_call(kwargs, step_name, provider, None, time.monotonic() - started,
-                           error=str(exc), extra_result={"session": True})
-        raise
-    capture_model_call(kwargs, step_name, provider, _SessionReply(outcome), time.monotonic() - started,
-                       extra_result={"session": True, "iterations": outcome.iterations,
-                                     "tool_calls": outcome.tool_calls, "truncated": outcome.truncated,
-                                     "refusals": list(outcome.refusals),
-                                     "tools_used": list(outcome.tools_used)})
+def run_harness_session(transport, request: AgentSessionRequest):
+    """One native call boundary for sessions, completions and their receipts."""
+    from .completion import complete_native
+    from .base import execution_effort
+    from dataclasses import replace
+    requested_effort = getattr(request, 'effort', '')
+    effort = execution_effort(transport, requested_effort)
+    if effort != requested_effort:
+        request = replace(request, effort=effort)
+    settings = getattr(transport, 'settings', None)
+    if getattr(settings, 'native_session_profiles', {}).get(transport.spec.id):
+        from .session_execution import execute_session
+        return execute_session(transport, request)
+    _, outcome, _, _ = complete_native(lambda: transport,
+        request={'system': request.system, 'messages': [{'role': 'user', 'content': request.prompt}],
+                 'model': request.model, 'max_tokens': None, 'role': request.step_name,
+                 **({'effort': effort} if effort else {})},
+        identity={'provider': transport.spec.id}, session_request=request, settings=settings,
+        capture={'provider': 'harness:' + transport.spec.id, 'extra_result': {'session': True}})
     return outcome
-
-
-class _SessionReply:
-    """An AgentOutcome viewed as a reply for capture: final text, usage."""
-
-    def __init__(self, outcome):
-        from ..llm import Block
-
-        self.blocks = [Block(type="text", text=outcome.text or "")]
-        self.model = ""
-        self.stop_reason = "truncated" if outcome.truncated else "end_turn"
-        self.usage = {"input_tokens": outcome.input_tokens, "output_tokens": outcome.output_tokens}

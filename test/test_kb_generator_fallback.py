@@ -97,8 +97,6 @@ def test_waiver_does_not_relax_the_other_invariants(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [
-    RuntimeError("account restricted"),
-    TimeoutError("timeout"),
     "Your account is on hold and can't use Claude Code.",
     "",
 ])
@@ -113,6 +111,18 @@ def test_generator_outage_uses_exact_fallback_and_records_both_attempts(failure)
     assert [r["provider"] for r in records] == ["claude-code", "zcode"]
     assert records[0]["error"] and not records[1]["error"]
     assert records[1]["fallback_from"] == GEN.label()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("account restricted"), TimeoutError("timeout")])
+def test_unknown_dispatched_outcome_does_not_trigger_another_paid_call(failure):
+    records = []
+    primary, fallback = Transport(failure), Transport('{"operations": []}')
+    with pytest.raises(ModelUnavailable) as caught:
+        gateway(primary, fallback, recorder=records.append).call_json(
+            PRIMARY, system="policy", prompt="evidence")
+    assert caught.value.native_call_sent and not caught.value.native_call_completed
+    assert len(primary.calls) == 1 and not fallback.calls
+    assert len(records) == 1 and records[0]["error"]
 
 
 def test_missing_cli_is_recorded_and_uses_fallback():
@@ -181,8 +191,12 @@ def test_payload_omission_applies_to_both_models():
 
 
 def test_pending_event_recovers_and_change_and_trace_attribute_glm_with_codex_review(tmp_path):
+    class UnavailableBeforeDispatch(Transport):
+        def validate_completion(self):
+            raise RuntimeError('zcode unavailable before dispatch')
+
     primary = Transport("Your account is on hold and can't use Claude Code.")
-    unavailable = Transport(RuntimeError("zcode down"))
+    unavailable = UnavailableBeforeDispatch(None)
     g = gateway(primary, unavailable)
     rt, lifecycle = _runtime(tmp_path, g)
     rt.generator = PRIMARY
@@ -192,6 +206,7 @@ def test_pending_event_recovers_and_change_and_trace_attribute_glm_with_codex_re
     collect_events(rt, lifecycle)
     assert run_intake(rt, lifecycle) is None
     assert len(rt.ledger.events("demo", "pending")) == 1
+    assert unavailable.calls == []
     answer = _generator_then_judge()
     fallback = Transport(lambda kw: json.dumps(answer(FALLBACK, kw["messages"][0]["content"])))
     reviewer = Transport(lambda kw: json.dumps(answer(JUDGE, kw["messages"][0]["content"])))
@@ -211,3 +226,61 @@ def test_pending_event_recovers_and_change_and_trace_attribute_glm_with_codex_re
     assert len(generators) == 1 and generators[0]["model"]["provider"] == "zcode"
     assert generators[0]["changeset_id"] == changeset["id"]
     assert generators[0]["decision"]["status"] == "pass"
+
+
+@pytest.mark.parametrize('failure', ['after_dispatch', 'prior_execution'])
+def test_lost_fallback_response_is_not_retried_when_transport_recovers(tmp_path, failure):
+    from infermatrix_copilot.providers.container_execution import ContainerPending
+
+    class ReservedTransport(Transport):
+        def validate_completion(self):
+            raise ContainerPending('original execution needs reconciliation', prior_execution=True)
+
+    primary = Transport("Your account is on hold and can't use Claude Code.")
+    fallback = (Transport(RuntimeError('zcode response lost after dispatch')) if failure == 'after_dispatch'
+                else ReservedTransport(None))
+    g = gateway(primary, fallback)
+    rt, lifecycle = _runtime(tmp_path, g)
+    rt.generator = PRIMARY
+    collect_events(rt, lifecycle)
+    assert run_intake(rt, lifecycle) is None
+    assert not rt.ledger.events('demo', 'pending')
+    assert len(rt.ledger.events('demo', 'draft_unknown')) == 1
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == (1 if failure == 'after_dispatch' else 0)
+    fallback.answer = '{"operations": []}'
+    assert run_intake(rt, lifecycle) is None
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == (1 if failure == 'after_dispatch' else 0)
+
+
+def test_evolved_intake_preserves_original_pending_through_rollback_error(tmp_path, monkeypatch):
+    from infermatrix_copilot import llm
+    from infermatrix_copilot.config import Settings
+    from infermatrix_copilot.improve import artifacts, objectives, runtime as evolution
+    from infermatrix_copilot.providers.container_execution import ContainerPending
+
+    rt, lifecycle = _runtime(tmp_path, gateway(Transport(None), Transport(None)))
+    rt.settings = Settings(_env_file=None, improve_enabled=True, improve_evolve_enabled=True)
+    rt.traces = TraceStore(tmp_path / 'traces', environ={})
+    monkeypatch.setattr(artifacts, 'runtime_settings', lambda settings, _: settings)
+    monkeypatch.setattr(objectives, 'enabled', lambda _: True)
+    monkeypatch.setattr(objectives, 'capture', lambda *args: None)
+    monkeypatch.setattr(evolution, 'registry', lambda _: tmp_path / 'no-active-registry')
+    monkeypatch.setattr(llm, 'LLM', lambda _: object())
+    executions = []
+
+    def pending(*args):
+        executions.append(args)
+        error = ContainerPending('original execution needs reconciliation', prior_execution=True)
+        error.native_call_sent = False
+        error.native_call_completed = False
+        raise error
+
+    monkeypatch.setattr(evolution, 'execute', pending)
+    collect_events(rt, lifecycle)
+    assert run_intake(rt, lifecycle) is None
+    assert not rt.ledger.events('demo', 'pending')
+    assert len(rt.ledger.events('demo', 'draft_unknown')) == 1
+    assert run_intake(rt, lifecycle) is None
+    assert len(executions) == 1

@@ -49,6 +49,11 @@ def test_prepared_body_refresh_preserves_native_jobs_files_and_commit_metadata(w
     # through the same official metadata writer, without rewriting any source.
     oversized = {**prepared, 'body':'Old full review history\n'+'retained failed context '*60000}
     save_prepared(first.pr['prepared'], **oversized)
+    # The older runtime predates the executor's immutable publication proof.
+    # Keep the fixture faithful to that legacy record, rather than tampering
+    # with a newly bound prepared publication.
+    first.pr.pop('validation', None)
+    first.save(rt.state_dir)
     before_tasks = copy.deepcopy(first.coverage['foundation_jobs'])
     before_proofs = first.coverage['foundation_publication']['receipt'].copy()
     before_calls = len(calls)

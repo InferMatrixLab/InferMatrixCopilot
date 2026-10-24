@@ -206,30 +206,22 @@ def _repo_map_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
     repo = ctx.state.get("repo_path") or (adapter.repo_path if adapter else "")
     if not repo or not Path(repo).exists():
         return {}
-    language = "python"
+    from ..agent_policy import agent_policy
+
+    policy = agent_policy(ctx)
+    language = str(adapter.manifest.get("repo", {}).get("language") or "python") if adapter else "python"
     cache_dir = ctx.run_dir / "repo_map"
-    # a shadow run never writes the production knowledge tree: the cache
-    # (which RepoMap.index purges and rewrites) stays in the shadow run dir
-    shadow = bool(getattr(ctx.settings, "improve_shadow", False))
-    if adapter is not None and not shadow:
+    if policy.repo_map_cache is not None:
+        cache_dir = policy.repo_map_cache(ctx)
+    elif adapter is not None:
         from ...memory.paths import KnowledgePaths
 
-        language = str(adapter.manifest.get("repo", {}).get("language")
-                       or "python")
         cache_dir = KnowledgePaths.resolve(
-            ctx.settings, str((ctx.state.get("task_spec") or {})
-                              .get("repo", "")),
+            ctx.settings, str((ctx.state.get("task_spec") or {}).get("repo", "")),
             adapter_root=adapter.root).repo_map_cache_dir
-    if adapter is not None and shadow:
-        language = str(adapter.manifest.get("repo", {}).get("language") or "python")
     accept = None
-    if shadow:
-        # the indexer follows symlinks: fence every indexed file to the shadow
-        # checkout after resolution, exactly as the read tools are fenced
-        from ...scopes import shadow_scope
-
-        fence = shadow_scope(repo)
-        accept = lambda resolved: fence.check_read(resolved).allowed  # noqa: E731
+    if policy.repo_map_accept is not None:
+        accept = lambda resolved: policy.repo_map_accept(repo, resolved)
     rmap = RepoMap(repo, language, cache_dir=cache_dir, accept=accept)
     if not rmap.supported:
         ctx.trace.record("capability_gap", capability=f"repo_map.{language}",
@@ -263,15 +255,9 @@ def _repo_docs_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
     repo_subdir = None
     if adapter is not None:
         repo_subdir = (adapter.manifest.get("knowledge") or {}).get("repo_subdir")
-    from ...knowledge_view import KnowledgeView, _load_view
+    from ...knowledge_view import KnowledgeView
     from ...kb_service.repo_spec import resolve_snapshot_repo
-    current = KnowledgeView.current()
-    if current.root.resolve() == kdir.resolve():
-        view = current
-    elif (kdir.parent / "MANIFEST.json").is_file():
-        view = _load_view(str(kdir.parent.resolve()))
-    else:
-        view = KnowledgeView(kdir.resolve(), f"unverified:{kdir.resolve()}")
+    view = KnowledgeView.for_root(kdir)
     state = getattr(ctx, "state", {})
     params = getattr(ctx, "params", {})
     selector = str((state.get("task_spec") or {}).get("repo") or "")

@@ -382,7 +382,7 @@ async def _review_diff(ctx: StepContext) -> StepResult:
     recheck_missing = []
     carried = (spec.get("params") or {}).get("carried_findings") or []
     if result.ok and carried:
-        from ....sdk.v1.rechecks import checked_rechecks, validate_carried
+        from ....review.rechecks import checked_rechecks, validate_carried
 
         validate_carried(carried)
         recheck_result, recheck_output = await run_agent_step(

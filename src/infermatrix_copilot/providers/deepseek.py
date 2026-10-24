@@ -25,8 +25,7 @@ TWO WAYS THIS BREAKS THE REGISTRY'S HARNESS ASSUMPTIONS, both deliberate:
    archaeology set `show_commit` / `search_history` / `file_at_base` — are
    NOT reachable as named tools. bash subsumes most of them (they are thin
    git wrappers) but those calls fall outside our audit trail, so a
-   `capability_gap` is traced on every session that was handed a bridge spec
-   it could not honour. An arm must never be labelled "tools bridged" when
+   session requesting a bridge spec is rejected before SDK construction. An arm must never be labelled "tools bridged" when
    it ran on native bash; this campaign has already measured three arms that
    were not the configuration their label claimed.
 
@@ -48,26 +47,27 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import sys
 import tempfile
-import threading
+import time
+from types import SimpleNamespace
 from pathlib import Path
 
 from ..agent_loop import AgentOutcome
-from ..llm import Block, Reply
+from ..llm import Reply
 from .base import (
     AgentSessionRequest,
     HarnessTransport,
     SessionUsage,
     flatten_messages,
     sanitized_env,
+    stream_cli,
 )
 from .registry import PROVIDERS
 
 # Env the dsh runtime subprocess keeps, on top of `sanitized_env()`. The
-# credential does NOT travel here — it goes through the SDK config field so it
-# never lands in a subprocess environment we also hand to bash.
+# The credential travels through stdin to the SDK config, not this worker env.
+# The vendor SDK supplies that credential to its own runtime as required.
 _DSH_ENV_KEEP = ("DSH_HOME",)
 
 # How far past our own iteration budget a dsh session may wander before we
@@ -78,14 +78,6 @@ _DSH_ENV_KEEP = ("DSH_HOME",)
 # 558 steps measured.
 _STEP_CAP_FACTOR = 6
 
-
-def _close(harness) -> None:
-    """Best-effort shutdown of a running harness from a watchdog thread."""
-    try:
-        if harness is not None:
-            harness.close()
-    except Exception:  # noqa: BLE001 — the watchdog must never raise
-        pass
 
 _PLUGIN_RE = re.compile(r"name: '(@deepseek-ai/[a-z0-9-]+)'")
 _bundled_plugins: set[str] | None = None
@@ -160,8 +152,10 @@ class DeepSeekHarnessTransport(HarnessTransport):
         if not cli:
             raise RuntimeError(
                 "deepseek backend selected but the SDK is not installed — "
-                "run: pip install deepseek-harness-sdk (it carries the "
+                "run: pip install 'infermatrix-copilot[deepseek]' (deepseek-harness-sdk carries the "
                 "bundled runtime; no Node.js needed)")
+        from .deepseek_worker import validate_sdk
+        validate_sdk()
         return cli
 
     def _credential(self) -> tuple[str, str]:
@@ -191,16 +185,16 @@ class DeepSeekHarnessTransport(HarnessTransport):
 
     # -- composition ---------------------------------------------------------
     def _composition(self, *, run_dir: Path, step_name: str, cwd: Path,
-                     read_only: bool, bridge_spec_path: Path | None) -> Path:
+                     read_only: bool, bridge_spec_path: Path | None,
+                     tool_free: bool = False) -> Path:
         """Write this session's Cordis composition and return its path.
 
         Upstream `minimal.cordis.yml` verbatim in shape — one system prompt,
-        persistent bash + str_replace_editor, JSONL persistence, no
-        compaction, no runtime-context injection, no skills — with two
-        deliberate edits: the sandbox mode is pinned to the session's scope
-        instead of `danger-full-access`, and an `dsh-mcp-client` layer mounts
-        our tool bridge so scoped tools reach the model as
-        `mcp__infermatrix__<name>`.
+        optional persistent bash + str_replace_editor, JSONL persistence, no
+        compaction, no runtime-context injection, no skills. The sandbox mode
+        is pinned to the session's scope instead of `danger-full-access`.
+        The bundled runtime cannot mount our MCP bridge; session preflight
+        rejects requests requiring it.
         """
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", step_name or "step") or "step"
         out_dir = Path(run_dir) / "dsh"
@@ -250,12 +244,12 @@ class DeepSeekHarnessTransport(HarnessTransport):
             "    workspaceContext: false\n"
             "    skills:\n      enabled: false\n"
             "    toolBash: false\n    toolJobs: false\n",
-            "- id: persistent-bash\n"
+            *([] if tool_free else ["- id: persistent-bash\n"
             "  name: '@deepseek-ai/dsh-tool-bash-persistent'\n"
             "  config:\n    timeoutMs: 300000\n",
             "- id: str-replace-editor\n"
             "  name: '@deepseek-ai/dsh-tool-str-replace-editor'\n"
-            "  config:\n    maxOutputChars: 16000\n",
+            "  config:\n    maxOutputChars: 16000\n"]),
             "- id: sessions\n"
             "  name: '@deepseek-ai/dsh-session-persistence-jsonl'\n"
             "  config:\n"
@@ -270,8 +264,8 @@ class DeepSeekHarnessTransport(HarnessTransport):
         # `_assert_plugins_bundled` below turns that into an instant error.
         header = ("# Generated per session by providers/deepseek.py — upstream\n"
                   "# minimal composition, sandbox pinned to this step's scope.\n"
-                  "# Native bash + str_replace_editor only: the bundled runtime\n"
-                  "# carries no MCP client, so our tool bridge is unreachable.\n"
+                  "# Native tool plugins depend on this call's execution policy.\n"
+                  "# The bundled runtime has no MCP client for our tool bridge.\n"
                   "# Do not hand-edit.\n")
         body = "\n".join(blocks)
         _assert_plugins_bundled(body)
@@ -300,19 +294,18 @@ class DeepSeekHarnessTransport(HarnessTransport):
     # -- result mapping ------------------------------------------------------
     @staticmethod
     def _activity(events: list) -> tuple[int, list[str], SessionUsage]:
-        """Best-effort (tool_calls, tools_used, usage) from the event stream.
+        """Decode native activity once for sessions, completions and recovery.
 
-        The SDK documents `RunResult.events` as root-session events but not
-        their per-kind schema, and the shape is not worth guessing at: this
-        parser accepts the plausible spellings and degrades to zeros rather
-        than inventing numbers. `run_session` traces the observed event kinds
-        so the first live run tells us the real shape instead of us asserting
-        it here.
+        The pinned runtime emits usage chunks and a final assistant message
+        for the same (turn, step). Prefer the message; retain a chunk if the
+        worker stops before that message. Legacy aggregate envelopes are used
+        only when no native per-step reports exist, never added to them.
         """
         usage = SessionUsage()
         tools: list[str] = []
         calls = 0
-        for event in events or []:
+        reports, legacy = {}, []
+        for index, event in enumerate(events or []):
             if not isinstance(event, dict):
                 continue
             kind = str(event.get("kind") or event.get("type") or "")
@@ -322,22 +315,102 @@ class DeepSeekHarnessTransport(HarnessTransport):
                 name = data.get("name") or data.get("tool") or ""
                 if name:
                     tools.append(str(name))
-            raw = data.get("usage")
-            if isinstance(raw, dict):
-                usage.input_tokens += int(raw.get("input_tokens")
-                                          or raw.get("inputTokens") or 0)
-                usage.output_tokens += int(raw.get("output_tokens")
-                                           or raw.get("outputTokens") or 0)
-            served = data.get("model")
+            message = data.get("message")
+            source = message.get("source") if isinstance(message, dict) else None
+            served = data.get("model") or (source.get("model") if isinstance(source, dict) else None)
             if isinstance(served, str) and served:
                 usage.served_model = served
+            raw, priority = data.get("usage"), 0
+            if kind == "assistant/message":
+                priority = 2
+            elif kind == "assistant/chunk" and isinstance(data.get("chunk"), dict):
+                chunk = data["chunk"]
+                if chunk.get("type") == "usage":
+                    raw, priority = chunk.get("usage"), 1
+            if priority:
+                # Without coordinates we cannot distinguish repeated reports
+                # from different paid steps. Do not attest their sum.
+                bound = type(data.get("turn")) is int and type(data.get("step")) is int
+                key = (data["turn"], data["step"]) if bound else ("unbound", index)
+                if not bound:
+                    raw = {}
+                if priority >= reports.get(key, (0, {}))[0]:
+                    reports[key] = (priority, raw if isinstance(raw, dict) else {})
+            elif isinstance(raw, dict):
+                legacy.append(raw)
+        costs = []
+        for raw in ([value[1] for value in reports.values()] if reports else legacy):
+            usage.add_token_usage({target: raw.get(target, raw.get(alias)) for target, alias in (
+                ("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+                ("cache_read_input_tokens", "cacheReadInputTokens"),
+                ("cache_creation_input_tokens", "cacheCreationInputTokens"))})
+            costs.append(SessionUsage.normalized_cost(raw.get("cost_usd", raw.get("costUsd"))))
+        usage.set_reported_cost(sum(costs) if costs and all(cost is not None for cost in costs) else None)
         usage.tools_used = tools
         return calls, tools, usage
 
+    supports_native_events = True
+
+    @classmethod
+    def native_snapshot(cls, events):
+        native = [event["payload"] for event in events
+                  if event.get("type") == "native.deepseek.event" and isinstance(event.get("payload"), dict)]
+        _, _, activity = cls._activity(native)
+        return {"text": "", "served_model": activity.served_model,
+                "usage": dict(activity.reported_usage) or None}
+
+    def _invoke(self, *, options, env, prompt, timeout_s, step_cap=None, native_event_sink=None):
+        """The SDK inherits only this worker's filtered environment.
+
+        Startup, turn execution and SDK shutdown share the CLI supervisor's
+        absolute deadline and process group; no adapter watchdog is needed.
+        Credentials travel over stdin, never in argv or a request file.
+        """
+        response = None
+
+        def line(channel, raw):
+            nonlocal response
+            if channel != "stdout" or not raw.strip():
+                return
+            frame = json.loads(raw)
+            if not isinstance(frame, dict) or frame.get("protocol") != 1:
+                raise ValueError("invalid DeepSeek worker protocol")
+            if "event" in frame:
+                if native_event_sink is not None:
+                    native_event_sink({"type": "native.deepseek.event", "payload": frame["event"]})
+            else:
+                response = frame
+
+        _, _, code, reason = stream_cli(
+            [sys.executable, "-I", "-m", "infermatrix_copilot.providers.deepseek_worker"],
+            cwd=options["cwd"], env=env, deadline=time.monotonic() + timeout_s,
+            on_line=line,
+            input=json.dumps({"options": {**options, "env": env}, "prompt": prompt, "step_cap": step_cap}))
+        if reason:
+            raise RuntimeError(f"DeepSeek worker {reason} deadline or cancellation")
+        if code:
+            raise RuntimeError("DeepSeek worker failed before returning a result")
+        try:
+            value = response
+            if not isinstance(value, dict) or value.get("protocol") != 1:
+                raise ValueError("invalid protocol")
+            if value.get("failure"):
+                raise RuntimeError(f"DeepSeek SDK failed ({value['failure']})")
+            return SimpleNamespace(**value["result"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("DeepSeek worker returned an invalid result") from exc
+
     # -- transport contract --------------------------------------------------
-    def run_session(self, req: AgentSessionRequest) -> AgentOutcome:
+    def validate_completion(self) -> None:
+        """Reject missing/incompatible SDKs before accounting marks dispatch."""
         self.require_cli()
-        from deepseek_harness import DeepSeekHarness
+
+    def validate_session(self, req: AgentSessionRequest):
+        super().validate_session(req)
+        self.require_cli()
+
+    def run_session(self, req: AgentSessionRequest) -> AgentOutcome:
+        self.validate_session(req)
 
         cwd = Path(req.scope.root or req.run_dir)
         session_root = Path(req.run_dir) / "dsh" / "sessions"
@@ -356,61 +429,20 @@ class DeepSeekHarnessTransport(HarnessTransport):
         finish = ""
         result = None
         error = ""
-        steps = 0
-        # dsh owns its own loop and its bundled runtime exposes NO step cap, so
-        # `max_iters` cannot be handed to the harness the way `claude
-        # --max-turns` takes it. Measured 2026-08-17 on pr4816: two lenses
-        # finished in ~40 steps each while a third ran 558 steps / 564 tool
-        # calls / 7MB of session log and was still going 50 minutes later,
-        # killed only by the arm's outer timeout — and minimal mounts no
-        # compaction, so a runaway grows its context the whole way. Both bounds
-        # below are ours: a step ceiling and a hard wall-clock deadline that
-        # closes the runtime, because `request_timeout_seconds` did not fire
-        # (it bounds a request, and a busy loop keeps making progress).
-        step_cap = max(1, int(req.max_iters)) * _STEP_CAP_FACTOR
-        stopper: dict = {"harness": None, "hit": ""}
-
-        def _on_notification(note) -> None:
-            nonlocal steps
-            kind = ""
-            if isinstance(note, dict):
-                kind = str(note.get("kind") or note.get("type") or "")
-            else:
-                kind = str(getattr(note, "kind", "")
-                           or getattr(note, "type", "") or "")
-            if kind.endswith("step/end"):
-                steps += 1
-                if steps >= step_cap and not stopper["hit"]:
-                    stopper["hit"] = f"step cap {step_cap} reached"
-                    _close(stopper["harness"])
-
         try:
-            with DeepSeekHarness(
-                    provider="deepseek-official", model=model,
-                    cwd=str(cwd), session_root=str(session_root),
-                    cordis=str(cordis), api_key=key,
-                    base_url=base_url or None,
-                    env=self._env(cwd=cwd, model=model, system=req.system,
-                                  session_root=session_root),
-                    request_timeout_seconds=req.timeout_s) as harness:
-                stopper["harness"] = harness
-                watchdog = threading.Timer(
-                    max(60.0, float(req.timeout_s)),
-                    lambda: (stopper.__setitem__(
-                        "hit", f"wall-clock deadline {req.timeout_s:.0f}s"),
-                        _close(harness)))
-                watchdog.daemon = True
-                watchdog.start()
-                try:
-                    result = harness.run(req.prompt,
-                                         on_notification=_on_notification)
-                finally:
-                    watchdog.cancel()
-            finish = str(getattr(result, "finish_reason", "") or "")
-        except Exception as exc:  # noqa: BLE001 — a dead harness is an outcome
-            error = (stopper["hit"] or f"{type(exc).__name__}: {exc}")[:300]
-        if stopper["hit"] and not error:
-            error = stopper["hit"]
+            result = self._invoke(
+                options=dict(provider="deepseek-official", model=model,
+                             cwd=str(cwd), session_root=str(session_root),
+                             cordis=str(cordis), api_key=key, base_url=base_url or None,
+                             request_timeout_seconds=req.timeout_s),
+                env=self._env(cwd=cwd, model=model, system=req.system, session_root=session_root),
+                prompt=req.prompt, timeout_s=req.timeout_s,
+                step_cap=max(1, int(req.max_iters)) * _STEP_CAP_FACTOR,
+                **({"native_event_sink": req.native_event_sink} if req.native_event_sink is not None else {}))
+            finish = str(result.finish_reason or "")
+            error = result.error
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:300]
 
         events = list(getattr(result, "events", None) or [])
         calls, tools, usage = self._activity(events)
@@ -426,17 +458,6 @@ class DeepSeekHarnessTransport(HarnessTransport):
             refusals.append(f"dsh finish_reason={finish}")
 
         if req.trace is not None:
-            if req.bridge_spec_path is not None:
-                # the step asked for our scoped tools and could not get them:
-                # say so loudly enough that this arm cannot later be described
-                # as having run with the tool bridge
-                req.trace.record(
-                    "capability_gap", capability="review.mcp_tool_bridge",
-                    step=req.step_name,
-                    effect="bundled dsh runtime has no MCP client plugin; the "
-                           "session ran on native bash + str_replace_editor "
-                           "and scoped-tool calls are absent from the audit "
-                           "trail")
             req.trace.record(
                 "harness_session", provider=self.spec.id, step=req.step_name,
                 finish_reason=finish or None, error=error or None,
@@ -450,59 +471,50 @@ class DeepSeekHarnessTransport(HarnessTransport):
                 event_kinds=sorted({str(e.get("kind") or e.get("type") or "?")
                                     for e in events
                                     if isinstance(e, dict)})[:20])
-        return AgentOutcome(
-            text=text,
-            iterations=0,  # the harness does not expose its round count
-            tool_calls=calls,
-            truncated=truncated,
-            refusals=refusals,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            tools_used=tools[:40])
+        # The harness does not expose its round count.
+        return usage.outcome(text, tool_calls=calls, tools_used=tools,
+                             truncated=truncated, refusals=refusals)
 
     def complete(self, *, system: str, messages: list[dict],
                  model: str = "", max_tokens: int | None = None,
                  role: str = "", effort: str = "",
-                 max_budget_usd: float | None = None) -> Reply:
-        """Tool-less one-shot in an EMPTY scratch cwd — the containment for
-        calls that need no repo at all (intent, reducer, repair). No bridge
-        spec, so no MCP layer is written; bash and the editor see an empty
-        directory under a read-only policy."""
-        self.require_cli()
-        from deepseek_harness import DeepSeekHarness
+                 max_budget_usd: float | None = None, native_event_sink=None) -> Reply:
+        """One-shot completion without bash/editor tool plugin registration.
 
-        scratch = Path(tempfile.mkdtemp(prefix="imc-dsh-oneshot-"))
+        An empty scratch directory and a read-only sandbox are supplementary
+        controls, not substitutes for removing the tool providers.
+        """
+        self.validate_completion()
+
         key, base_url = self._credential()
         selected = (model or self.settings.strict_backend_model
                     or self.spec.default_model)
         text, finish = "", ""
-        try:
+        with tempfile.TemporaryDirectory(prefix="imc-dsh-oneshot-", ignore_cleanup_errors=True) as directory:
+            scratch = Path(directory)
             cordis = self._composition(
                 run_dir=scratch, step_name="oneshot", cwd=scratch,
-                read_only=True, bridge_spec_path=None)
-            with DeepSeekHarness(
-                    provider="deepseek-official", model=selected,
-                    cwd=str(scratch), session_root=str(scratch / "sessions"),
-                    cordis=str(cordis), api_key=key,
-                    base_url=base_url or None,
-                    env=self._env(cwd=scratch, model=selected, system=system,
-                                  session_root=scratch / "sessions"),
-                    request_timeout_seconds=(
-                        self.settings.strict_backend_timeout_s)) as harness:
-                result = harness.run(flatten_messages(system, messages))
+                read_only=True, bridge_spec_path=None, tool_free=True)
+            result = self._invoke(
+                options=dict(provider="deepseek-official", model=selected,
+                             cwd=str(scratch), session_root=str(scratch / "sessions"),
+                             cordis=str(cordis), api_key=key, base_url=base_url or None,
+                             request_timeout_seconds=self.settings.strict_backend_timeout_s),
+                env=self._env(cwd=scratch, model=selected, system=system,
+                              session_root=scratch / "sessions"),
+                prompt=flatten_messages(system, messages),
+                timeout_s=self.settings.strict_backend_timeout_s,
+                native_event_sink=native_event_sink)
+            if result.error:
+                raise RuntimeError(result.error)
             text = str(getattr(result, "final_response", "") or "").strip()
             finish = str(getattr(result, "finish_reason", "") or "")
+            from .audit import assert_tool_less
+
+            assert_tool_less([
+                {**event, "type": event.get("kind") or event.get("type") or ""}
+                for event in result.events if isinstance(event, dict)
+            ])
             _, _, usage = self._activity(
                 list(getattr(result, "events", None) or []))
-        except Exception:  # noqa: BLE001 — mirror cursor: empty reply, no raise
-            usage = SessionUsage()
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-        return Reply(
-            blocks=[Block(type="text", text=text)] if text else [],
-            stop_reason="max_tokens" if finish == "max-tokens" else "end_turn",
-            usage={"input_tokens": usage.input_tokens,
-                   "output_tokens": usage.output_tokens,
-                   "cache_read_input_tokens": 0,
-                   "cache_creation_input_tokens": 0},
-            model=usage.served_model)
+        return usage.reply(text, stop_reason="max_tokens" if finish == "max-tokens" else "end_turn")

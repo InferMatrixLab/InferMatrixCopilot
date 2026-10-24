@@ -1,9 +1,16 @@
-"""Review subsystem: cheap deterministic diff summarization, conditional
-trigger evaluation, and the fail-closed patch reviewer. Re-exports the public
-surface (`DiffSummary`/`build_diff_summary`, `evaluate_triggers`,
-`ReviewVerdict`/`run_patch_review`) so callers import from the package, not its
-modules."""
+"""Review domain; implementations load only when their capability is requested."""
+from importlib import import_module
 
-from .diff_summary import DiffSummary, build_diff_summary  # noqa: F401
-from .triggers import evaluate_triggers  # noqa: F401
-from .reviewer import ReviewVerdict, run_patch_review  # noqa: F401
+_EXPORTS = {
+    "DiffSummary": "diff_summary", "build_diff_summary": "diff_summary",
+    "evaluate_triggers": "triggers", "ReviewVerdict": "reviewer", "run_patch_review": "reviewer",
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module("." + _EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

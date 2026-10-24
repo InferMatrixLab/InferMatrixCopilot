@@ -14,6 +14,7 @@ from . import artifacts, objectives
 from .cycle import ledger_dir_for, governor_for
 from .isolation import Sandbox, SandboxUnavailable
 from ..trace_store import bind_store, trace_context, file_lock
+from ..git_objects import tree_entries
 
 
 def registry(settings):
@@ -290,21 +291,18 @@ def freeze_review(settings, state):
     for revision in revisions:
         listing = subprocess.check_output(['git', '-C', str(repository), 'ls-tree', '-rz', '--full-tree', revision], timeout=60)
         files = {}
-        for record in listing.split(b'\0'):
-            if not record: continue
-            meta, name = record.split(b'\t', 1)
-            mode, kind, oid = meta.split()
+        for mode, kind, oid, name in tree_entries(listing):
             name = name.decode()
             # Refuse credential/config payloads and binary/oversize material
             # rather than silently replaying a different repository.
-            if mode == b'120000' or kind != b'blob': raise artifacts.ArtifactError('review snapshot contains non-regular source')
+            if mode == '120000' or kind != 'blob': raise artifacts.ArtifactError('review snapshot contains non-regular source')
             from .drivers import input_path
             input_path(name)
             if any(part == '.env' or part.startswith('.env.') for part in Path(name).parts): raise artifacts.ArtifactError('review snapshot contains credential files')
-            size = int(subprocess.check_output(['git', '-C', str(repository), 'cat-file', '-s', oid.decode()], timeout=20))
+            size = int(subprocess.check_output(['git', '-C', str(repository), 'cat-file', '-s', oid], timeout=20))
             total += size
             if size > 1_000_000 or total > 12_000_000: raise artifacts.ArtifactError('review snapshot exceeds replay bound')
-            files[name] = subprocess.check_output(['git', '-C', str(repository), 'cat-file', 'blob', oid.decode()], timeout=20).decode('utf-8')
+            files[name] = subprocess.check_output(['git', '-C', str(repository), 'cat-file', 'blob', oid], timeout=20).decode('utf-8')
         trees.append(files)
     knowledge = {}
     kroot = Path(settings.knowledge_dir).resolve()

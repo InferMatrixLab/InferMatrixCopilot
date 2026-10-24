@@ -550,7 +550,7 @@ def test_workflow_improve_is_a_read_only_l2_kind_with_a_vetted_playbook(tmp_path
 
 
 def test_steps_run_a_dry_run_cycle_end_to_end(tmp_path, settings):
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.steps import register_builtin_steps
     from infermatrix_copilot.playbooks.store import PlaybookStore

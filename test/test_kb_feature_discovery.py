@@ -13,6 +13,103 @@ from infermatrix_copilot.kb_service.models import ModelReply, ModelRole, ModelUn
 PIN = 'a' * 40
 
 
+def test_discovery_prompt_survives_durable_request_key_order():
+    from infermatrix_copilot.kb_service.init_feature_discovery import _prompt
+    payload = {'repository': 'owner/repo', 'pin': PIN,
+               'files': [{'path': 'src/example.py', 'text': '</untrusted_data>', 'start': 1}]}
+    restored = json.loads(json.dumps(payload, sort_keys=True))
+    assert list(restored) != list(payload)
+    assert _prompt(restored) == _prompt(payload)
+    assert _prompt(payload).count('</untrusted_data>') == 1
+
+
+@pytest.mark.parametrize('pending', [[], {'wrong-key': {'phase': 'extract', 'attempt': 1}}])
+def test_corrupt_discovery_dispatch_journal_cannot_start_work(tmp_path, pending):
+    state = {'dispatch_intents': pending}
+    calls = []
+    engine = DiscoveryEngine(index(tmp_path, docs=False), seeds=[], owners=[], state=state,
+                             call=lambda *args: calls.append('call'), save=lambda: calls.append('save'),
+                             concurrency=1, pin=PIN)
+    before = deepcopy(pending)
+    with pytest.raises(ModelUnavailable, match='reconcile retained state'):
+        engine.scan()
+    assert state['dispatch_intents'] == before and 'call' not in calls
+
+
+@pytest.mark.parametrize("phase", ["extract", "review", "repair"])
+def test_discovery_crash_retains_dispatch_and_resume_cannot_repeat_call(tmp_path, phase):
+    idx = index(tmp_path, docs=False)
+    state, persisted, calls = {}, {}, []
+
+    def save():
+        persisted.clear()
+        persisted.update(deepcopy(state))
+
+    def call(role, system, prompt, validate):
+        calls.append(role)
+        crash = ((phase == "extract" and role == "generator")
+                 or (phase == "review" and role == "judge")
+                 or (phase == "repair" and role == "generator" and calls.count(role) == 2))
+        if crash:
+            assert persisted["dispatch_intents"]
+            for key in persisted['dispatch_intents']:
+                request = persisted['dispatch_requests'][key]['request']
+                context = persisted['dispatch_contexts'][request['context_sha256']]
+                assert context['policy']['kind'] == ('candidate' if phase == 'review' else phase)
+                assert context['pin'] == PIN and context['owners'] == ['runtime']
+                assert _hash(request['task']) == persisted['dispatch_intents'][key]['task_sha256']
+            raise KeyboardInterrupt()
+        return reply(role, {"candidates": [candidate()]} if role == "generator" else
+                     approve([candidate()], supported="no"))
+
+    engine = DiscoveryEngine(idx, seeds=[], owners=["runtime"], state=state, call=call,
+                             save=save, concurrency=1, pin=PIN)
+    with pytest.raises(KeyboardInterrupt):
+        engine.scan()
+        engine.review()
+    assert persisted["dispatch_intents"]
+    key, = persisted['dispatch_intents']
+    scope = (key, persisted['dispatch_intents'][key]['attempt'])
+    before = len(calls)
+    resumed = DiscoveryEngine(idx, seeds=[], owners=["runtime"], state=deepcopy(persisted),
+                              call=call, save=lambda: None, concurrency=1, pin=PIN)
+    original = resumed.original_request(scope=scope)
+    # Current discovery state cannot replace the original worker inputs.
+    resumed.owners.append('new-owner')
+    resumed.state['candidates'].clear()
+    assert resumed.original_request(scope=scope) == original
+    original['context']['owners'].append('detached')
+    assert resumed.original_request(scope=scope)['context']['owners'] == ['runtime']
+    with pytest.raises(ModelUnavailable, match="reconcile original dispatch"):
+        resumed.scan() if phase == "extract" else resumed.review()
+    assert len(calls) == before
+    context = resumed.state['dispatch_contexts'][original['context_sha256']]
+    context['owners'].append('tampered')
+    with pytest.raises(ModelUnavailable, match='context is missing or mismatched'):
+        resumed.original_request(scope=scope)
+
+
+def test_unknown_extraction_retains_intent_even_if_explicit_retry_marks_task_pending(tmp_path):
+    idx = index(tmp_path, docs=False)
+    state, calls = {}, []
+
+    def call(*args):
+        calls.append(1)
+        error = ModelUnavailable("native response lost")
+        error.native_call_sent = True
+        raise error
+
+    engine = DiscoveryEngine(idx, seeds=[], owners=[], state=state, call=call,
+                             save=lambda: None, concurrency=1)
+    engine.scan()
+    assert state["dispatch_intents"]
+    for task in state["tasks"].values():
+        task["status"] = "pending"  # The existing explicit retry adapter.
+    with pytest.raises(ModelUnavailable, match="reconcile original dispatch"):
+        engine.scan()
+    assert calls == [1]
+
+
 @pytest.mark.parametrize('packet_chars', [24000, 96000, 160000, 192000])
 def test_configured_packets_offer_every_complete_chunk_once(tmp_path, packet_chars):
     idx = index(tmp_path)
@@ -234,16 +331,22 @@ def test_successful_repair_survives_checkpoint_resume_without_calls(tmp_path):
 
 
 def test_inflight_budget_reservations_are_journaled(tmp_path):
-    from infermatrix_copilot.kb_service.init_feature_discovery import _ConcurrentBudget
+    from infermatrix_copilot.kb_service.init_feature_discovery import _discovery_budget
     from infermatrix_copilot.kb_service.init_budget import Budget
     journal = tmp_path / 'reservation.json'
-    wrapper = _ConcurrentBudget(Budget(1), journal, 'batch')
+    wrapper = _discovery_budget(Budget(1), journal, 'batch')
     with wrapper.reserve(.5) as reservation:
         saved = json.loads(journal.read_text())
-        assert saved == {'identity': 'batch', 'reserved_usd': .5, 'spent_usd': 0}
+        assert len(reservation.identity) == 32
+        assert saved == {'schema': 'discovery-budget/2', 'identity': 'batch',
+                         'reserved_usd': .5, 'spent_usd': 0,
+                         'calls': {reservation.identity: {'status': 'reserved', 'reserved_usd': .5,
+                                                         'accounted_usd': .5, 'accounting': 'actual'}}}
         reservation.charge(.2)
     saved = json.loads(journal.read_text())
     assert saved['reserved_usd'] == 0 and saved['spent_usd'] == .2
+    assert saved['calls'] == {reservation.identity: {'status': 'settled', 'reserved_usd': .5,
+                                                     'accounted_usd': .2, 'accounting': 'actual'}}
 
 
 def test_malformed_candidate_does_not_discard_valid_sibling(tmp_path):

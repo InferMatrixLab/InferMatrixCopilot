@@ -7,10 +7,10 @@ aggregator stays on the run's tier model. Guarantees, enforced HERE and not
 in prompt-land:
 
 - **Cap**: every member request must atomically `reserve()` a conservative
-  upper-bound cost first (input at ceil(chars/2) tokens — a deliberate
-  over-estimate — plus max_tokens output, plus the cache-creation surcharge);
-  settlement replaces the reservation with actual usage, so settled spend can
-  never exceed `moa_max_usd`. Reservation failure ⇒ the call runs on the tier
+  upper-bound cost first (UTF-8 request bytes plus max_tokens output and
+  the cache-creation surcharge). Unknown paid usage retains that reservation;
+  a reported overrun is recorded in full and stops further member calls.
+  Reservation failure ⇒ the call runs on the tier
   model (PR) or the member is skipped (issue) — never an uncapped request.
 - **Deadline**: per-request timeout = min(member timeout, remaining overall
   deadline); an expired deadline fails reservation.
@@ -21,7 +21,7 @@ in prompt-land:
 
 from __future__ import annotations
 
-import math
+import json
 import os
 import threading
 import time
@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-from ...metrics import CACHE_CREATE_FACTOR, model_price
+from ...budgeting import bind_call_budget, request_cost_bound, reservation_fits, settlement_charge, usage_cost
+from ...metrics import CACHE_CREATE_FACTOR, CACHE_READ_FACTOR, model_price
 
 
 @dataclass(frozen=True)
@@ -65,10 +66,10 @@ def resolve_members(settings: Any) -> list[Member]:
         model = str(raw["model"])
         provider = str(raw.get("provider") or "")
         if provider:
-            # harness member (provider registry): rides a subscription CLI,
-            # so there is no per-token spend for the USD cap to govern —
-            # the cap covers API members only; sessions stay bounded by
-            # strict_backend_timeout_s. Reject unshipped/unknown ids here so
+            # Harness sessions are reported separately from the API USD cap;
+            # kind does not attest zero spend (DeepSeek is API-keyed).
+            # Sessions stay bounded by strict_backend_timeout_s.
+            # Reject unshipped/unknown ids here so
             # a typo degrades to "member skipped", never a mid-run raise.
             try:
                 from ...providers.registry import transport_for_id
@@ -123,7 +124,7 @@ def moa_eligible(settings: Any, *, kind: str, mode: str,
 class MoaBudget:
     """Thread-safe atomic reservation ledger (W6). `reserve()` is the
     serialization point — concurrent members cannot enter on a stale
-    remaining-spend read; settled spend ≤ reserved spend by construction."""
+    remaining-spend read. Receipts prevent duplicate or conflicting charges."""
 
     max_usd: float
     deadline: float                      # monotonic absolute deadline
@@ -131,14 +132,17 @@ class MoaBudget:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reserved: dict[int, float] = field(default_factory=dict)
     _settled: float = 0.0
+    _receipts: dict[int, tuple[float | None, float]] = field(default_factory=dict)
+    _breached: bool = False
     _next_id: int = 0
     tripped: bool = False
+    _settings: Any = field(default=None, repr=False)
 
     @classmethod
     def start(cls, settings: Any) -> "MoaBudget":
         return cls(max_usd=float(settings.moa_max_usd),
                    deadline=time.monotonic() + float(settings.moa_deadline_s),
-                   member_timeout_s=float(settings.moa_member_timeout_s))
+                   member_timeout_s=float(settings.moa_member_timeout_s), _settings=settings)
 
     def request_timeout(self) -> float:
         """min(member timeout, remaining overall deadline); <=0 ⇒ expired."""
@@ -146,13 +150,10 @@ class MoaBudget:
 
     def estimate(self, member: Member, request_chars: int,
                  max_tokens: int) -> float:
-        """Conservative upper bound: input at ceil(chars/2) tokens (over-
-        estimates vs the ~3-4 chars/token reality) at the member's input
-        price incl. the cache-creation surcharge, plus max_tokens output."""
-        p_in, p_out = model_price(member.model)
-        tin = math.ceil(max(0, request_chars) / 2)
-        return (tin / 1e6 * p_in * CACHE_CREATE_FACTOR
-                + max_tokens / 1e6 * p_out)
+        """Conservative input-token bound, including cache creation."""
+        p_in, p_out = model_price(member.model, self._settings)
+        return request_cost_bound(request_chars, p_in, max_tokens, p_out,
+                                  cache_factor=CACHE_CREATE_FACTOR)
 
     def reserve(self, est_usd: float) -> int | None:
         """Atomically reserve `est_usd`; None when the cap/deadline refuses
@@ -160,8 +161,8 @@ class MoaBudget:
         if self.request_timeout() <= 0:
             return None
         with self._lock:
-            committed = self._settled + sum(self._reserved.values())
-            if committed + est_usd > self.max_usd:
+            if self._breached or not reservation_fits(self.max_usd, self._settled,
+                                                     sum(self._reserved.values()), est_usd):
                 self.tripped = True
                 return None
             rid = self._next_id
@@ -169,16 +170,51 @@ class MoaBudget:
             self._reserved[rid] = est_usd
             return rid
 
-    def settle(self, rid: int, actual_usd: float) -> None:
-        """Replace the reservation with actual spend (≤ reserved)."""
+    def settle(self, rid: int, actual_usd: float | None) -> None:
+        """Record the full charge once; unknown paid usage retains its bound."""
         with self._lock:
-            reserved = self._reserved.pop(rid, 0.0)
-            self._settled += min(actual_usd, reserved) if reserved else actual_usd
+            if rid in self._receipts:
+                previous, _ = self._receipts[rid]
+                if actual_usd != previous:
+                    raise MoaBudgetExceeded("different settlement for MoA reservation")
+                return
+            if rid not in self._reserved:
+                raise MoaBudgetExceeded("unknown MoA reservation")
+            reserved = self._reserved.pop(rid)
+            charged = settlement_charge(reserved, actual_usd)
+            self._receipts[rid] = (actual_usd, charged)
+            self._settled += charged
+            if charged > reserved:
+                self.tripped = self._breached = True
 
     def release(self, rid: int) -> None:
-        """Drop a reservation whose request never completed (error path)."""
-        with self._lock:
-            self._reserved.pop(rid, None)
+        """Only a request that was never dispatched can release its bound."""
+        self.settle(rid, 0.0)
+
+    def bind(self, member: Member):
+        """Bind this domain's account to real API dispatch, without wrapping LLMs."""
+        def acquire(request):
+            if request.get("kind") != "api" or request.get("model") != member.model:
+                return None
+            payload = {key: request.get(key) for key in ("system", "messages", "tools")}
+            size = len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+            rid = self.reserve(self.estimate(member, size, int(request["max_tokens"])))
+            if rid is None:
+                raise MoaBudgetExceeded(f"MoA budget/deadline refused {member.label()}")
+            return rid
+
+        def finish(rid, facts):
+            if rid is None:
+                return
+            if not facts["sent"]:
+                self.release(rid)
+            else:
+                pin, pout = model_price(member.model, self._settings)
+                self.settle(rid, usage_cost(facts["usage"], pin, pout,
+                            cache_read_factor=float(getattr(self._settings, "cache_read_price_factor", 0) or 0)
+                            or CACHE_READ_FACTOR, cache_create_factor=CACHE_CREATE_FACTOR))
+
+        return bind_call_budget(("moa", id(self)), acquire, finish)
 
     def spent(self) -> float:
         with self._lock:
@@ -186,67 +222,4 @@ class MoaBudget:
 
 
 class MoaBudgetExceeded(RuntimeError):
-    """Raised by a strict BudgetedLLM when a reservation is refused."""
-
-
-class BudgetedLLM:
-    """The LLM-call choke point for MoA member requests (design W6): every
-    `create()` atomically reserves a conservative upper-bound cost before the
-    provider request and settles to actual usage after. On a refused
-    reservation (cap tripped / deadline expired):
-
-    - `fallback` mode (PR lenses): the request runs on the tier model via the
-      fallback client instead — the lens continues at baseline cost.
-    - `strict` mode (issue proposers): raises `MoaBudgetExceeded` — the
-      member's proposal is skipped entirely (no per-member legacy drafts).
-
-    Duck-types the LLM interface the agent loop uses (`create`, `available`).
-    """
-
-    def __init__(self, member: Member, client: Any, budget: MoaBudget, *,
-                 fallback: tuple[Any, str] | None = None, role: str = "moa_member"):
-        self._member = member
-        self._client = client
-        self._budget = budget
-        self._fallback = fallback
-        self._role = role
-        self.available = bool(getattr(client, "available", False))
-
-    def create(self, **kwargs: Any) -> Any:
-        request_chars = (len(str(kwargs.get("system") or ""))
-                         + sum(len(str(m)) for m in kwargs.get("messages") or [])
-                         + len(str(kwargs.get("tools") or "")))
-        max_tokens = int(kwargs.get("max_tokens")
-                         or self._client.settings.llm_max_tokens)
-        est = self._budget.estimate(self._member, request_chars, max_tokens)
-        rid = self._budget.reserve(est)
-        if rid is None:
-            if self._fallback is not None:
-                fb_llm, fb_model = self._fallback
-                return fb_llm.create(**{**kwargs, "model": fb_model,
-                                        "role": self._role + "_fallback"})
-            raise MoaBudgetExceeded(
-                f"MoA budget/deadline refused {self._member.label()}")
-        try:
-            reply = self._client.create(**{**kwargs, "model": self._member.model,
-                                           "role": self._role})
-        except Exception as exc:
-            # a served-model mismatch is raised AFTER the provider was paid —
-            # the guard attaches the reply, so settle actual spend instead of
-            # releasing (a release would let fallbacks exceed MOA_MAX_USD)
-            paid = getattr(exc, "reply", None)
-            if paid is not None and getattr(paid, "usage", None):
-                self._budget.settle(rid, self._actual_cost(paid.usage))
-            else:
-                self._budget.release(rid)
-            raise
-        self._budget.settle(rid, self._actual_cost(getattr(reply, "usage", None)))
-        return reply
-
-    def _actual_cost(self, usage: dict | None) -> float:
-        usage = usage or {}
-        p_in, p_out = model_price(self._member.model)
-        return ((usage.get("input_tokens", 0) or 0) / 1e6 * p_in
-                + (usage.get("output_tokens", 0) or 0) / 1e6 * p_out
-                + (usage.get("cache_creation_input_tokens", 0) or 0)
-                / 1e6 * p_in * CACHE_CREATE_FACTOR)
+    """The member's account refused a dispatch or conflicting settlement."""

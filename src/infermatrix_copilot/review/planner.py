@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from ..llm import parse_json_reply
+from .diff import parse_diff
 
 DEPTHS = ("light", "standard", "full")
 # fail-safe set, priority order. Verification is included: the planner
@@ -42,12 +43,6 @@ _ASSET_SUFFIXES = (
     ".svg", ".webm", ".webp", ".wav",
 )
 _TEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.py|conftest\.py)$")
-# header forms — `diff --git` is the ONLY header on binary/empty/mode-only
-# changes, so it must be parsed too or such files evade classification
-_DIFF_GIT = re.compile(
-    r'^diff --git (?:"a/((?:[^"\\]|\\.)*)"|a/(\S+)) (?:"b/((?:[^"\\]|\\.)*)"|b/(\S+))\s*$')
-_OLD_NEW = re.compile(r'^(?:---|\+\+\+) (?:"?([ab])/((?:[^"\\]|\\.)*?)"?|/dev/null)\s*$')
-_RENAME = re.compile(r'^rename (?:from|to) "?(.+?)"?\s*$')
 # signature/default-constant surface on ± lines. Only a `-` line means an
 # EXISTING surface changed or went away (the breaking-behavior class — someone
 # may depend on the old form); a pure `+def` addition has no old consumers and
@@ -61,11 +56,6 @@ _API_LINE = re.compile(
 # flips a value can have repo-wide blast radius, so it must never rule light.
 _ASSIGN_LINE = re.compile(
     r"^[+-]\s*(?P<lhs>[A-Za-z_][\w.]*(?:\[[^\]=]+\])?)\s*=(?![=])\s*(?P<rhs>.+?)\s*$")
-
-
-def _unquote(path: str) -> str:
-    """Decode git's C-style backslash escapes in quoted paths."""
-    return re.sub(r"\\(.)", r"\1", path)
 
 
 def _classify_path(path: str) -> str:
@@ -180,61 +170,38 @@ def diff_signals(diff_text: str,
     # motion and stay silent.
     removed_assigns: dict[tuple[str, str], str] = {}
     value_flips: list[str] = []
-    current_path = ""
-    current_kind = "code"
-
-    def add(path: str) -> None:
-        nonlocal current_path, current_kind
-        path = _unquote(path)
-        if not path or path == "/dev/null":
-            return
-        kind = _classify_path(path)
-        files.setdefault(path, kind)
-        current_path, current_kind = path, kind
-
-    for raw in diff_text.splitlines():
-        m = _DIFF_GIT.match(raw)
-        if m:
-            qa, a, qb, b = m.groups()
-            add(qa if qa is not None else (a or ""))
-            add(qb if qb is not None else (b or ""))  # b-side wins "current"
-            continue
-        m = _OLD_NEW.match(raw)
-        if m:
-            side, path = m.groups()
-            if path is not None:
-                add(path)
-            continue
-        m = _RENAME.match(raw)
-        if m:
-            add(m.group(1))
-            continue
-        if not raw or raw[0] not in "+-":
-            continue
-        if raw[0] == "+":
-            insertions += 1
-            if current_kind == "code":
-                code_insertions += 1
-        else:
-            deletions += 1
-            if current_kind == "code":
-                code_deletions += 1
-        if current_kind == "code" and _API_LINE.match(raw):
-            if raw[0] == "-":
-                api_hints.append(f"{current_path}: `{raw[:120].strip()}`")
+    for parsed in parse_diff(diff_text):
+        for path in (parsed.old_path, parsed.new_path):
+            if path:
+                files.setdefault(path, _classify_path(path))
+        current_path = parsed.new_path or parsed.old_path
+        current_kind = _classify_path(current_path)
+        for change in parsed.changes:
+            raw = change.kind + change.text
+            if raw[0] == "+":
+                insertions += 1
+                if current_kind == "code":
+                    code_insertions += 1
             else:
-                api_added += 1
-        if current_kind == "code":
-            m = _ASSIGN_LINE.match(raw)
-            if m:
-                key = (current_path, m.group("lhs"))
+                deletions += 1
+                if current_kind == "code":
+                    code_deletions += 1
+            if current_kind == "code" and _API_LINE.match(raw):
                 if raw[0] == "-":
-                    removed_assigns.setdefault(key, m.group("rhs"))
-                elif key in removed_assigns \
-                        and removed_assigns[key] != m.group("rhs"):
-                    if len(value_flips) < 10:
-                        value_flips.append(
-                            f"{current_path}: `{m.group('lhs')}`")
+                    api_hints.append(f"{current_path}: `{raw[:120].strip()}`")
+                else:
+                    api_added += 1
+            if current_kind == "code":
+                m = _ASSIGN_LINE.match(raw)
+                if m:
+                    key = (current_path, m.group("lhs"))
+                    if raw[0] == "-":
+                        removed_assigns.setdefault(key, m.group("rhs"))
+                    elif key in removed_assigns \
+                            and removed_assigns[key] != m.group("rhs"):
+                        if len(value_flips) < 10:
+                            value_flips.append(
+                                f"{current_path}: `{m.group('lhs')}`")
 
     by_kind: dict[str, list[str]] = {"doc": [], "test": [], "config": [],
                                      "asset": [], "code": []}

@@ -213,21 +213,8 @@ rebase:
   # adapter is active; this whole `rebase:` section is HIGH-RISK (human-only
   # writes) so an agent can never self-install hooks
   hooks: rebase/hooks.py
-  # READ-ONLY parent-store read-compat (Rev 8 §9 PR4c, delivered by the
-  # completion design D2): v3 knowledge retrieval unions these layers LAST
-  # (runtime > adapter seed > parent) until the PR4d migration executes,
-  # after which the owner REMOVES these two keys (RUNBOOK step) and the
-  # compat layer dies. The v3 prelude fails CLOSED when a declared layer
-  # is unreadable and records open/close logical digests (§8 fairness).
-  knowledge:
-    parent_debug_db: ${REBASE_AGENT_ROOT}/agent/store/debug_memory.db
-    parent_skills_dir: ${REBASE_AGENT_ROOT}/agent/skills
-    # the parent store's own column carrying the upstream commit — repo
-    # data, so the neutral read-compat/migration code stays literal-free
-    parent_upstream_column: vllm_commit
-  # the shared checkout flock name: v3, the v1 backend, EXT1's external
-  # startup guard, and PR7 archival ALL take locks/<lock_name>.lock inside
-  # the checkout, so exclusion is mutual (repo data — the core stays neutral)
+  # Copilot owns execution and knowledge; no external agent stores are required.
+  # Rebase runs and archival share locks/<lock_name>.lock in the checkout.
   lock_name: omni
   # phase-3.2 precommit workflow (parent config.sh §10 __precommit__ entry:
   # command, 600s timeout, 0 GPUs; one retry — auto-fix hooks often pass on

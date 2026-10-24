@@ -179,6 +179,20 @@ def most_specific(path: str, owners: Sequence[Owner]) -> list[Owner]:
     return out
 
 
+
+def owner_for_paths(paths: Sequence[str], owners: Sequence[Owner]) -> Owner | None:
+    """Most-specific path coverage, then routing order; shared by init callers."""
+    counts: dict[str, int] = {}
+    by_name = {o.owner: o for o in owners}
+    for path in paths:
+        for owner in most_specific(path, owners):
+            counts[owner.owner] = counts.get(owner.owner, 0) + 1
+    if not counts:
+        return None
+    order = [o.owner for o in owners]
+    best = max(counts, key=lambda name: (counts[name], -order.index(name)))
+    return by_name[best]
+
 def shadowing(owners: Sequence[Owner]) -> list[tuple[str, str, str, str]]:
     """``(owner, prefix, other owner, other prefix)`` for every prefix that is a
     strict ancestor of another owner's prefix: the broader owner still routes

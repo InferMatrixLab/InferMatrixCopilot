@@ -49,3 +49,19 @@ for name in ('infermatrix_copilot.app.core',
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_execution_kernel_does_not_import_domain_implementations():
+    source = Path(__file__).resolve().parents[1] / "src"
+    code = """
+import sys
+from infermatrix_copilot.engine.executor import Executor
+assert not any(name.startswith(('infermatrix_copilot.improve',
+                               'infermatrix_copilot.kb_service',
+                               'infermatrix_copilot.knowledge_service'))
+               for name in sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", code],
+                            env={**os.environ, "PYTHONPATH": str(source)},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr

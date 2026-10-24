@@ -1,0 +1,239 @@
+[
+  {
+    "input": "",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "no JSON object in the judge reply"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "no json here",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "no JSON object in the judge reply"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "{\"verdict\":\"approve\",\"nested\":{\"a\":1}}",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "approve",
+          "nested": {
+            "a": 1
+          }
+        }
+      },
+      "plan": {
+        "value": {
+          "verdict": "approve",
+          "nested": {
+            "a": 1
+          }
+        }
+      },
+      "decision": {
+        "value": {
+          "verdict": "approve",
+          "nested": {
+            "a": 1
+          }
+        }
+      }
+    }
+  },
+  {
+    "input": "prose {\"verdict\":\"revise\"} trailing",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "revise"
+        }
+      },
+      "plan": {
+        "value": {
+          "verdict": "revise"
+        }
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "```json\n{\"verdict\":\"approve\"}\n```",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "approve"
+        }
+      },
+      "plan": {
+        "value": {
+          "verdict": "approve"
+        }
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "{\"verdict\":\"approve\"} {\"verdict\":\"revise\"}",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "judge reply is not valid JSON: Extra data: line 1 column 23 (char 22)"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "{bad} {\"verdict\":\"approve\"}",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "judge reply is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "error": "DecisionError",
+        "message": "invalid JSON in <decision>"
+      }
+    }
+  },
+  {
+    "input": "prefix {\"verdict\":\"approve\"}",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "approve"
+        }
+      },
+      "plan": {
+        "value": {
+          "verdict": "approve"
+        }
+      },
+      "decision": {
+        "value": {
+          "verdict": "approve"
+        }
+      }
+    }
+  },
+  {
+    "input": "{\"verdict\":\"approve\",\"x\":\"}\"}",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "approve",
+          "x": "}"
+        }
+      },
+      "plan": {
+        "value": {
+          "verdict": "approve",
+          "x": "}"
+        }
+      },
+      "decision": {
+        "value": {
+          "verdict": "approve",
+          "x": "}"
+        }
+      }
+    }
+  },
+  {
+    "input": "[]",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "no JSON object in the judge reply"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "value": []
+      }
+    }
+  },
+  {
+    "input": "null",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "no JSON object in the judge reply"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "value": null
+      }
+    }
+  },
+  {
+    "input": "\"scalar\"",
+    "results": {
+      "judge": {
+        "error": "JudgeError",
+        "message": "no JSON object in the judge reply"
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "value": "scalar"
+      }
+    }
+  },
+  {
+    "input": "{\"verdict\": \"invalid\"}",
+    "results": {
+      "judge": {
+        "value": {
+          "verdict": "invalid"
+        }
+      },
+      "plan": {
+        "value": null
+      },
+      "decision": {
+        "value": {
+          "verdict": "invalid"
+        }
+      }
+    }
+  }
+]

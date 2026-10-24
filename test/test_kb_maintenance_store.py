@@ -501,3 +501,12 @@ def test_high_impact_cold_unit_precedes_equal_age_low_impact_and_unstructured_pr
     assert prose["protected"] and prose["risk_score"] == 0
     assert high["risk_score"] > low["risk_score"] and "page_impact_high" in high["risk_reasons"]
     assert select_units([prose, low, high], {}, 1, "night", fair_fraction=0, now=100)[0]["unit_id"] == high["unit_id"]
+
+
+def test_recovery_cannot_create_missing_reservation_or_daily_policy(state):
+    ledger, store, _ = state
+    with pytest.raises(MaintenanceConflict, match='original cost reservation is missing'):
+        store.reserve_cost('missing', repo='demo', owner='owner', worst_cost_usd=2,
+                           require_existing=True)
+    assert ledger._conn.execute('SELECT COUNT(*) FROM maintenance_budget').fetchone()[0] == 0
+    assert ledger._conn.execute('SELECT COUNT(*) FROM maintenance_budget_policy').fetchone()[0] == 0

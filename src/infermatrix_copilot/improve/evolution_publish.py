@@ -132,9 +132,13 @@ def observe(settings, store, c):
         from .experiments import _adapter_kwargs
         adapter = load_adapter(decl.outcome_adapter, **_adapter_kwargs(settings, decl))
     values = {"before": {}, "after": {}}
+    unknown_cost_items = {'before': set(), 'after': set()}
     for side, group in sides.items():
         for u in group:
-            metrics = {"usd_review": unit_usd(u, settings)}
+            usd = unit_usd(u, settings)
+            metrics = {'usd_review': usd} if usd is not None else {}
+            if usd is None:
+                unknown_cost_items[side].add(u.item)
             if c.get("mechanism", "").startswith("L"):
                 metrics["target_defect"] = float(any(f.lint == c["mechanism"] for f in run_lints(u, store, Baseline(settings=settings))))
             if adapter:
@@ -143,6 +147,9 @@ def observe(settings, store, c):
                     metrics.update(scores_from([], [], adapter.review_scores(u, outcome)).values)
             for metric, value in metrics.items():
                 values[side].setdefault(metric, {}).setdefault(u.item, []).append(value)
+        for item in unknown_cost_items[side]:
+            values[side].get('usd_review', {}).pop(item, None)
+    report['unknown_cost_items'] = {side: sorted(items) for side, items in unknown_cost_items.items()}
     directions = {**(decl.evolution.get("guards", {}) if decl else {}), "target_defect": "lower"}
     if decl and decl.evolution.get("metric"): directions[decl.evolution["metric"]] = decl.evolution.get("direction", "higher")
     import statistics
@@ -155,7 +162,9 @@ def observe(settings, store, c):
         regressed = result.hi < 0 if direction == "higher" else result.lo > 0
         report["metrics"][metric] = {**asdict(result), "regressed": regressed}
         if regressed: regressions.append(metric)
-    report["state"] = "regressed" if regressions else "observed" if report["metrics"] else "waiting-for-matched-items-and-outcomes"
+    cost_pending = 'usd_review' in directions and any(unknown_cost_items.values())
+    report["state"] = "regressed" if regressions else "waiting-for-cost-evidence" if cost_pending \
+        else "observed" if report["metrics"] else "waiting-for-matched-items-and-outcomes"
     if regressions:
         report["rollback_recommendation"] = {"pr": c.get("pr"), "candidate": c["id"], "reason": regressions, "action": "Human review: revert this PR and restore the preceding configuration."}
     c["observation"] = report

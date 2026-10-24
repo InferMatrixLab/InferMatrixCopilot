@@ -28,8 +28,8 @@
 - **它用不了我们的工具桥 —— 这是实测事实，不是选择。** 捆绑的运行时编译进了 122 个
   插件，`@deepseek-ai/dsh-mcp-client` 不在其中（扫描可执行文件验证过）。因此会话跑在
   harness 原生的 `bash` + `str_replace_editor` 上，我们的 scoped 工具（含考古工具组）
-  **作为具名工具不可达**。每个拿到桥 spec 却无法履约的会话都会记一条
-  `review.mcp_tool_bridge` 的 `capability_gap`，结果里 `mcp_bridged=False`。
+  **作为具名工具不可达**。请求工具桥的会话在执行前拒绝；显式使用原生工具的
+  会话仍报告 `mcp_bridged=False`。
   **注册表不得为这个 provider 声明 `mcp_tools`**（在 2026-08-17 之前它声明了；
   没有任何分支读它，所以这条假声明只起到了误导读者的作用）。
 - **跑在原生 bash 上的 arm，绝不能被标成 "tools bridged"。** 本轮战役已经测到过三个
@@ -62,3 +62,16 @@ stdlib + `.base` + `.registry` + `..agent_loop` + `..llm` 的类型 + dsh SDK（
 
 ## 2026-09-30
 `complete()` 接受并忽略 `max_budget_usd`；`stops_at_spend` 为 False。
+
+## 2026-10-12
+
+SDK execution now runs in `providers.deepseek_worker` under the shared process
+supervisor. Its filtered parent environment, absolute deadline and process group
+cover SDK startup, the turn, and shutdown. The adapter no longer owns a Timer.
+The worker carries SDK configuration over stdin and separates SDK logs from its
+result protocol. Unknown completion failures propagate to shared accounting.
+
+Install the optional `infermatrix-copilot[deepseek]` extra for the composition
+API supported here (`deepseek-harness-sdk==0.1.0rc6`). SDKs lacking `cordis` or
+`session_root` fail before runtime construction. Constructor compatibility and
+offline lifecycle tests do not establish live model-quality parity.

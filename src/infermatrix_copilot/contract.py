@@ -40,7 +40,7 @@ from .direct_routing import (
     direct_review_plan,
 )
 from .run_trace import RunTrace
-from .sdk.v1.models import (
+from .contracts.models import (
     DIRECT_API_VERSION,
     KNOWLEDGE_API_VERSION,
     QUALITY_API_VERSION,
@@ -112,7 +112,7 @@ def capabilities(*, max_strict_workers: int = 1,
     # Compatibility shim: new consumers import ``infermatrix_copilot.sdk.v1``;
     # existing MCP and cross-repo callers keep receiving the legacy dict shape,
     # now with the distribution/SDK/resource identity added.
-    from .sdk.v1 import get_capabilities
+    from .review.direct import get_capabilities
 
     return get_capabilities(
         max_strict_workers=max_strict_workers,
@@ -255,6 +255,11 @@ def build_review_result(run_dir: Path | str) -> dict[str, Any]:
             "usd": cost.get("usd"), "minutes": cost.get("minutes"),
             "input_tokens": cost.get("input_tokens"),
             "output_tokens": cost.get("output_tokens"),
+            **{key: cost[key] for key in (
+                "source", "cost_partial", "usage_partial", "actual_usd", "actual_model_usd", "usd_is_estimate",
+                "unpriced_calls", "llm_calls", "input_tokens_include_cache",
+                "cache_read_tokens", "cache_creation_tokens", "legacy_usage_exceeds_records",
+                "record_read_error_count", "conflicting_calls", "usage_capture_incomplete") if key in cost},
         }
 
     # A stale head is the one outcome a caller must not have to infer from
@@ -263,8 +268,8 @@ def build_review_result(run_dir: Path | str) -> dict[str, Any]:
 
     reviewed_head = str(updates.get("pr_head_sha") or "")
     findings = build_findings(updates.get("review_comments"), reviewed_head)
-    from .sdk.v1.rechecks import checked_rechecks, validate_carried
-    from .sdk.v1.models import InvalidRequestError
+    from .review.rechecks import checked_rechecks, validate_carried
+    from .contracts.models import InvalidRequestError
     request = _read_json(run_dir / "request.json")
     params = request.get("params") or {}
     carried = (params.get("carried_findings") or []) if isinstance(params, dict) else []

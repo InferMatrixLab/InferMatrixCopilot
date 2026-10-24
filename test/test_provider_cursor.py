@@ -8,6 +8,8 @@ CLI would see."""
 import json
 import os
 import stat
+
+import pytest
 from pathlib import Path
 
 from infermatrix_copilot.config import Settings
@@ -138,6 +140,8 @@ def test_run_session_timeout_is_truncated_not_a_crash(tmp_path):
 
 def test_complete_flattens_messages_and_runs_in_scratch_cwd(tmp_path):
     transport = _transport(tmp_path)
+    (tmp_path / "bin" / "events.jsonl").write_text(json.dumps({
+        "type": "result", "result": "REVIEW", "usage": {"inputTokens": 10, "outputTokens": 5}}))
 
     reply = transport.complete(
         system="CLASSIFY", messages=[{"role": "user", "content": "review pr 5"}])
@@ -150,6 +154,9 @@ def test_complete_flattens_messages_and_runs_in_scratch_cwd(tmp_path):
     # one-shots run in an empty scratch dir, never in a repo
     assert "imc-cursor-oneshot-" in capture["cwd"]
     assert reply.usage["input_tokens"] == 10
+    assert "--force" not in capture["argv"] and "--approve-mcps" not in capture["argv"]
+    assert capture["argv"][capture["argv"].index("--mode") + 1] == "ask"
+    assert capture["argv"][capture["argv"].index("--workspace") + 1] == capture["cwd"]
 
 
 def test_audit_checks_paths_on_all_native_tools(tmp_path):
@@ -211,3 +218,64 @@ def test_audit_resolves_relative_paths_against_session_cwd(tmp_path):
     audit = audit_events(events, roots=(str(tmp_path),), cwd=str(tmp_path))
     assert [v for v in audit.violations if "pkg/mod.py" in v] == []
     assert any("/etc" in v for v in audit.violations)
+
+
+@pytest.mark.parametrize('event', [
+    {'type':'result','result':'plausible JSON','subtype':'error_max_turns','is_error':False},
+    {'type':'result','result':{'ok':True}},
+    {'type':'result','result':'plausible JSON','is_error':'false'},
+    {'type':'error','error':{}}, {'type':'turn.failed'},
+])
+@pytest.mark.parametrize('entry', ['completion','session','readonly'])
+def test_terminal_failure_classification_is_shared_across_all_callers(tmp_path,event,entry):
+    transport = _transport(tmp_path)
+    event = {**event,'model':'reported-model','usage':{'inputTokens':7,'outputTokens':3}}
+    (tmp_path/'bin/events.jsonl').write_text(json.dumps(event))
+    captured = []
+    with pytest.raises((RuntimeError,ValueError), match='failure|malformed'):
+        if entry=='readonly':
+            transport.readonly_events(json.dumps(event))
+        elif entry=='session':
+            req=_request(tmp_path,transport,with_bridge=False);req.native_event_sink=captured.append
+            transport.run_session(req)
+        else:
+            transport.complete(system='rules',messages=[{'role':'user','content':'evidence'}],native_event_sink=captured.append)
+    if entry!='readonly':
+        snapshot=transport.native_snapshot(captured)
+        assert snapshot['usage']['input_tokens']==7 and snapshot['usage']['output_tokens']==3
+        assert snapshot['served_model']=='reported-model'
+    assert len(transport.readonly_events(json.dumps(event),validate=False))==1
+
+
+def test_clean_exit_without_terminal_result_is_not_a_successful_completion(tmp_path):
+    transport = _transport(tmp_path)
+    (tmp_path/'bin/events.jsonl').write_text(json.dumps({'type':'system','model':'reported-model'}))
+    with pytest.raises(RuntimeError, match='successful terminal'):
+        transport.complete(system='rules',messages=[{'role':'user','content':'evidence'}])
+
+
+def test_nonzero_exit_with_success_shaped_output_is_rejected_after_usage_capture(tmp_path):
+    import subprocess
+    transport = _transport(tmp_path)
+    event={'type':'result','result':'{"ok":true}','usage':{'inputTokens':7,'outputTokens':3}}
+    transport.runner=lambda *args,**kwargs: subprocess.CompletedProcess(args[0],1,json.dumps(event),'launch failure')
+    captured=[]
+    with pytest.raises(RuntimeError,match='successful terminal'):
+        transport.complete(system='rules',messages=[{'role':'user','content':'evidence'}],native_event_sink=captured.append)
+    assert transport.native_snapshot(captured)['usage']['input_tokens']==7
+
+
+
+def test_malformed_model_metadata_remains_unknown_without_losing_usage():
+    events=[{'type':'result','result':'OK','model':{'name':'invented'},
+             'usage':{'inputTokens':7,'outputTokens':3}}]
+    decoded=CursorTransport.decode_event(events[0])
+    assert decoded.served_model is None and decoded.error is None
+    snapshot=CursorTransport.native_snapshot([{'type':'native.cursor.event','payload':events[0]}])
+    assert snapshot['served_model']=='' and snapshot['usage']['input_tokens']==7
+
+
+def test_readonly_json_requires_a_terminal_object_but_legacy_result_type_is_optional():
+    with pytest.raises(ValueError,match='malformed'):
+        CursorTransport.readonly_events('{"type":"system","result":"not a result"}')
+    assert CursorTransport.readonly_events('{"result":"legacy"}')==[{'result':'legacy'}]

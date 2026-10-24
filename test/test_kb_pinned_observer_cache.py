@@ -148,6 +148,21 @@ class PinnedObserverCacheTests(unittest.TestCase):
         with self.assertRaises(FactsError):
             fresh.file_text(self.new, "src/main.py")
 
+    def test_malformed_peer_does_not_hide_a_valid_lookup(self):
+        original = self.observer._git
+
+        def with_malformed_peer(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[:2] == ("ls-tree", "-z"):
+                result.stdout = b"unparsed-output\0" + result.stdout
+            return result
+
+        self.observer._git = with_malformed_peer
+        self.assertEqual(self.observer.file_text(self.new, "src/main.py"), "answer = 2\n")
+        before = len(self.calls)
+        self.assertEqual(self.observer.file_text(self.new, "src/main.py"), "answer = 2\n")
+        self.assertEqual(len(self.calls), before)
+
     def test_thirteen_threads_share_one_successful_source_read(self):
         barrier = Barrier(13)
         def read(_):

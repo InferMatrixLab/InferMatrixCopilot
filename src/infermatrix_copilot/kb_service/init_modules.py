@@ -414,12 +414,12 @@ class _Modules(_Stage):
                 cards.append(card)
         self._write(cards)
         after = module_coverage(modules, _owners(self.routes))
-        self.record.coverage = {
+        self._replace_coverage({
             "modules": {"before": round(before.ratio, 4), "after": round(after.ratio, 4), "total": len(modules)},
             "unrouted": after.uncovered,
             "cards": {c.module: c.page for c in cards},
             "routes_source": self.route_source,
-        }
+        })
         problems = routes_append_only(self.routes_before, self.routes)
         if problems:
             raise InitError("; ".join(problems))   # a bug in this stage, never a model outcome
@@ -584,8 +584,8 @@ class _Modules(_Stage):
             if not isinstance(data.get("headings", {}), dict):
                 raise ValueError("headings must be an object")
 
-        data = generate(self.rt, self.budget, self.lifecycle.init, system=system,
-                        prompt=_fence(payload), validate=validate).data
+        data = self._generate_data(system=system, prompt=_fence(payload), validate=validate,
+                                   unit=f"module:{key}")
         in_module = {entry["path"] for entry in listed} if self.rt.unlimited_subscription else set(files)
         doc_paths = {path for path, _ in self.docs}
 
@@ -636,7 +636,7 @@ class _Modules(_Stage):
             evidence = _implementation_payload(payload, self.source_index, self.record.pin, max_bytes=allowance)
             verdict = judge(self.rt, self.budget, self.lifecycle.init,
                             Block("prose", page, "", "prose", text_sha), base={}, head={page: text},
-                            evidence=[evidence])
+                            evidence=[evidence], record=self.record)
             label, dimensions, reasons, model = (classify_verdict(verdict), verdict.dimensions,
                                                  verdict.reasons, verdict.model)
         except (ValueError, BudgetExhausted, ModelUnavailable) as exc:

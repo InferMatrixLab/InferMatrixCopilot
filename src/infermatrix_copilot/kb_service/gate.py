@@ -15,12 +15,14 @@ import json
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
+from ..budgeting import native_outcome_unknown
 
 from ..knowledge_service.l1 import Block, Change, ChangesetResult, check_changeset
 from ..knowledge_service.lifecycle import LifecycleError, Page
 from .judge_tuning import (CONSISTENCY_SYSTEM, JUDGE_SYSTEM, NEIGHBOUR_LIMIT,
                            verdict_from_answers)
 from .models import ModelGateway, ModelRole, ModelUnavailable
+from .quality_review import QualityPolicy, QualityPolicyError, review_call
 
 VERDICTS = ("yes", "no", "unsure")
 # the L2 dimensions each block kind must answer "yes" on. Structural: the
@@ -43,10 +45,12 @@ class BlockVerdict:
     dimensions: dict[str, str] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
     model: str = ""
+    quality_receipt: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {**self.block.to_dict(), "verdict": self.verdict, "dimensions": self.dimensions,
-                "reasons": self.reasons, "model": self.model}
+                "reasons": self.reasons, "model": self.model,
+                **({"quality_receipt": self.quality_receipt} if self.quality_receipt else {})}
 
 
 @dataclass
@@ -107,8 +111,35 @@ def _neighbours(files: dict[str, str], path: str, rule_id: str,
     return out
 
 
+def validate_block_review(data: dict, block: Block) -> None:
+    dimensions = DIMENSIONS[block.op]
+    answers = data.get("dimensions")
+    if not isinstance(answers, dict):
+        raise ValueError("dimensions must be an object")
+    if data.get("reasons") is not None and not isinstance(data["reasons"], dict):
+        raise ValueError("reasons must be an object")
+    for name in dimensions:
+        if answers.get(name) not in VERDICTS:
+            raise ValueError(f"dimension {name} must be one of {VERDICTS}")
+
+
+def block_review_verdict(data: dict, block: Block) -> str:
+    validate_block_review(data, block)
+    return verdict_from_answers({name: data["dimensions"][name] for name in DIMENSIONS[block.op]})
+
+
+def block_review_result(reply, block: Block, judge: ModelRole) -> BlockVerdict:
+    dimensions = DIMENSIONS[block.op]
+    answers = {name: reply.data["dimensions"][name] for name in dimensions}
+    verdict = block_review_verdict(reply.data, block)
+    reasons = {k: str(v) for k, v in (reply.data.get("reasons") or {}).items() if k in dimensions}
+    return BlockVerdict(block, verdict, answers, reasons, reply.served_model or judge.label(),
+                        getattr(reply, "quality_receipt", {}))
+
+
 def judge_block(block: Block, *, base: dict[str, str], head: dict[str, str], evidence: list[dict],
-                gateway: ModelGateway, judge: ModelRole, evidence_for=None) -> BlockVerdict:
+                gateway: ModelGateway, judge: ModelRole, evidence_for=None, budget=None, charge_usd=None,
+                quality_policy=None) -> BlockVerdict:
     """``evidence_for(rule_text, evidence)`` narrows and expands the evidence for
     this one block (None: the change set's evidence as recorded)."""
     dimensions = DIMENSIONS[block.op]
@@ -123,27 +154,21 @@ def judge_block(block: Block, *, base: dict[str, str], head: dict[str, str], evi
         "evidence": evidence,
         "dimensions_to_answer": list(dimensions),
     }
-    prompt = "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace(
+    prompt = "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True).replace(
         "<", "\\u003c") + "\n</untrusted_data>\n"
 
-    def validate(data: dict) -> None:
-        answers = data.get("dimensions")
-        if not isinstance(answers, dict):
-            raise ValueError("dimensions must be an object")
-        if data.get("reasons") is not None and not isinstance(data["reasons"], dict):
-            raise ValueError("reasons must be an object")
-        for name in dimensions:
-            if answers.get(name) not in VERDICTS:
-                raise ValueError(f"dimension {name} must be one of {VERDICTS}")
-
     try:
-        reply = gateway.call_json(judge, system=JUDGE_SYSTEM, prompt=prompt, validate=validate)
+        reply = review_call(gateway, judge, policy=quality_policy or QualityPolicy("block"),
+                            system=JUDGE_SYSTEM, prompt=prompt, validate=lambda data: validate_block_review(data, block),
+                            budget=budget, charge_usd=charge_usd)
+    except QualityPolicyError:
+        raise
     except ModelUnavailable as exc:
-        return BlockVerdict(block, "human", reasons={"model": str(exc)}, model=judge.label())
-    answers = {name: reply.data["dimensions"][name] for name in dimensions}
-    verdict = verdict_from_answers(answers)
-    reasons = {k: str(v) for k, v in (reply.data.get("reasons") or {}).items() if k in dimensions}
-    return BlockVerdict(block, verdict, answers, reasons, reply.served_model or judge.label())
+        if native_outcome_unknown(exc):
+            raise  # Preserve the owning checkpoint's unresolved paid intent.
+        return BlockVerdict(block, "human", reasons={"model": str(exc)}, model=judge.label(),
+                            quality_receipt=getattr(exc, "quality_receipt", {}))
+    return block_review_result(reply, block, judge)
 
 
 def check_consistency(head: dict[str, str], owner_dirs: list[str], *, gateway: ModelGateway,
@@ -182,9 +207,12 @@ def check_consistency(head: dict[str, str], owner_dirs: list[str], *, gateway: M
                 raise ValueError("conflicts must be a list")
 
         try:
-            reply = gateway.call_json(judge, system=CONSISTENCY_SYSTEM, prompt=prompt, validate=validate)
+            reply = review_call(gateway, judge, policy=QualityPolicy("consistency"),
+                                system=CONSISTENCY_SYSTEM, prompt=prompt, validate=validate)
             verdict, conflicts = reply.data["verdict"], reply.data.get("conflicts") or []
         except ModelUnavailable as exc:
+            if native_outcome_unknown(exc):
+                raise  # Do not dispatch another owner review after a lost call.
             verdict, conflicts = "unsure", [["", "", str(exc)]]
         preexisting: list = []
         if verdict == "conflict" and changed is not None and conflicts:

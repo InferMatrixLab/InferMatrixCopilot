@@ -31,6 +31,13 @@
 
 ## 运维
 
+PR-history 抽取默认使用 `KB_INIT_HISTORY_PAYLOADS=omit`，不记录请求和回复。
+需要主机侧耐久执行归档时，可显式配置 `KB_INIT_HISTORY_PAYLOADS=retain-private`：
+原始请求和回复保留在运行记录中，不生成原始 PR 证据知识页。该选择由应用层处理，
+写入原批次身份和 trace；中途切换会阻止重抽取，恢复时须使用原选择。
+配置化 native 沙箱的耐久执行要求显式留存：`omit` 会在模型派发前返回 blocked，
+不会自动开启记录或启动替代运行。沙箱 profile 本身不代表留存授权。
+
 ```bash
 infermatrix-copilot kb keygen --out /etc/infermatrix-kb/service.pem   # 公钥交给发布器（KB_SERVICE_PUBKEY）
 export KB_SIGNING_KEY=/etc/infermatrix-kb/service.pem KB_STATE_DIR=/var/lib/infermatrix-kb
@@ -89,6 +96,28 @@ infermatrix-copilot kb rollback --to <sha>   # 回指到较早的快照（下一
 有人绕过门禁直接合并/推送知识变更时，服务立即暂停该仓库、停止激活新快照、告警，并开出撤回 PR（不自动合并）；
 合并精确的撤回 PR 并 `kb resume` 后恢复，被撤回的内容会作为新候选重新过门禁；也可以用 `kb accept-unknown <sha>` 让该提交本身完整通过门禁后保留它（通过才算处置，仍需 `kb resume`）。发版巡检在上游新 release 后运行
 T1/T2/T3 与 purge，每个规则页一个变更集，全部经过质量门。
+
+质量门已完成、但账本落盘失败时，可运行
+`infermatrix-copilot kb --state-dir STATE_DIR reconcile-review CHANGESET_ID`，
+根据原始 `gate-results/` 回执恢复该变更集。命令取得服务的单写租约，校验原始草稿、
+意图和仓库 generation；重复运行不会重复写入 verdict，也不会调用模型或发布 PR。
+服务仍持有租约时需要先正常停止服务。缺失结果、草稿变化、generation 变化、缺少恢复绑定的
+旧巡检/维护记录，以及未保存 companion 编辑内容的旧回执会保留待处理状态，不能据此重跑付费调用。
+新回执保存 companion 的完整编辑内容；恢复时，companion 记录和父变更集的等待状态在同一事务中落盘。
+该命令仍不发布 PR，后续由服务原有的发布流程处理。
+
+生成阶段若明确报告调用已发出但结果未知，intake 将源事件记录为 `draft_unknown`，
+不会在下次轮询自动重跑。`kb status` 的 `unresolved_draft_events` 列出这些事件和错误。
+硬中断可能发生在事件状态落盘之前；`unresolved_draft_checkpoints` 同时列出 intake、refine、
+sweep 共用生成检查点中保留的调用意图，包含原始 cursor、输入摘要、base SHA 和 generation。
+损坏的检查点标为 `invalid_checkpoint`，原始记录保留不动。查看状态不重跑生成，也不清除调用意图。
+它们还没有完整质量门回执，因此不能用 `reconcile-review` 处置，也不能把状态改回 pending
+来代替核对原始调用结果。
+
+foundation 初始化恢复时，若原始 worker 的完整结果已保存，而对应调用意图仍保留，
+服务先核验结果、输入绑定和 native 审批回执，再通过共用结算流程清除匹配意图。
+这不会重新调用模型，也不会重写已接受内容。不同 page、不同输入或仍标记结果未知的回执
+不能解除意图；缺少明确完成标记的旧记录同样保持待核对。
 
 初始化、增加 owner 目录、修改顶层入口或校验器时，负责人合并的 PR 可能包含普通自动规则门禁不接受的路径。
 `kb reconcile-reviewed` 是这种已合并历史的显式操作员接收流程：以服务密钥签名，先生成可检查的计划，再重新核验后写入不可变回执。
@@ -160,3 +189,96 @@ infermatrix-copilot kb traces --changeset <id>                      # 查询记�
 infermatrix-copilot kb replay --record <id> --model codex:gpt-6-mini:low   # 用便宜模型重放一次调用
 infermatrix-copilot kb export --out judge.jsonl                     # 导出数据集（自动剔除校准集相关调用）
 ```
+
+若进程在成功调用的 JSONL 记录落盘后、原生 archive 完成标记写入前退出，先停止该
+trace store 的所有写入者，再使用原始 attempt 和 trace ID 完成归档：
+
+```bash
+infermatrix-copilot kb --state-dir /path/to/kb recover-attempt \
+  --attempt <native-attempt-id> --record <trace-id> --offline-confirmed
+```
+
+该命令只从唯一匹配的原始成功记录恢复 archive，不调用模型，不新增调用记录，也不结算领域预算。
+重复执行保留原完成时间；缺失、失败、重复或内容不一致的记录会被拒绝。SQLite 索引修复和
+工作流 checkpoint／预算结算仍是独立步骤；此命令不会把未知结果变成成功结果。
+
+若原生调用明确已完成，但其输出校验失败，可在同一命令添加 `--outcome failed`，
+从原始失败 trace 结算 archive 为 `failed`。要求原记录明确声明已派发、已完成且非 pending，
+并保留原错误、回复及用量；重复执行不改变完成时间。默认仍只恢复成功记录。
+缺少这些事实的旧失败、传输未完成、超时、清理未决及冲突状态均拒绝，不能借此授权重试。
+
+init 调用的 trace 位于 `$KB_STATE_DIR/init/traces/`，因此补全其 archive 时将
+`recover-attempt` 的 `--state-dir` 指向 `$KB_STATE_DIR/init`。archive 完整后，停止
+该状态目录下的 init 和 trace 写入者，可对原始预算预留执行离线结算：
+
+```bash
+infermatrix-copilot kb --state-dir /path/to/kb reconcile-init-cost \
+  --repo demo --stage pr-history --record <trace-id> --offline-confirmed
+```
+
+结算要求唯一的成功原生 trace、完整且一致的 archive，以及匹配的预留 ID、金额和原始计费模式。
+实际费用模式保留已知超支，未知费用保留原保守金额；固定 judge 计费继续使用原约定额度。
+缺少原始计费模式的旧记录不会被推测补全。重复执行不重复计费，也不会调用模型。
+
+对于明确已完成但输出校验失败的原始调用，先用 `recover-attempt --outcome failed` 完成
+失败 archive，再对 `reconcile-init-cost` 添加 `--outcome failed`。两者共用终态事实检查；
+对账仍使用原预留绑定及领域计费策略。实际费用保留超支，未报告费用保留保守预留，固定费用
+保持原额度。此选项只结算费用，不批准失败回复、不完成质量 checkpoint，也不授权新调用。
+未完成／pending、缺事实、损坏或冲突的记录在账本写入前拒绝；默认仍只接受成功调用。
+discovery 新预算日志使用 `discovery-budget/2` 作为金额权威，init 记录只镜像总额；旧日志
+首次迁移仍保留原有的保守最大值规则。此命令不恢复质量审查结果，也不清除其待确认 checkpoint。
+
+PR-history 的 aggregate review 可单独恢复原生调用已完成、但结果 checkpoint 尚未落盘的情况：
+
+```bash
+infermatrix-copilot kb --state-dir /path/to/kb reconcile-init-review \
+  --repo demo --stage pr-history --record <trace-id> --offline-confirmed
+```
+
+该操作复用正常审查的结果校验与序列化，要求原运行时指纹、reviewer、策略版本、输入绑定和尝试编号一致。
+它先幂等结算原预留，再恢复绑定到原 head 的结果；`request_changes` 仍然是拒绝结果。
+不会重新调用模型或发布 PR。`--stage knowledge-deepen` 可恢复原 facet review checkpoint，
+复用 depth 的独立结果格式：Strict 要求完整有效的 facet packet，lightweight 保留独立有效的结果。
+恢复只保存原判断，后续 resume 仍执行该阶段的内容应用规则；它不会直接接受或发布知识页面。
+新 depth checkpoint 绑定原 reviewer、facet acceptance modes 和 validation kinds；缺少这些字段的旧调用不能猜测恢复。
+其他阶段仍需注册自己的结果策略，不会套用 aggregate 或 depth 的格式。
+缺少原包内容指纹的旧 trace 不能通过版本号猜测恢复策略。
+
+`reconcile-init-review` 也支持持久化在 init record 中的 `init-block` 判断（例如 modules
+和 advisory rule review）。该策略绑定原 block identity、reviewer 和输入摘要，并复用正常
+block judge 的 dimensions 校验与 verdict 转换；`unsure` 仍然需要人工处理。恢复后 normal
+resume 会复用该判断，不会重跑模型，也不会把 block 判断写成 aggregate PR review。
+Foundation 并行任务自己持有的 checkpoint 不在这个 record 适配器范围内。
+
+新的并行 foundation 任务会在原 dispatch checkpoint 中保存任务输入，并引用一份共享的
+原始渲染上下文（head、日期、tags、pin、模型角色、预算设置、owner 和 coverage policy）。
+所有 init 和 trace writer 停止后，可用原 `foundation_jobs.inflight` 中的 dispatch key 和 attempt：
+
+```bash
+infermatrix-copilot kb --state-dir /path/to/kb reconcile-foundation \
+  --repo REPO --dispatch ORIGINAL_DISPATCH_SHA256 --attempt ORIGINAL_ATTEMPT --offline-confirmed
+```
+
+此命令只读取保留的本地 upstream Git mirror，不 fetch、不调用模型、不发布内容。它检查完整
+native attempt 清单，用原始输入重放现有 worker，结算原 reservation，并在保存 task result 时
+清除原 intent。之后 normal resume 负责应用结果。重复执行不会创建新 reservation；中断后的
+未知结果仍保留，不能触发替代付费调用。旧任务缺少原始上下文、原 runtime 不匹配、归档不完整
+或本地 pin 不可读取时拒绝恢复，不会从当前配置猜测补齐。
+
+Feature discovery 的原始任务可通过同一个离线结算机制恢复：
+
+```bash
+infermatrix-copilot kb --state-dir /path/to/kb reconcile-discovery \
+  --repo REPO --dispatch ORIGINAL_DISPATCH_SHA256 --attempt ORIGINAL_ATTEMPT --offline-confirmed
+```
+
+使用保留的 index snapshot、原 task/context、native archives 和 discovery budget journal，
+重放 extraction、candidate review、boundary/consolidation audit 或 repair 的原验收规则。
+先幂等结算原 reservation，再将结果与 intent 的清除保存到同一个 init record checkpoint。
+无独立 reservation 的订阅生成仍不写入 judge USD 账本。其他任务的已完成结果保留；
+后续任务和整个 audit 的完成标记由正常 resume 推进，不在恢复命令内派发。
+
+此路径与 foundation 共用 account/result/intent 结算顺序。结算或落盘中断后可重跑相同命令，
+不会重新调用模型、创建 reservation 或发布内容。它不 fetch 源码、不重建缺失的 index，
+也不从当前配置补齐原上下文。原包内容指纹、输入、index pin/hash、native outcome 或账本
+不匹配时保留 pending。包含 failed/malformed native calls 的完整 correction replay 仍是独立验收项。

@@ -13,6 +13,7 @@ import threading
 from ...llm import parse_json_reply
 from ...scopes import ToolScope
 from ..step import FailureKind, StepContext, StepResult
+from .dispatch import TASK_STATUS_GUIDANCE
 
 _STATUS_TO_FAILURE = {
     "blocked": FailureKind.BLOCKED,
@@ -91,7 +92,8 @@ def _coerce_output(text: str, ctx: StepContext, contract: dict) -> dict | None:
                 "matching this contract exactly (fill unknowns with sensible "
                 "defaults, keep all substance — if the draft looks truncated, "
                 "close it into valid JSON rather than inventing content):\n"
-                + json.dumps(contract, ensure_ascii=False)),
+                + json.dumps(contract, ensure_ascii=False)
+                + "\n\n" + TASK_STATUS_GUIDANCE),
         messages=[{"role": "user", "content": draft}],
         max_tokens=max(16_000, ctx.settings.llm_max_tokens))
     obj = parse_json_reply(reply.text)

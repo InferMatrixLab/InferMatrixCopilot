@@ -1,0 +1,2295 @@
+{
+  "baselines": {
+    "copilot": "647e6e02b083e61801e1bccd20c30a1aa7f590ec",
+    "reviewbot": "1e70e98310f191dc7ea77ffa508eaa0093e5b0c6"
+  },
+  "capabilities": [
+    {
+      "capability": "neutral contracts",
+      "owner": [
+        "copilot:contracts/models.py"
+      ],
+      "callers": [
+        "copilot:sdk/v1/models.py",
+        "copilot:knowledge_service/validation.py"
+      ]
+    },
+    {
+      "capability": "application workflow execution",
+      "owner": [
+        "copilot:app/workflow_execution.py"
+      ],
+      "callers": [
+        "copilot:app/core.py",
+        "copilot:app/run_service.py",
+        "copilot:kb_service/init_execution.py"
+      ]
+    },
+    {
+      "capability": "provider registry and process execution",
+      "owner": [
+        "copilot:providers/registry.py",
+        "copilot:process_execution.py",
+        "copilot:process_tree.py"
+      ],
+      "callers": [
+        "copilot:providers/base.py",
+        "copilot:providers/zcode.py",
+        "copilot:providers/harness_llm.py",
+        "copilot:kb_service/models.py",
+        "copilot:knowledge_service/validation.py"
+      ],
+      "compatibility_exports": [
+        "copilot:providers/process.py",
+        "copilot:testing/process_tree.py"
+      ]
+    },
+    {
+      "capability": "native outcome uncertainty and error adaptation",
+      "owner": [
+        "copilot:budgeting.py"
+      ],
+      "callers": [
+        "copilot:providers/completion.py",
+        "copilot:kb_service/models.py",
+        "copilot:kb_service/runtime.py",
+        "copilot:kb_service/quality_review.py",
+        "copilot:kb_service/depth_judge.py",
+        "copilot:kb_service/gate.py",
+        "copilot:kb_service/intake.py",
+        "copilot:kb_service/init_knowledge_parallel.py",
+        "copilot:kb_service/init_feature_discovery.py",
+        "copilot:engine/steps/review/direct_run.py",
+        "copilot:engine/agent_runtime/ensemble.py"
+      ]
+    },
+    {
+      "capability": "durable review lifecycle",
+      "owner": [
+        "copilot:sdk/v1/strict.py",
+        "copilot:app/run_service.py"
+      ],
+      "callers": [
+        "reviewbot:strict_host.py",
+        "reviewbot:review/provider_run.py",
+        "reviewbot:remote_direct.py",
+        "reviewbot:remote_strict.py"
+      ]
+    },
+    {
+      "capability": "SDK host exchange",
+      "owner": [
+        "reviewbot:host_client.py"
+      ],
+      "callers": [
+        "reviewbot:strict_backend.py",
+        "reviewbot:review/provider_run.py"
+      ]
+    },
+    {
+      "capability": "knowledge rules and validation",
+      "owner": [
+        "copilot:knowledge_service/format.py",
+        "copilot:knowledge_service/validation.py"
+      ],
+      "callers": [
+        "copilot:knowledge_service/apply.py",
+        "copilot:knowledge_service/lifecycle.py",
+        "copilot:knowledge_service/ops.py"
+      ]
+    },
+    {
+      "capability": "knowledge curation",
+      "owner": [
+        "copilot:knowledge_service/curation.py",
+        "copilot:knowledge_service/drafting.py"
+      ],
+      "callers": [
+        "copilot:sdk/v1/knowledge.py",
+        "reviewbot:knowledge_distiller.py"
+      ]
+    },
+    {
+      "capability": "quality dispatch and checkpoint mechanism",
+      "owner": [
+        "copilot:kb_service/quality_review.py"
+      ],
+      "callers": [
+        "copilot:kb_service/gate.py",
+        "copilot:kb_service/init_support.py",
+        "copilot:kb_service/init_knowledge_parallel.py",
+        "copilot:kb_service/depth_judge.py",
+        "copilot:kb_service/init_feature_discovery.py",
+        "copilot:kb_service/init_history.py",
+        "copilot:kb_service/maintenance_audit.py"
+      ]
+    },
+    {
+      "capability": "evidence codecs and Git objects",
+      "owner": [
+        "copilot:knowledge_service/evidence.py",
+        "copilot:git_objects.py"
+      ],
+      "callers": [
+        "reviewbot:knowledge_evidence.py",
+        "copilot:kb_service/git_source.py"
+      ]
+    },
+    {
+      "capability": "diff and finding policy",
+      "owner": [
+        "copilot:review/diff.py",
+        "copilot:review/rechecks.py",
+        "copilot:review/dispositions.py",
+        "copilot:review/severity.py"
+      ],
+      "callers": [
+        "copilot:review/planner.py",
+        "reviewbot:review_result_parser.py",
+        "reviewbot:review/publication_projection.py",
+        "copilot:review/direct_prompt.py",
+        "copilot:engine/steps/review/prompts.py",
+        "copilot:engine/steps/review/refinement.py",
+        "copilot:review/result_decode.py",
+        "copilot:engine/steps/review/utils.py",
+        "copilot:improve/objectives.py"
+      ]
+    },
+    {
+      "capability": "publication eligibility",
+      "owner": [
+        "copilot:review/publication_policy.py"
+      ],
+      "callers": [
+        "copilot:engine/steps/pr/publish.py",
+        "reviewbot:publication.py"
+      ]
+    },
+    {
+      "capability": "GitHub delivery and business receipts",
+      "owner": [
+        "reviewbot:publication.py",
+        "reviewbot:ledger.py"
+      ],
+      "callers": [
+        "reviewbot:pipeline.py",
+        "reviewbot:remote_direct.py"
+      ]
+    },
+    {
+      "capability": "trusted completion profile selection and original execution binding",
+      "owner": [
+        "copilot:providers/completion_profiles.py",
+        "copilot:providers/completion.py",
+        "copilot:app/completion_execution.py",
+        "copilot:trace_store.py"
+      ],
+      "callers": [
+        "copilot:providers/harness_llm.py",
+        "copilot:kb_service/models.py",
+        "copilot:improve/judges.py",
+        "copilot:app/reservation.py",
+        "copilot:app/run_service.py",
+        "copilot:app/workflow_execution.py",
+        "copilot:kb_service/init_execution.py"
+      ],
+      "deleted_bodies": [
+        "copilot:kb_service/runtime.py:trace_recorder receipt body (delegates to NativeCompletionRecorder)",
+        "copilot:providers/container_execution.py:duplicate image constraint (delegates to validate_container_image)"
+      ],
+      "retained_policies": [
+        "prompt/conversation trace shapes",
+        "domain budget authority",
+        "Codex no-tools capability remains unsupported by default",
+        "subscription requires profile-native admission; USD remains unknown",
+        "legacy runs do not inherit new configured profiles"
+      ]
+    },
+    {
+      "capability": "original init task account/result/intent settlement",
+      "owner": [
+        "copilot:kb_service/init_recovery.py:_settle_task",
+        "copilot:kb_service/init_budget.py",
+        "copilot:kb_service/quality_review.py:DispatchJournal"
+      ],
+      "callers": [
+        "copilot:kb_service/init_recovery.py:reconcile_foundation",
+        "copilot:kb_service/init_recovery.py:reconcile_discovery",
+        "copilot:kb_service/cli.py"
+      ],
+      "deleted_bodies": [
+        "copilot:kb_service/init_recovery.py:reconcile_foundation inline account/result/intent sequence"
+      ],
+      "retained_policies": [
+        "foundation worker validation and later content application",
+        "discovery task acceptance and later follow-up scheduling",
+        "domain ledger authority and subscription admission",
+        "missing original outcomes remain pending"
+      ]
+    },
+    {
+      "capability": "retained discovery index snapshot lookup",
+      "owner": [
+        "copilot:kb_service/feature_discovery_index.py:load_index_snapshot"
+      ],
+      "callers": [
+        "copilot:kb_service/init_recovery.py:reconcile_discovery",
+        "copilot:kb_service/init_feature_discovery.py:_boundary_record_ready",
+        "copilot:kb_service/init_feature_discovery.py:_verify_consolidation_approval"
+      ],
+      "deleted_bodies": [
+        "copilot:kb_service/init_feature_discovery.py:_boundary_record_ready index scan",
+        "copilot:kb_service/init_feature_discovery.py:_verify_consolidation_approval index scan"
+      ],
+      "retained_policies": [
+        "publication skips unrelated invalid caches",
+        "recovery and native consolidation require retained immutable evidence",
+        "no source fetch or index rebuild on recovery"
+      ]
+    },
+    {
+      "capability": "native login snapshot and ephemeral worker delivery",
+      "owner": [
+        "copilot:providers/codex_credentials.py:login_snapshot",
+        "copilot:providers/worker_credentials.py",
+        "copilot:providers/container_execution.py",
+        "copilot:container_worker.py"
+      ],
+      "callers": [
+        "copilot:providers/completion_profiles.py",
+        "copilot:providers/completion.py"
+      ],
+      "deleted_bodies": [
+        "copilot:providers/container_execution.py:proxy-only socket identity body (delegates to _socket_identity)"
+      ],
+      "retained_policies": [
+        "host owns native OAuth refresh; refresh token never exported",
+        "trusted login UID and private file checks before dispatch",
+        "worker protocol 4 binds only credential hashes and socket identity",
+        "existing-result observation uses no live credentials and cannot redispatch",
+        "profile-native ChatGPT admission required; no quota or USD attestation"
+      ]
+    },
+    {
+      "capability": "credential text filtering and local Unix service lifecycle",
+      "owner": [
+        "copilot:redaction.py:redact",
+        "copilot:providers/network_relay.py:unix_service"
+      ],
+      "callers": [
+        "copilot:trace_store.py",
+        "copilot:container_worker.py",
+        "copilot:providers/network_relay.py:model_proxy",
+        "copilot:providers/worker_credentials.py:WorkerCredentials.serve"
+      ],
+      "deleted_bodies": [
+        "copilot:trace_store.py:secret pattern/value filtering body (compatibility imports delegate)"
+      ],
+      "retained_policies": [
+        "existing stored-text redaction behavior",
+        "credentialed worker filters both streams before logs and receipt hashing",
+        "line-buffered credential streams need broader partial-output/cancellation validation"
+      ]
+    },
+    {
+      "capability": "sandbox execution contract, registered backend and execution location",
+      "owner": [
+        "copilot:sandbox/base.py",
+        "copilot:sandbox/backends.py",
+        "copilot:sandbox/docker.py",
+        "copilot:sandbox/remote.py",
+        "copilot:sandbox_agent.py"
+      ],
+      "callers": [
+        "copilot:providers/registry.py",
+        "copilot:providers/codex.py",
+        "copilot:providers/completion_profiles.py"
+      ],
+      "deleted_bodies": [
+        "copilot:providers/container_execution.py:ContainerCompletionProfile.validate",
+        "copilot:providers/container_execution.py:ContainerCompletionProfile.execute",
+        "copilot:providers/container_execution.py:ContainerCompletionProfile.get_result",
+        "copilot:providers/codex.py:concrete ContainerCompletionProfile dependency",
+        "copilot:providers/registry.py:concrete ContainerCompletionProfile dependency"
+      ],
+      "retained_policies": [
+        "legacy flat Docker configuration and profile construction",
+        "same durable Docker lifecycle and worker receipts",
+        "credentials and mounts prepared on the execution host",
+        "Codex contained completion only; no new native tool-disabling/billing capability",
+        "unknown remote outcomes cannot authorize a second execution",
+        "release/location/backend/input binding and original-runtime retention"
+      ]
+    },
+    {
+      "capability": "persisted and wire process-outcome validation",
+      "owner": [
+        "copilot:process_execution.py:ProcessOutcome.from_dict"
+      ],
+      "callers": [
+        "copilot:providers/container_execution.py:ContainerExecution.get_result",
+        "copilot:sandbox/remote.py:RemoteSandboxExecution._outcome"
+      ],
+      "deleted_bodies": [
+        "copilot:providers/container_execution.py:inline persisted outcome shape checks",
+        "copilot:sandbox/remote.py:inline wire outcome shape checks"
+      ]
+    },
+    {
+      "capability": "sandbox native/control output projection and cancellation receipts",
+      "owner": [
+        "copilot:providers/container_protocol.py:decode_receipt",
+        "copilot:providers/container_protocol.py:NativeOutputLines",
+        "copilot:sandbox/base.py:CancellationReceipt",
+        "copilot:sandbox/base.py:FileCancellation",
+        "copilot:sandbox/base.py:CombinedCancellation"
+      ],
+      "callers": [
+        "copilot:providers/container_execution.py",
+        "copilot:sandbox/docker.py",
+        "copilot:sandbox/remote.py",
+        "copilot:sandbox_agent.py"
+      ],
+      "deleted_bodies": [
+        "copilot:sandbox_agent.py:FileCancellation class body",
+        "copilot:sandbox/docker.py:boolean cancellation return",
+        "copilot:sandbox/remote.py:untyped cancellation passthrough"
+      ],
+      "retained_policies": [
+        "native stdout/stderr and malformed control diagnostics remain evidence",
+        "termination is distinct from model completion and ledger settlement",
+        "legacy protocol-1 cancellation acknowledgment never proves termination",
+        "unknown cancellation/cleanup remains pending"
+      ]
+    },
+    {
+      "capability": "original sandbox reservation authority",
+      "owner": [
+        "copilot:sandbox/base.py:refuse_reserved"
+      ],
+      "callers": [
+        "copilot:providers/completion_profiles.py:DockerCompletionConfig.prepare",
+        "copilot:providers/container_execution.py:run_command",
+        "copilot:providers/container_execution.py:run",
+        "copilot:sandbox/docker.py:preflight",
+        "copilot:sandbox/docker.py:execute",
+        "copilot:sandbox/remote.py:preflight",
+        "copilot:sandbox/remote.py:execute"
+      ],
+      "deleted_bodies": [
+        "copilot:sandbox/docker.py:inline binding-existence check",
+        "copilot:sandbox/remote.py:inline binding-existence check",
+        "copilot:providers/container_execution.py:inline binding-existence check"
+      ],
+      "retained_policies": [
+        "existing or corrupt bindings precede invalid/cancelled replacement input",
+        "exclusive reservation races carry original unknown outcome",
+        "domain alone authorizes a new attempt"
+      ]
+    },
+    {
+      "capability": "profile-native subscription admission and execution context binding",
+      "owner": [
+        "copilot:providers/subscription_admission.py",
+        "copilot:sandbox/context.py",
+        "copilot:providers/base.py:HarnessTransport.auth_probe",
+        "copilot:providers/codex.py:subscription_auth_status"
+      ],
+      "callers": [
+        "copilot:kb_service/models.py:ModelGateway.subscription_billing",
+        "copilot:providers/completion_profiles.py:prepare_completion_transport",
+        "copilot:sandbox/docker.py",
+        "copilot:sandbox/remote.py",
+        "copilot:sandbox_agent.py",
+        "copilot:eval/single-capability-shadow/shared_execution.py:subscription_control"
+      ],
+      "deleted_bodies": [
+        "copilot:kb_service/models.py:configured-profile always-False branch",
+        "copilot:providers/codex.py:inline native ChatGPT status interpretation (delegates to subscription_auth_status)"
+      ],
+      "retained_policies": [
+        "host owns refresh; expired/unknown native identity never admits",
+        "authentication is a zero-model control operation, not a model_call",
+        "original admission binds configuration, store, artifact, release, source and snapshot hashes",
+        "changed or unavailable original context refuses dispatch without fallback",
+        "native tools remain controlled by existing containment policy",
+        "USD and provider quota remain unknown"
+      ],
+      "additional_verification": "native-stage-evaluation-20261015/evidence.json; legacy zero-model status delegates original canonical proof validation; model dispatch still requires fresh admission"
+    },
+    {
+      "capability": "authoritative model-call journal selection for original init recovery",
+      "owner": [
+        "copilot:trace_store.py:TraceStore.iter_records"
+      ],
+      "callers": [
+        "copilot:kb_service/init_replay.py:original_task_records",
+        "copilot:kb_service/init_recovery.py:_original_call",
+        "copilot:kb_service/init_recovery.py:_settle_task"
+      ],
+      "deleted_bodies": [
+        "untyped all-record readers at native outcome/accounting boundaries"
+      ],
+      "retained_policies": [
+        "all controls remain in authoritative JSONL",
+        "no derived-index repair during recovery",
+        "control records cannot supply native outcomes or duplicate reservation identities",
+        "unreadable journals and unfinished native archives still refuse recovery"
+      ]
+    },
+    {
+      "capability": "namespace worker and model-broker process lifecycle",
+      "owner": [
+        "copilot:process_execution.py:run_process",
+        "copilot:process_execution.py:ProcessInputChannel"
+      ],
+      "callers": [
+        "copilot:improve/isolation.py:probe",
+        "copilot:improve/isolation.py:Sandbox.run"
+      ],
+      "deleted_bodies": [
+        "copilot:improve/isolation.py:probe subprocess invocation",
+        "copilot:improve/isolation.py:Sandbox.run Popen/selector/output-reader/deadline/wait/kill loop"
+      ],
+      "retained_policies": [
+        "namespace mounts and source/dependency identity",
+        "broker model/token/call limits and domain governor",
+        "synchronous response delivery and overlap refusal",
+        "five-second post-result grace",
+        "rejected or known stopped broker cannot admit queued model requests",
+        "native namespace confinement requires a provisioned execution environment"
+      ]
+    },
+    {
+      "capability": "internal rebase without an external agent dependency",
+      "owner": [
+        "copilot:rebase_engine/runctx.py:CheckoutLock",
+        "copilot:engine/steps/rebase_v3.py",
+        "copilot:config.py:Settings"
+      ],
+      "callers": [
+        "copilot:engine/steps/rebase_knowledge.py:_knowledge_layer_paths"
+      ],
+      "deleted_bodies": [
+        "shipped adapter external knowledge/skills declarations",
+        "default external checkout discovery",
+        "external EXT1 guard discovery and 16 external-only cases",
+        "external parent-template checkout comparison"
+      ],
+      "retained_policies": [
+        "internal checkout exclusion and archival",
+        "bundled historical prompt/request goldens",
+        "explicit legacy data import paths for existing custom adapters",
+        "no external-agent execution or release acceptance gate"
+      ]
+    },
+    {
+      "capability": "test setup and test-process supervision",
+      "migration_status": "implemented; paired source/installed/native conformance recorded; three source environment skips retain raw status and exact-wheel coverage",
+      "owner": [
+        "copilot:process_execution.py:run_process",
+        "copilot:process_tree.py:OwnedProcessTree",
+        "copilot:process_tree.py:terminate_tree"
+      ],
+      "callers": [
+        "copilot:testing/runner.py:TestRunner._run_setup",
+        "copilot:testing/runner.py:TestRunner._spawn"
+      ],
+      "retained_policies": [
+        "GPU admission",
+        "watchdog decisions",
+        "log artifacts and test verdicts",
+        "detached descendants and recorded PID/start-time identity",
+        "self and foreign-process protection",
+        "primary timeout status 124; setup grace, descendant grace, coverage fallback and final semantic log scan"
+      ],
+      "evidence": "internal-rebase-process-cutover-20261014/source-core.xml and source-callers.xml",
+      "deleted_bodies": [
+        "independent setup Popen/wait/timeout/cleanup",
+        "independent test Popen/wait/timers/cleanup",
+        "shared termination duplication after detached-descendant/PID identity consolidation"
+      ],
+      "compatibility": [
+        "providers.process aliases neutral implementation module",
+        "testing.process_tree aliases neutral implementation module",
+        "TestRunner._terminate_tree delegates explicit legacy identities"
+      ]
+    },
+    {
+      "capability": "live rebase tool guidance",
+      "owner": [
+        "copilot:rebase_engine/prompt_builder.py:build_module_prompt"
+      ],
+      "callers": [
+        "copilot:rebase_engine/module_rebase.py:rebase_module"
+      ],
+      "deleted_bodies": [
+        "live retired memory CLI instructions",
+        "live retired kill_test_tree.sh instructions"
+      ],
+      "retained_policies": [
+        "historical parity templates and golden request bytes",
+        "plan-review gate and semantic acceptance rules",
+        "registered tool schemas and supervised test lifecycle"
+      ],
+      "migration_status": "implemented; paired source/installed/native conformance recorded; three source environment skips retain raw status and exact-wheel coverage"
+    },
+    {
+      "capability": "bounded shadow-unit and rebase command execution",
+      "owner": [
+        "copilot:process_execution.py:run_command",
+        "copilot:process_execution.py:run_process"
+      ],
+      "callers": [
+        "copilot:improve/experiments.py:default_run_unit",
+        "copilot:improve/experiments.py:meta_run_unit",
+        "copilot:rebase_engine/rebase_tools.py:build_rebase_tools",
+        "copilot:tools.py:_run_shell",
+        "copilot:tools.py:search_files",
+        "copilot:rebase_engine/wheel.py:_run"
+      ],
+      "deleted_bodies": [
+        "two shadow subprocess.run/result-formatting bodies",
+        "rebase shell/import subprocess.run bodies",
+        "rebase tool local subprocess wrapper body",
+        "generic tool shell/grep subprocess invocations",
+        "wheel install command invocation"
+      ],
+      "retained_policies": [
+        "shadow registration/admission/domain accounting and original execution identity",
+        "locale/text newline conversion, raw timeout bytes and nonzero exit codes",
+        "rebase tool schemas, environment, timeout messages and output tails",
+        "durable run-service worker lifetime remains an application policy; short Git/GitHub commands remain host I/O"
+      ],
+      "migration_status": "implemented; command-lifetime compatibility applied; terminal source callers, paired framework, installed SDK/main/callers/resources, native and post-test integrity pass",
+      "evidence": "background-command-policy-cutover-20261014/evidence.json",
+      "lifetime_policy": {
+        "command": "leader exit plus pipe EOF releases legacy background tasks; inherited pipes still have deadlines/cancellation",
+        "owned": "provider/test/external cleanup/broker cannot release ownership through command policy"
+      }
+    },
+    {
+      "capability": "literal/regex file search with explicit result bounds",
+      "owner": [
+        "copilot:tools.py:search_files"
+      ],
+      "callers": [
+        "copilot:tools.py:_grep",
+        "copilot:chat.py:ChatSession._dispatch_tool"
+      ],
+      "deleted_bodies": [
+        "chat repository grep command construction, error classification and no-match body"
+      ],
+      "retained_policies": [
+        "chat read jail and literal-only surface",
+        "tool regex opt-in, shared VCS/vendor exclusions and signal-failure classification",
+        "distinct output limit and disclosure labels; chat returns diagnostics while tool raises"
+      ],
+      "evidence": "auxiliary-process-cutover-20261014/source-callers.xml"
+    },
+    {
+      "capability": "frozen sandbox inputs and sealed configuration projection",
+      "owner": [
+        "copilot:sandbox/inputs.py"
+      ],
+      "callers": [
+        "copilot:sandbox/base.py",
+        "copilot:providers/container_execution.py",
+        "copilot:container_worker.py",
+        "copilot:sandbox/remote.py",
+        "copilot:sandbox_agent.py"
+      ],
+      "deleted_bodies": [],
+      "migration_kind": "new missing framework connection; no pre-existing duplicate input implementation",
+      "retained_policies": [
+        "default payloads and worker/agent protocols unchanged without inputs",
+        "credentials remain a separate private channel",
+        "input bytes and sealed scope bind original execution and read-only recovery",
+        "unsupported old remote agents fail before reservation",
+        "provider controls, model metadata and quality remain adapter/domain policies",
+        "single-file sealing preserves neighboring managed requirements",
+        "schema-1 readonly recovery keeps original whole-directory projection",
+        "worker/agent protocols retain old payloads and refuse unsupported new projections before native dispatch"
+      ],
+      "evidence": "sandbox-frozen-inputs-20261014"
+    },
+    {
+      "capability": "native Codex configuration-only control and original result decoding",
+      "owner": [
+        "copilot:providers/codex.py:configuration_probe",
+        "copilot:providers/codex.py:get_configuration_result",
+        "copilot:providers/codex.py:_configuration_control"
+      ],
+      "callers": [
+        "trusted host/app adapter control (paid preparation integration remains open)"
+      ],
+      "delegates": [
+        "copilot:providers/base.py:version_probe",
+        "copilot:process_execution.py:ProcessInputChannel/run_process",
+        "copilot:sandbox.base:SandboxCompletionProfile"
+      ],
+      "deleted_bodies": [],
+      "migration_kind": "new required native preflight connection; existing adapter and execution owners extended",
+      "retained_policies": [
+        "only initialize/config-read RPCs allowed",
+        "native version remains explicitly pinned",
+        "nullable native feature state remains unknown",
+        "config commands/credentials are not projected into proof",
+        "original control result can be read without native replay",
+        "global no-tools/account/model certification not enabled"
+      ],
+      "evidence": "native-policy-composition-20261014/fixed"
+    },
+    {
+      "capability": "trusted native completion policy compilation and original-bound dispatch",
+      "owner": [
+        "copilot:providers/codex_policy.py",
+        "copilot:providers/completion_profiles.py:prepare_completion_transport",
+        "copilot:providers/completion_profiles.py:restore_completion_transport"
+      ],
+      "callers": [
+        "copilot:providers/completion.py",
+        "copilot:providers/codex.py",
+        "copilot:providers/harness_llm.py",
+        "copilot:kb_service/models.py"
+      ],
+      "deleted_bodies": [
+        "copilot:providers/subscription_admission.py:inline location/profile selection",
+        "copilot:providers/completion_profiles.py:inline repeated location/profile selection",
+        "copilot:providers/codex.py:independent effort/version constants"
+      ],
+      "retained_policies": [
+        "complete original model catalog/order/priority/inference/instruction metadata",
+        "legacy absent-policy bytes and model paths",
+        "independent domain budgets and control/model trace kinds",
+        "readonly original recovery cannot dispatch",
+        "unverified nonempty requirements fail before model dispatch",
+        "no global native no-tools/account/quality certification"
+      ],
+      "evidence": "provider-policy-binding-20261014/requirements-fixed"
+    },
+    {
+      "capability": "Cursor terminal interpretation across completion, agent sessions and readonly JSON",
+      "owner": [
+        "copilot:providers/cursor.py:decode_event"
+      ],
+      "callers": [
+        "copilot:providers/cursor.py:_run",
+        "copilot:providers/cursor.py:readonly_events",
+        "copilot:providers/cursor.py:complete",
+        "copilot:providers/cursor.py:run_session"
+      ],
+      "deleted_bodies": [
+        "copilot:providers/cursor.py:complete independent is_error-only check",
+        "copilot:providers/cursor.py:readonly_events independent subtype/is_error check"
+      ],
+      "retained_policies": [
+        "known usage emitted before rejection",
+        "timeout/truncated partial stream contract",
+        "legacy optional result type",
+        "malformed model metadata remains unknown"
+      ],
+      "verification": "backend-conformance-20261015/evidence.json"
+    },
+    {
+      "capability": "Claude native authentication interpretation",
+      "owner": [
+        "copilot:providers/claude_code.py:auth_status_issue",
+        "copilot:providers/base.py:auth_probe",
+        "copilot:process_execution.py:run_process"
+      ],
+      "callers": [
+        "copilot:providers/descriptors.py:provider_readiness",
+        "copilot:providers/claude_code.py:auth_gap",
+        "copilot:kb_service/models.py:ModelGateway._transport"
+      ],
+      "deleted_bodies": [
+        "public/native missing-login skips replaced with delegation; no independent process loop added"
+      ],
+      "retained_policies": [
+        "readonly SDK keeps model auth environment",
+        "ordinary completion uses its original allowlist",
+        "authentication success does not establish subscription billing",
+        "domain quota and journals unchanged"
+      ],
+      "verification": "claude-auth-control-20261015/evidence.json; native 2.1.299 local/SSH controls with no model dispatch"
+    },
+    {
+      "capability": "reported native USD validity",
+      "owner": [
+        "copilot:budgeting.py:normalized_cost"
+      ],
+      "callers": [
+        "copilot:providers/base.py:SessionUsage.normalized_cost",
+        "copilot:providers/completion.py:complete_native",
+        "copilot:improve/budget.py:actual_usd",
+        "copilot:kb_service/init_recovery.py:_settle_cost"
+      ],
+      "deleted_bodies": [
+        "SessionUsage independent finite/nonnegative normalizer",
+        "completion permissive amount conversion",
+        "init recovery independent currency validity expression"
+      ],
+      "retained_policies": [
+        "live invalid amount remains unknown",
+        "invalid persisted recovery evidence rejects",
+        "original domain journals remain authoritative"
+      ],
+      "verification": "native-accounting-facts-20261015/profile-fixed/evidence.json; full source no failures/errors, original 3 environment skips with exact-wheel supplements; all installed groups pass"
+    },
+    {
+      "capability": "native trace receipt projection",
+      "owner": [
+        "copilot:providers/completion.py:native_capture_result"
+      ],
+      "callers": [
+        "completion configured durable recorder",
+        "completion ordinary capture",
+        "HarnessLLM",
+        "improve.judges"
+      ],
+      "deleted_bodies": [
+        "configured capture independent result-field dictionary"
+      ],
+      "retained_policies": [
+        "configured authoritative USD/subscription aliases",
+        "ordinary legacy account aliases",
+        "cost_usd/native_subscription cannot be overridden",
+        "judge-calls/v1 convention is not invoice or account proof"
+      ],
+      "verification": "native-accounting-facts-20261015/profile-fixed/owner-caller-outcome-matrix.json"
+    },
+    {
+      "capability": "improvement reported cost settlement",
+      "owner": [
+        "copilot:improve/budget.py:actual_usd",
+        "copilot:improve/budget.py:Governor"
+      ],
+      "callers": [
+        "governed API calls",
+        "Governor.settle_call",
+        "original settlement retry"
+      ],
+      "deleted_bodies": [],
+      "retained_policies": [
+        "known reported cost first, invalid reported cost unknown, missing field legacy token pricing",
+        "actual overspend journaled before refusal",
+        "harness dollar admission and planning-cost consumers remain follow-ups"
+      ],
+      "verification": "native-accounting-facts-20261015/profile-fixed/remaining-governance-policy.json"
+    },
+    {
+      "capability": "reported and normalized token pricing",
+      "owner": [
+        "copilot:budgeting.py:usage_cost",
+        "copilot:budgeting.py:usage_observation"
+      ],
+      "callers": [
+        "copilot:improve/budget.py:actual_usd",
+        "copilot:engine/agent_runtime/moa.py",
+        "copilot:tracing.py:set_usage",
+        "copilot:metrics.py:cost_from_spans"
+      ],
+      "deleted_bodies": [
+        "span independent token/cache price arithmetic",
+        "improvement reported-cost normalization branch"
+      ],
+      "retained_policies": [
+        "original domain accounts remain authoritative",
+        "legacy span codec delegates",
+        "new usage projection preserves unknowns and inclusive-cache identity"
+      ],
+      "verification": "planning-cost-cutover-20261015/span-fixed/evidence.json"
+    },
+    {
+      "capability": "planning unit costs and consumers",
+      "owner": [
+        "copilot:improve/budget.py:record_usd",
+        "copilot:improve/lints.py:unit_cost"
+      ],
+      "callers": [
+        "L11",
+        "cycle reports and baseline",
+        "experiments._planning_unit_usd",
+        "evolution preflight",
+        "production observation"
+      ],
+      "compatibility_exports": [
+        "lints.unit_usd delegates and returns None for unknown"
+      ],
+      "deleted_bodies": [
+        "unit_usd price loop and all-harness skip",
+        "independent planning fallback expressions"
+      ],
+      "retained_policies": [
+        "historical rows/sample prefix retained",
+        "separate new planning sample policy",
+        "partial costs cannot support complete cost guards",
+        "native dollar admission still belongs to domain governance"
+      ],
+      "verification": "planning-cost-cutover-20261015/span-fixed/owner-caller-deletion-matrix.json"
+    },
+    {
+      "capability": "execution account preparation lifetime",
+      "owner": [
+        "copilot:budgeting.py:CallBudgetFacts.prepare",
+        "copilot:budgeting.py:call_budget"
+      ],
+      "callers": [
+        "copilot:providers/completion.py:complete_native",
+        "copilot:providers/__init__.py:run_harness_session",
+        "domain acquire/prepare/finish hooks"
+      ],
+      "deleted_bodies": [],
+      "retained_policies": [
+        "no domain imports in kernel",
+        "original eager accounts retain callback facts shape",
+        "every acquired account finalized, native required prepare cannot be skipped or repeated"
+      ],
+      "verification": "native-budget-admission-20261015/evidence.json"
+    },
+    {
+      "capability": "native domain account admission",
+      "owner": [
+        "copilot:providers/base.py:native_budget_facts",
+        "copilot:improve/budget.py:governed",
+        "copilot:improve/budget.py:judge_governed"
+      ],
+      "callers": [
+        "completion",
+        "session",
+        "CLI judge",
+        "governed shadow child"
+      ],
+      "deleted_bodies": [
+        "unconditional non-api dollar skip",
+        "judge-local reserve/settle callbacks"
+      ],
+      "retained_policies": [
+        "provider projects execution facts, domain authorizes quota",
+        "original judge counts explicit and separate from invoice observations",
+        "native dollar account requires stop plus one-request overshoot; unsupported refuses before model",
+        "known smaller caller threshold retained, unknown cost keeps original reservation",
+        "original USD and judge journals remain authoritative"
+      ],
+      "verification": "native-budget-admission-20261015/owner-caller-deletion-matrix.json",
+      "remaining": [
+        "full backend/account/native-stop support",
+        "deferred reservation-to-attempt crash reconciliation"
+      ]
+    },
+    {
+      "capability": "original native USD binding and reconciliation",
+      "owner": [
+        "copilot:improve/budget.py:Governor.reserve_amount",
+        "copilot:improve/budget.py:Governor.reconcile_native",
+        "copilot:trace_store.py:validate_native_attempt",
+        "copilot:providers/completion.py:_captured_native_recorder"
+      ],
+      "callers": [
+        "native dollar preparation",
+        "configured/account-required durable capture",
+        "improve budget --reconcile-native",
+        "original archive repair"
+      ],
+      "deleted_bodies": [
+        "configured independent capture closure"
+      ],
+      "retained_policies": [
+        "old archive validation success-only default",
+        "explicit failed-terminal accounting cannot make a successful review",
+        "original account/trace/attempt authority and missing/pending identities retained",
+        "USD bindings atomic, original settlements idempotent; no dispatch/index repair in reconciliation"
+      ],
+      "verification": "native-budget-reconciliation-20261015/evidence.json",
+      "remaining": [
+        "full all-workflow/host/backend/account recovery matrix"
+      ]
+    },
+    {
+      "capability": "original judge count binding and reconciliation",
+      "owner": [
+        "copilot:improve/budget.py:judge_governed",
+        "copilot:improve/budget.py:Governor count journal",
+        "copilot:improve/budget.py:Governor._native_outcome",
+        "copilot:trace_store.py:validate_native_attempt"
+      ],
+      "callers": [
+        "CLI judge",
+        "improve budget --reconcile-judge",
+        "original native USD reconciliation"
+      ],
+      "deleted_bodies": [
+        "USD-only inline original-outcome validator (moved to shared helper)",
+        "unconditional bound-count settlement on unknown outcomes"
+      ],
+      "retained_policies": [
+        "eager original count reservation, legacy token strings and anonymous counters",
+        "known terminal failures count once; native currency facts separate",
+        "pending/incomplete/ambiguous/unsupported/changed outcomes cannot authorize replacement",
+        "recovery only under original account and canonical pause/lock; no model or index repair"
+      ],
+      "verification": "judge-budget-reconciliation-20261015/evidence.json",
+      "remaining": [
+        "full all-workflow/host/backend/account recovery matrix",
+        "real native parity, frozen quality and final release/retention"
+      ]
+    },
+    {
+      "capability": "readonly preparation and adapter-owned native completion/usage",
+      "owner": [
+        "copilot:providers/json_session.py:_readonly_budget",
+        "copilot:providers/base.py:validate_readonly_completion",
+        "copilot:providers/codex.py:_require_completed / readonly_usage"
+      ],
+      "callers": [
+        "readonly streaming/buffered/format repair",
+        "native completion/session",
+        "eval codex_guard"
+      ],
+      "deleted_bodies": [
+        "duplicated readonly account request/cleanup",
+        "JSON caller failure scan",
+        "eval private JSONL/terminal and raw-only accounting interpretation"
+      ],
+      "retained_policies": [
+        "wire/raw metadata compatibility",
+        "domain quota/journal authority",
+        "old native receipts replay unchanged and unresolved identities stay pending",
+        "completion-only admission cannot authorize agent host execution"
+      ],
+      "verification": "readonly-budget-preparation-20261015/evidence.json",
+      "remaining": [
+        "full native backend/account/recovery and final acceptance"
+      ]
+    },
+    {
+      "capability": "readonly Direct sandbox application connection",
+      "owner": [
+        "copilot:providers/readonly_execution.py",
+        "copilot:providers/completion.py",
+        "copilot:providers/codex.py:_run",
+        "copilot:sandbox/inputs.py",
+        "copilot:process_execution.py"
+      ],
+      "callers": [
+        "public SDK readonly entry",
+        "durable Direct application model step",
+        "local Docker worker",
+        "SSH agent and same backend"
+      ],
+      "deleted_bodies": [
+        "old contained provider executor wrapper path; dispatch now consumes the same bound controls and inputs"
+      ],
+      "retained_policies": [
+        "host profiles remain compatible",
+        "separate domain budget/receipt authority",
+        "legacy envelope hashes and projections preserved",
+        "no new attempt for changed/pending original outcome"
+      ],
+      "verification": "readonly-sandbox-cutover-20261015/evidence.json",
+      "remaining": [
+        "preparation exhaustion category and final capability negotiation",
+        "full native/account/recovery/quality/final release acceptance"
+      ]
+    },
+    {
+      "capability": "native call/account/capture boundary",
+      "owner": "providers/completion.py:complete_native",
+      "callers": [
+        "providers/__init__.py:run_harness_session",
+        "providers/harness_llm.py",
+        "providers/readonly_execution.py",
+        "providers/session_execution.py",
+        "kb_service/models.py",
+        "improve/judges.py"
+      ],
+      "deleted_bodies": [
+        "providers/__init__.py:run_harness_session independent call_budget/observe/capture loop"
+      ],
+      "retained_policies": [
+        "typed AgentOutcome",
+        "session refusal/truncation semantics",
+        "unknown native usage",
+        "independent domain journals"
+      ],
+      "verification": "agent-session-sandbox-20261015/evidence.json; agent-session-framework-final-20261015/result.json"
+    },
+    {
+      "capability": "original native intent/result coordination",
+      "owner": "providers/original_execution.py:run_original_native",
+      "callers": [
+        "providers/readonly_execution.py",
+        "providers/session_execution.py"
+      ],
+      "deleted_bodies": [
+        "providers/readonly_execution.py independent lock/intent/attempt/result loop"
+      ],
+      "retained_policies": [
+        "readonly schema/verdict policy",
+        "agent scope and typed result policy",
+        "legacy readonly intent/result bytes"
+      ],
+      "verification": "agent-session-sandbox-20261015/evidence.json; agent-session-framework-final-20261015/result.json"
+    },
+    {
+      "capability": "frozen scoped bridge preparation/readiness",
+      "owner": [
+        "providers/session_inputs.py",
+        "tool_bridge.py",
+        "sandbox/inputs.py"
+      ],
+      "callers": [
+        "providers/session_execution.py",
+        "providers/completion_profiles.py",
+        "providers/codex.py"
+      ],
+      "deleted_bodies": [],
+      "retained_policies": [
+        "read-only scope",
+        "writable/rebase profiles fail before model dispatch",
+        "same local/SSH backend/worker",
+        "completion admission does not waive session accounts"
+      ],
+      "verification": "agent-session-sandbox-20261015/evidence.json; agent-session-framework-final-20261015/result.json"
+    },
+    {
+      "capability": "shared raw native exchange and translating evaluation hosts",
+      "owner": [
+        "copilot:providers/hosted_execution.py",
+        "copilot:providers/native_result.py",
+        "copilot:trace_store.py:native_process_fields",
+        "copilot:providers/codex.py:process_receipt"
+      ],
+      "callers": [
+        "copilot:eval/single-capability-shadow/codex_guard.py",
+        "copilot:eval/single-capability-shadow/shared_execution.py",
+        "copilot:eval/single-capability-shadow/run_paired.py"
+      ],
+      "deleted_bodies": [
+        "eval guard vendor process dispatch",
+        "eval guard native terminal/usage interpretation",
+        "coordinator subprocess.run lifecycle",
+        "coordinator independent native failure event scan"
+      ],
+      "retained_policies": [
+        "independent evaluation quota ledger",
+        "legacy completed receipts read-only",
+        "unknown originals cannot dispatch",
+        "domain schema judgment",
+        "native last-message whitespace"
+      ],
+      "verification": "shadow-shared-execution-20261015/evidence.json",
+      "remaining": [
+        "frozen quality comparison",
+        "full native/account/recovery and final acceptance"
+      ]
+    },
+    {
+      "capability": "installed shadow arm application composition",
+      "owner": [
+        "eval/single-capability-shadow/arm_runtime.py",
+        "eval/single-capability-shadow/arm_entry.py",
+        "copilot:providers/registry.py:bind_transport_policy",
+        "copilot:providers/base.py:execution_effort",
+        "copilot:app/completion_execution.py"
+      ],
+      "callers": [
+        "block_arm",
+        "depth_arm",
+        "strict_depth_arm",
+        "discovery_arm",
+        "foundation_arm",
+        "history_arm",
+        "modules_arm",
+        "screening_arm",
+        "maintenance_arm",
+        "completion driver",
+        "strict_arm",
+        "strict_review_case_arm",
+        "foundation_native_arm",
+        "init_native_arm",
+        "screening_native_arm"
+      ],
+      "deleted_bodies": [
+        "nine drivers direct ModelGateway / CodexTransport factory construction",
+        "installed verifier arm subprocess.run invocation",
+        "two Strict drivers independent SDK construction paths; both delegate sdk_runtime"
+      ],
+      "retained_policies": [
+        "old installed packages use translating CLI",
+        "evaluation quota ledger keeps authority",
+        "domain judgment and repair loops stay in application workflows",
+        "separate host/native deadlines",
+        "exact external SDK schema resource permissions",
+        "raw packet identities separate from serialization-equivalent input comparison"
+      ],
+      "verification": "strict-sdk-profile-cutover-20261015/evidence.json",
+      "production_delta": {
+        "files": 8,
+        "net_lines": 73,
+        "ast_nodes": 396
+      },
+      "additional_verification": "native-screening-stage-20261015/evidence.json; shared foundation/screening composition, local native complete-stage parity; SSH screening remains blocked with original result retrieved read-only",
+      "recorder_authority": "Recorder.store delegates the caller durable store so admission and native archival authority coincide"
+    },
+    {
+      "capability": "original native worker identity and environment projection",
+      "owner": [
+        "copilot:app/completion_execution.py:_backend_settings",
+        "copilot:app/completion_execution.py:backend_environment",
+        "copilot:app/completion_execution.py:completion_settings_for_run"
+      ],
+      "callers": [
+        "reservation",
+        "WorkflowExecution",
+        "RunService durable child"
+      ],
+      "deleted_bodies": [
+        "conditional host-only STRICT_BACKEND handoff; worker native settings now delegate one original-policy projection"
+      ],
+      "retained_policies": [
+        "existing v1/v2/v3 pin bytes and uncaptured field semantics",
+        "credential values are not persisted",
+        "original profile/location/effort and at-most-once execution remain authoritative"
+      ],
+      "verification": "reserved-native-identity-20261015/evidence.json",
+      "status": "source regressions, real settings child, installed local/SSH full worker and installed conformance verified; historical full paired source results are terminal; final full paired acceptance remains open"
+    },
+    {
+      "capability": "authoritative session usage projection",
+      "owner": [
+        "copilot:providers/completion.py:complete_native"
+      ],
+      "callers": [
+        "harness sessions",
+        "session Reply",
+        "native capture",
+        "domain account settlement"
+      ],
+      "deleted_bodies": [
+        "Reply usage fallback from legacy numeric display counters"
+      ],
+      "retained_policies": [
+        "legacy display counters unchanged",
+        "unknown stays absent",
+        "native event recovery via canonical adapter snapshot",
+        "reported zero stays zero",
+        "domain cost/refund policies unchanged"
+      ],
+      "verification": "session-usage-projection-20261015/evidence.json",
+      "status": "focused source, paired framework, isolated installed conformance and installed before/after probe pass; historical full paired source results are terminal; final full paired acceptance remains open"
+    },
+    {
+      "capability": "native init evaluation composition",
+      "owner": [
+        "copilot:eval/single-capability-shadow/init_native_arm.py"
+      ],
+      "callers": [
+        "foundation_native_arm.py",
+        "screening_native_arm.py",
+        "history_native_arm.py",
+        "history_arm.py",
+        "modules_arm.py",
+        "foundation_arm.py",
+        "screening_arm.py",
+        "discovery_native_arm.py"
+      ],
+      "policy_owner": "Original installed application stages retain schemas, acceptance, recovery and publication policy; evaluation-only retention delegates canonical native execution",
+      "preserved_module_policy": "scripted zcode generation and independent native Codex judgments; no native generation claim or provider substitution",
+      "fixture_policy_owner": "init_fixture_policies.py; fixture output/routing/auth translation only; execution/capture/recovery in init_native_arm",
+      "evidence": [
+        "shared-init-legacy-entries-20261015/evidence.json",
+        "native-discovery-stage-20261015/evidence.json"
+      ],
+      "discovery_scope": "full capped stage: native fixture scan/generation, independent role identities, primary/boundary/consolidation judgment, catalog preparation and no-dispatch resume; real quality remains unverified"
+    },
+    {
+      "capability": "production history payload selection",
+      "owner": [
+        "copilot:kb_service/init_history.py"
+      ],
+      "callers": [
+        "knowledge.init application workflow",
+        "CLI kb init pr-history",
+        "SDK/host InitRuntime composition",
+        "eval:init_native_arm history adapter"
+      ],
+      "boundaries": "trusted host choice only; profiles and PR evidence do not authorize retention; current gateway cannot rewrite omission",
+      "compatibility": "default omit preserves prior fields/fingerprint; explicit retain-private binds original batch and capture; old SDKs retain frozen-plan translation only",
+      "verification": "production-history-payload-policy-20261015/evidence.json"
+    },
+    {
+      "capability": "original-bound sandbox result retrieval",
+      "owner": [
+        "copilot:sandbox/base.py:SandboxExecution.read_result",
+        "copilot:providers/container_execution.py:ContainerExecution.get_original_command_result",
+        "copilot:sandbox/remote.py:RemoteSandboxExecution._result"
+      ],
+      "callers": [
+        "copilot:sandbox/base.py:SandboxCompletionProfile.read_result",
+        "copilot:sandbox/docker.py:DockerSandboxExecution.read_result",
+        "copilot:sandbox/remote.py:RemoteSandboxExecution.result/read_result",
+        "copilot:sandbox_agent.py:perform result operation via request-matching compatibility reader",
+        "copilot:providers/container_execution.py:ContainerExecution.get_command_result"
+      ],
+      "deleted_bodies": [
+        "ContainerExecution.get_command_result inline outcome retrieval/decoding moved to get_original_command_result; compatibility method delegates",
+        "RemoteSandboxExecution.result inline cache/reconciliation moved to _result; both entry points delegate"
+      ],
+      "retained_policies": [
+        "existing caller request matching remains in result/get_command_result wrappers",
+        "original location/backend/release/image and worker receipt validation",
+        "unknown results cannot dispatch",
+        "legacy backends without original-bound retrieval refuse; no implicit fallback",
+        "server request-to-worker digest matching remains mandatory; no independent result recovery body retained"
+      ],
+      "verification": "original-sandbox-result-20261015/evidence.json",
+      "remaining": "raw archives and remote bindings are retained; durable execution requires explicit host retention under the accepted contract"
+    },
+    {
+      "capability": "standard durable worker composition",
+      "owner": [
+        "copilot:app/run_service.py",
+        "copilot:sdk/v1/strict.py",
+        "eval/single-capability-shadow/arm_runtime.py",
+        "eval/single-capability-shadow/durable_worker.py"
+      ],
+      "callers": [
+        "eval/single-capability-shadow/strict_arm.py",
+        "eval/single-capability-shadow/strict_review_case_arm.py"
+      ],
+      "deleted_bodies": [
+        "both maintained Strict drivers: _core._q.put replacement and private in-process execute_strict_reserved call",
+        "strict_review_case_arm.py: inline frozen forge body moved to strict_host.py"
+      ],
+      "retained_policies": [
+        "standard queue/process/CLI/workflow owns execution; trusted evaluation startup binds its existing domain ledger",
+        "immutable worker-launch command; worker PID differs from SDK host",
+        "agent-step/1 binds stable logical agent identity to repairs; same intent cannot replace an original attempt",
+        "unknown native outcomes remain unresolved; no fallback dispatch"
+      ],
+      "verification": "durable-evaluation-worker-20261015/evidence.json; isolated installed, full standard Docker local/SSH and paired main/boundary conformance pass"
+    },
+    {
+      "capability": "frozen per-role evaluation model identity",
+      "owner": [
+        "copilot:eval/single-capability-shadow/role_profiles.py"
+      ],
+      "callers": [
+        "arm_runtime.py:ArmRuntime.acquire",
+        "codex_guard.py:dispatch",
+        "shared_execution.py:execute_shared",
+        "init_native_arm.py:frozen_roles"
+      ],
+      "deleted_bodies": [
+        "unconditional single-model selection in original/current evaluation adapters"
+      ],
+      "retained_policies": [
+        "existing single-model plans keep their original path",
+        "canonical provider owns capability/effort validation; discovery domain alone owns independent-family policy",
+        "native role selection never mutates the original evaluation plan or ledger authority",
+        "role codec and shared implementations must be hash-bound before dispatch"
+      ],
+      "supported_scope": "Codex native profiles with distinct frozen model roles; mixed-provider ZCode/Codex composition remains open",
+      "evidence": [
+        "native-discovery-stage-20261015/evidence.json"
+      ]
+    },
+    {
+      "capability": "generic sandbox completion worker",
+      "owner": [
+        "copilot:providers/completion_worker.py"
+      ],
+      "callers": [
+        "copilot:providers/zcode.py:complete",
+        "copilot:providers/registry.py",
+        "copilot:providers/completion_profiles.py"
+      ],
+      "delegates": [
+        "canonical adapter.complete once; native CLI command/spool/tool/event rules remain in the adapter",
+        "sandbox.SandboxExecution; backend independent from local/SSH location",
+        "complete_native accounting/native archive hooks"
+      ],
+      "evidence": [
+        "zcode-sandbox-completion-20261015/evidence.json"
+      ]
+    },
+    {
+      "capability": "native executable identity control",
+      "owner": [
+        "copilot:providers/native_identity.py",
+        "copilot:providers/base.py:identity_probe"
+      ],
+      "callers": [
+        "copilot:providers/codex.py legacy --identity-probe delegation",
+        "copilot:providers/zcode.py inherited control",
+        "eval:arm_runtime.py:transport",
+        "eval:shared_execution.py:prepared_transport"
+      ],
+      "evidence": [
+        "mixed-provider-composition-20261015/evidence.json"
+      ]
+    },
+    {
+      "capability": "trusted provider-option binding",
+      "owner": [
+        "copilot:providers/provider_options.py"
+      ],
+      "callers": [
+        "copilot:providers/registry.py",
+        "copilot:providers/completion_profiles.py:prepare_completion_transport",
+        "copilot:providers/completion_worker.py",
+        "eval:shared_execution.py"
+      ],
+      "evidence": [
+        "provider-option-binding-20261015/evidence.json"
+      ]
+    },
+    {
+      "capability": "provider-native credential source",
+      "owner": [
+        "copilot:providers/credential_sources.py",
+        "copilot:providers/codex_credentials.py",
+        "copilot:providers/zcode_credentials.py"
+      ],
+      "callers": [
+        "copilot:providers/completion_profiles.py",
+        "copilot:sandbox/base.py",
+        "copilot:sandbox/docker.py",
+        "copilot:providers/subscription_admission.py"
+      ],
+      "deleted_bodies": [
+        "Codex independent private login file reader"
+      ],
+      "evidence": [
+        "native-credential-source-20261015/evidence.json"
+      ]
+    },
+    {
+      "capability": "structured schema serialization and native wire projection",
+      "owner": [
+        "copilot:providers/schema_projection.py"
+      ],
+      "callers": [
+        "copilot:providers/readonly_execution.py",
+        "copilot:providers/codex.py",
+        "copilot:providers/json_session.py"
+      ],
+      "deleted_bodies": [
+        "Readonly workflow inline schema-file construction",
+        "Codex inline schema-file construction",
+        "Host JSON-session independent schema serialization"
+      ],
+      "compatibility": "Original intent serialization and result validation remain unchanged; only equivalent native regex representation is encoded."
+    },
+    {
+      "capability": "knowledge initialization role admission",
+      "owner": [
+        "copilot:kb_service/init_role_policy.py"
+      ],
+      "callers": [
+        "copilot:kb_service/init_stages.py",
+        "copilot:sdk.v1.knowledge_init_role_error",
+        "evaluation:quality_plan via actual init_native_arm options"
+      ],
+      "deleted_bodies": [
+        "Inline Discovery model-family comparison",
+        "Inline unlimited fallback and fixed-provider/model-pair validation"
+      ],
+      "compatibility": "Original refusal text and Discovery/unlimited constraints remain; no same-family waiver or vendor substitution. Accounts and availability remain execution checks."
+    },
+    {
+      "capability": "preview filesystem reads and original receipt validation",
+      "owner": [
+        "copilot:kb_service/preview.py"
+      ],
+      "callers": [
+        "copilot:kb_service/init_stages.py:_dry_run_files",
+        "copilot:kb_service/init_stages.py:_preview_files",
+        "copilot:kb_service/init_execution.py:prepare",
+        "copilot:kb_service/portable_init.py:stage_receipt",
+        "copilot:kb_service/portable_init.py:accept_stage",
+        "copilot:kb_service/init_history.py"
+      ],
+      "retained_policies": [
+        "checked output for cache/acceptance/publication",
+        "untrusted owner-edited inputs only for new nonportable dry runs",
+        "legacy Discovery persisted-hash translation; no receipt backfill"
+      ]
+    },
+    {
+      "capability": "Foundation generation guidance and evidence-protocol selection",
+      "owner": [
+        "copilot:kb_service/init_knowledge_inputs.py"
+      ],
+      "callers": [
+        "copilot:kb_service/init_knowledge.py owner/feature request construction",
+        "copilot:kb_service/init_knowledge.py:_judge_evidence",
+        "copilot:kb_service/init_knowledge_parallel.py:_worker",
+        "copilot:kb_service/init_knowledge_parallel.py:_validate_result",
+        "copilot:kb_service/init_knowledge_parallel.py:_verify_native"
+      ],
+      "retained_policies": [
+        "exact historical v3/v4/v5 systems",
+        "cited-only versus full-packet evidence unchanged",
+        "depth has separate generation/acceptance policy",
+        "unknown outcomes require original reconciliation"
+      ]
+    },
+    {
+      "capability": "initialization generation checkpoint and workflow-policy binding",
+      "owner": [
+        "copilot:kb_service/init_generation.py:generate_data"
+      ],
+      "callers": [
+        "copilot:kb_service/init_stages.py:_Stage._generate_data",
+        "copilot:kb_service/init_stages.py:_Skeleton._map_call",
+        "copilot:kb_service/init_stages.py:_Stage._rules_call",
+        "copilot:kb_service/init_modules.py:_Modules._card",
+        "copilot:kb_service/init_history.py:_PrHistory._extract_one"
+      ],
+      "delegates": [
+        "quality_review.checkpoint_review owns dispatch/result/unknown mechanics",
+        "init_execution.policy_digest selected once by application composition"
+      ],
+      "retained_policies": [
+        "original per-stage schemas and acceptance",
+        "Foundation/Discovery/Depth task journals keep their own authority",
+        "old ambiguous generation state refuses before dispatch; known predispatch refusal may retry",
+        "legacy History extraction checkpoint adapter is read-only"
+      ],
+      "evidence": [
+        "history-citation-contract-20261017/validation.json",
+        "generation-workflow-policy-20261017/validation.json"
+      ]
+    },
+    {
+      "capability": "knowledge component routing and History citation eligibility",
+      "owner": [
+        "copilot:kb_service/init_coverage.py:owner_for_paths/most_specific",
+        "copilot:kb_service/init_history_routes.py:CitationPolicy"
+      ],
+      "callers": [
+        "copilot:kb_service/init_stages.py:_Stage._owner_for delegates",
+        "copilot:kb_service/init_history.py extraction citation descriptor",
+        "copilot:kb_service/init_history.py application citation gate"
+      ],
+      "retained_policies": [
+        "most-specific ownership and collective routing tie order unchanged",
+        "context-only tests can inform checks but are not component-owned evidence",
+        "model-specific scope and missing model page restrictions preserved",
+        "v0/v1 full requests unchanged; only v2 has descriptor and issue details"
+      ],
+      "deleted_bodies": [
+        "init_stages._Stage._owner_for collective routing body",
+        "init_history inline model/owner/per-path predicate"
+      ],
+      "evidence": [
+        "history-citation-contract-20261017/validation.json",
+        "history-citation-contract-20261017/legacy-request-equality.json"
+      ]
+    },
+    {
+      "capability": "durable init rule-source citations and quick-map rendering",
+      "owner": [
+        "copilot:kb_service/init_quick_maps.py:with_rule_sources/_source_row_paths/_paths_in/render_quick_map/rule_body_without_sources"
+      ],
+      "callers": [
+        "copilot:kb_service/init_stages.py:_Stage._screen",
+        "copilot:kb_service/init_content.py:check_capacity_with_map",
+        "copilot:kb_service/init_stages.py:_Stage._refresh_quick_maps",
+        "copilot:kb_service/init_history.py:_body_key v3 policy"
+      ],
+      "retained_policies": [
+        "Only new checked rule candidates acquire missing source citations",
+        "LegacyHistory0/1/2 rendering retained; new3 selects same formatter",
+        "Existing rules, manual maps, root routing and signals unchanged",
+        "Source citation is display; range/hash authority stays with pinned evidence validation"
+      ],
+      "evidence": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/quick-map-body-identity-20261017/validation.json"
+    },
+    {
+      "capability": "legacy review dispatch provenance and quarantine",
+      "owner": [
+        "reviewbot:persistence/review_recovery.py"
+      ],
+      "callers": [
+        "reviewbot:persistence/jobs.py:record_comment_trigger/retry_failed_review/retry_failed_review_job",
+        "reviewbot:auto_review_ledger.py:enqueue_auto_review",
+        "reviewbot:persistence/watcher_recovery.py:recover_running_jobs",
+        "reviewbot:watch/workflow_execution.py via Ledger.legacy_review_pending"
+      ],
+      "retained_policies": [
+        "Old uncertain jobs retain original attempt/state and cannot get a replacement dispatch",
+        "Only new producer INSERTs attest the protocol in their own transaction",
+        "No schema trigger stamps old writers or deduplicated rows",
+        "Explicit known terminal failures retain business retries",
+        "Original worker/release/profile retention remains a rollout gate"
+      ],
+      "evidence": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/legacy-review-restart-20261017/validation.json"
+    }
+  ],
+  "deletions": [
+    {
+      "repository": "reviewbot",
+      "path": "src/omni_reviewbot/codex_runner.py",
+      "owner": "Copilot ReviewRuntime and providers.codex",
+      "removed_symbols": [
+        "CodexRunner._parse_result",
+        "CodexRunner.review",
+        "_codex_failure_detail",
+        "build_review_prompt"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "reviewbot",
+      "path": "src/omni_reviewbot/cursor_runner.py",
+      "owner": "Copilot ReviewRuntime and providers.cursor",
+      "removed_symbols": [
+        "CursorRunner._decode_result",
+        "CursorRunner._emit",
+        "CursorRunner._event_session_id",
+        "CursorRunner._invalid_json_message",
+        "CursorRunner._process_group_options",
+        "CursorRunner._read_stderr",
+        "CursorRunner._read_stdout",
+        "CursorRunner._repair_result",
+        "CursorRunner._review",
+        "CursorRunner._start_process",
+        "CursorRunner._terminate_process_tree",
+        "CursorRunner._tool_detail",
+        "CursorRunner.review",
+        "CursorRunner.review_with_validation"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "reviewbot",
+      "path": "src/omni_reviewbot/knowledge_model.py",
+      "owner": "Copilot provider registry/transports",
+      "removed_symbols": [
+        "KnowledgeModelRunner.__init__",
+        "KnowledgeModelRunner.call_codex",
+        "KnowledgeModelRunner.call_cursor",
+        "KnowledgeModelRunner.workspace"
+      ],
+      "file_removed": true
+    },
+    {
+      "repository": "reviewbot",
+      "path": "src/omni_reviewbot/knowledge_curation_cycle.py",
+      "owner": "Copilot KnowledgeCurator.curate",
+      "removed_symbols": [
+        "KnowledgeCurationCycle.__init__",
+        "KnowledgeCurationCycle.run",
+        "ReadOnlyCheck.__call__"
+      ],
+      "file_removed": true
+    },
+    {
+      "repository": "reviewbot",
+      "path": "src/omni_reviewbot/strict_backend.py",
+      "owner": "omni_reviewbot.host_client.HostClient",
+      "removed_symbols": [
+        "StrictBackend._roundtrip",
+        "StrictBackend._spawn"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "test/test_ext1_checkout_guard.py",
+      "owner": "internal rebase workflow and CheckoutLock tests",
+      "removed_symbols": [
+        "external guard discovery",
+        "all external guard integration cases"
+      ],
+      "file_removed": true
+    },
+    {
+      "capability": "retired self-only native tool-policy prototype",
+      "deleted": [
+        "copilot:eval/single-capability-shadow/codex_tool_policy.py",
+        "copilot:eval/single-capability-shadow/test_codex_tool_policy.py"
+      ],
+      "canonical_owner": "copilot:providers/codex_policy.py",
+      "callers_before": [
+        "self-only prototype tests; no live driver imports"
+      ],
+      "retained": "immutable original evaluation and runtime artifacts",
+      "verification": "test_capability_ownership.py:test_native_tool_policy_compiler_has_one_owner_in_runtime_and_maintained_eval; backend-conformance-20261015"
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/providers/__init__.py",
+      "owner": "providers.completion.complete_native",
+      "removed_symbols": [
+        "run_harness_session independent budget/capture/partial-event loop"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/providers/readonly_execution.py",
+      "owner": "providers.original_execution.run_original_native",
+      "removed_symbols": [
+        "execute_readonly independent lock/intent/marker/result coordination body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/codex_guard.py",
+      "owner": "providers.hosted_execution / complete_native / CodexTransport",
+      "removed_symbols": [
+        "run_process vendor dispatch body",
+        "independent terminal/usage receipt body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/run_paired.py",
+      "owner": "process_execution.run_process / CodexTransport.terminal_failure",
+      "removed_symbols": [
+        "stage subprocess.run lifecycle",
+        "independent failure event scan"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "paths": [
+        "eval/single-capability-shadow/block_arm.py",
+        "eval/single-capability-shadow/depth_arm.py",
+        "eval/single-capability-shadow/strict_depth_arm.py",
+        "eval/single-capability-shadow/discovery_arm.py",
+        "eval/single-capability-shadow/foundation_arm.py",
+        "eval/single-capability-shadow/history_arm.py",
+        "eval/single-capability-shadow/modules_arm.py",
+        "eval/single-capability-shadow/screening_arm.py",
+        "eval/single-capability-shadow/maintenance_arm.py"
+      ],
+      "owner": "eval.arm_runtime.model_gateway -> canonical provider and accounting",
+      "removed_symbols": [
+        "direct gateway and native transport factory construction"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/providers/completion.py",
+      "owner": "complete_native canonical reported usage projection",
+      "removed_symbols": [
+        "session Reply legacy display-counter fallback body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/foundation_native_arm.py",
+      "owner": "eval/single-capability-shadow/init_native_arm.py",
+      "removed_symbols": [
+        "standalone argparse/world/gateway/stage/resume/report orchestration body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/history_arm.py",
+      "owner": "eval/single-capability-shadow/init_native_arm.py",
+      "removed_symbols": [
+        "standalone argparse/world/gateway/stage/resume/report orchestration body"
+      ],
+      "file_removed": false,
+      "compatibility": "entry selects scripted extraction characterization policy and delegates; native entry selects full generation"
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/modules_arm.py",
+      "owner": "eval/single-capability-shadow/init_native_arm.py",
+      "removed_symbols": [
+        "standalone argparse/world/gateway/stage/capture/result/resume orchestration body"
+      ],
+      "file_removed": false,
+      "compatibility": "five-line entry selects original scripted generation policy and delegates",
+      "evidence": [
+        "shared-module-stage-20261015/evidence.json"
+      ]
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/foundation_arm.py",
+      "owner": "eval/single-capability-shadow/init_native_arm.py",
+      "removed_symbols": [
+        "standalone argument/world/gateway/stage/capture/result/resume orchestration",
+        "standalone correction resume orchestration"
+      ],
+      "file_removed": false,
+      "compatibility": "five-line entry selects preserved scripted policy and delegates",
+      "evidence": [
+        "shared-init-legacy-entries-20261015/evidence.json"
+      ]
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/screening_arm.py",
+      "owner": "eval/single-capability-shadow/init_native_arm.py",
+      "removed_symbols": [
+        "standalone argument/world/gateway/stage/capture/result/resume orchestration",
+        "standalone screening-stage lifecycle"
+      ],
+      "file_removed": false,
+      "compatibility": "five-line entry selects preserved scripted policy and delegates",
+      "evidence": [
+        "shared-init-legacy-entries-20261015/evidence.json"
+      ]
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/arm_runtime.py",
+      "owner": "copilot:kb_service/init_history.py",
+      "removed_symbols": [
+        "PlannedGateway forced record_payload=True for current application-capable SDK requests"
+      ],
+      "file_removed": false,
+      "compatibility": "translation retained only for older installed SDKs with an explicit frozen evaluation retention plan",
+      "evidence": [
+        "production-history-payload-policy-20261015/evidence.json"
+      ]
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/strict_arm.py",
+      "owner": "public SDK ReviewRuntime -> app.RunService standard worker; eval.durable_worker injects trusted account policy",
+      "removed_symbols": [
+        "runtime._core._q.put replacement",
+        "private in-process execute_strict_reserved call"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/strict_review_case_arm.py",
+      "owner": "public SDK ReviewRuntime -> app.RunService standard worker; eval.durable_worker injects trusted account policy",
+      "removed_symbols": [
+        "runtime._core._q.put replacement",
+        "private in-process execute_strict_reserved call"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/providers/codex.py",
+      "owner": "providers.native_identity / HarnessTransport",
+      "removed_symbols": [
+        "CodexTransport.identity_probe body",
+        "_configuration_main independent identity reader body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/arm_runtime.py",
+      "owner": "canonical provider registry and per-role prepared native bindings",
+      "removed_symbols": [
+        "Codex-only role admission",
+        "Codex-only native receipt construction"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "eval/single-capability-shadow/init_native_arm.py",
+      "owner": "kb_service.init_stages original unlimited policy",
+      "removed_symbols": [
+        "blanket native module evaluation refusal"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_stages.py",
+      "owner": "kb_service.preview",
+      "removed_symbols": [
+        "_dry_run_files independent rglob/read_text body"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/portable_init.py",
+      "owner": "kb_service.preview",
+      "removed_symbols": [
+        "stage_receipt independent checked file-set/hash loop"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_knowledge_parallel.py",
+      "owner": "kb_service.init_knowledge_inputs:foundation_uses_full_packet",
+      "removed_symbols": [
+        "_worker inline full-packet protocol selection",
+        "_validate_result inline full-packet protocol selection",
+        "_verify_native inline full-packet protocol selection"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_knowledge.py",
+      "owner": "kb_service.init_knowledge_inputs:foundation_uses_full_packet",
+      "removed_symbols": [
+        "_judge_evidence inline full-packet protocol selection"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_history.py",
+      "owner": "kb_service.quality_review:checkpoint_review",
+      "removed_symbols": [
+        "_PrHistory._extract_one uncheckpointed generate-to-pending transition"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "owner": "kb_service.init_generation:generate_data → quality_review:checkpoint_review",
+      "path": "kb_service init callers",
+      "removed_symbols": [
+        "_Skeleton._map_call raw generation body",
+        "_Stage._rules_call raw generation body",
+        "_Modules._card raw generation body",
+        "_PrHistory per-PR extraction dispatch wrapper (old state read-only adapter retained)"
+      ],
+      "file_removed": false
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_stages.py",
+      "owner": "kb_service.init_coverage and init_history_routes.CitationPolicy",
+      "removed_symbols": [
+        "_Stage._owner_for collective routing body (wrapper delegates to owner_for_paths)"
+      ],
+      "file_removed": false,
+      "evidence": "history-citation-contract-20261017/validation.json"
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_history.py",
+      "owner": "kb_service.init_coverage and init_history_routes.CitationPolicy",
+      "removed_symbols": [
+        "inline model_scope_valid + collective owner + per-path validation predicate (delegates to CitationPolicy.issue)"
+      ],
+      "file_removed": false,
+      "evidence": "history-citation-contract-20261017/validation.json"
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/kb_service/init_history.py",
+      "owner": "init_quick_maps canonical trailing source-row parser; History selects legacy/v3 policy",
+      "removed_symbols": [
+        "presentation-sensitive raw-only body identity for new source-annotated History batches"
+      ],
+      "file_removed": false,
+      "evidence": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/quick-map-body-identity-20261017/validation.json"
+    },
+    {
+      "repository": "copilot",
+      "path": "src/infermatrix_copilot/knowledge_service/validation.py",
+      "owner": "Copilot process_execution.run_command / run_process",
+      "removed_symbols": [],
+      "removed_bodies": [
+        "validate_workspace direct subprocess.run validator dispatch",
+        "validate_snapshot direct subprocess.run git archive/init dispatch"
+      ],
+      "file_removed": false,
+      "compatibility": "Same binary evidence and exit behavior; unresolved cleanup refuses further validators and curation repair."
+    }
+  ],
+  "closed_framework_connections": [
+    {
+      "id": "strict-sdk-shadow-composition",
+      "priority": "P0",
+      "evidence": [
+        "strict-sdk-profile-cutover-20261015/evidence.json",
+        "strict-sdk-profile-framework-20261015/result.json"
+      ],
+      "current": "Both Strict drivers delegate sdk_runtime; canonical providers/default effort/original v3 pin connect session and bounded output repair with independent evaluation call receipts",
+      "required": "compose native session/completion profiles and evaluation budget/context policies before SDK workflow construction; freeze model/effort and retain old run-pin semantics; prove full installed Strict on local/SSH without quota bypass or replacing retained runtimes",
+      "status": "implemented and deterministic installed local/SSH forced-repair conformance verified"
+    },
+    {
+      "id": "reserved-native-worker-identity",
+      "priority": "P0",
+      "status": "implemented; source regression, real settings child and installed local/SSH full worker verified",
+      "evidence": [
+        "reserved-native-identity-20261015/evidence.json",
+        "reserved-native-identity-framework-20261015/result.json"
+      ],
+      "remaining_verification": "historical full source environment complements retained; current standard-child account validation is tracked separately in durable-evaluation-worker-20261015"
+    },
+    {
+      "id": "native-history-evaluation-retention",
+      "priority": "P0",
+      "status": "implemented and actual installed local Docker original/current full native history plus legacy characterization verified",
+      "owner": "eval/single-capability-shadow/arm_runtime.py / init_native_arm.py",
+      "current": "Explicit frozen case/root/input-hash retention policy connects native extraction and aggregate review; exact prompt/tree/head parity, canonical receipts and no-dispatch resume pass",
+      "limitation": "offline execution conformance only; production retention contract was accepted explicitly; no real-model quality claim",
+      "evidence": [
+        "native-history-retention-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "caller-recorder-admission-authority",
+      "priority": "P0",
+      "owner": "eval/single-capability-shadow/arm_runtime.py:ArmRuntime.recorder",
+      "status": "implemented; source/isolated installed regression and full actual installed local correction verify original-store admission/archive authority",
+      "current": "Store delegates the caller durable recorder. Canonical subscription admission and native archive use that original root; distinct host trace settings cannot split authority.",
+      "evidence": [
+        "shared-init-legacy-entries-20261015/evidence.json"
+      ],
+      "raw_failures": "Original matrix and unsuccessful simulated-property diagnosis remain retained; property guard reverted; original generator/judge class ASTs preserved"
+    },
+    {
+      "id": "production-history-explicit-retention",
+      "priority": "P0",
+      "owner": "copilot:kb_service/init_history.py",
+      "status": "implemented; source/installed/current original-candidate Docker and unwrapped production gateway flow verified",
+      "current": "Explicit host choice precedes canonical model execution; default omitted requests remain blocked, explicit retained batches complete and reuse results; policy drift cannot reextract",
+      "limitation": "explicit retention is required for durable execution; default omit refuses by accepted contract; no real-model quality claim",
+      "evidence": [
+        "production-history-payload-policy-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "original-sandbox-result-reader",
+      "priority": "P0 precursor",
+      "status": "implemented; affected source/isolated wheel, actual local Docker/SSH and paired main-flow/boundary conformance pass without drift",
+      "current": "local and SSH callers read the original bound result without reconstructing inputs; server request-to-worker matching remains in its compatibility reader, delegating the canonical worker result reader",
+      "evidence": [
+        "original-sandbox-result-20261015/evidence.json",
+        "original-sandbox-result-framework-fixed-20261015/result.json"
+      ],
+      "remaining": "not payload omission; raw archives and remote request bindings remain"
+    },
+    {
+      "id": "redacted-native-history-execution",
+      "priority": "P0",
+      "status": "closed by explicit user acceptance of required retention for durable execution",
+      "current": "Durable native history requires explicit retain-private; default omit refuses before dispatch. This matches the implemented production application, original batch binding and verified zero-dispatch default.",
+      "callers": [
+        "copilot:kb_service/init_history.py:_extract_one",
+        "copilot:kb_service/init_support.py:generate",
+        "copilot:kb_service/models.py:ModelGateway"
+      ],
+      "owners": [
+        "copilot:providers/completion.py:complete_native",
+        "application host payload-retention policy"
+      ],
+      "required": "Keep default refusal, explicit host retention, original batch identity and no replacement dispatch. Omitted-payload durable recovery is not required.",
+      "evidence": [
+        "native-screening-stage-20261015/redacted-profile-before.json",
+        "native-screening-stage-20261015/redacted-native-compatibility-gap.json",
+        "native-history-retention-20261015/evidence.json",
+        "production-history-payload-policy-20261015/evidence.json",
+        "original-sandbox-result-20261015/evidence.json",
+        "durable-evaluation-worker-20261015/history-retention-decision.json"
+      ],
+      "production_behavior_unchanged": false,
+      "default_omission_behavior_unchanged": true,
+      "user_decision": "耐久执行可要求显式留存，默认保持拒绝"
+    },
+    {
+      "id": "standard-child-evaluation-account",
+      "priority": "P1",
+      "status": "closed; isolated installed, standard full local/SSH, native account/worker/recovery audit and paired main/boundary conformance pass",
+      "evidence": [
+        "durable-evaluation-worker-20261015/evidence.json",
+        "durable-evaluation-logical-framework-20261015/result.json"
+      ],
+      "required": "standard durable child settles original evaluation account; distinct logical repair identities do not collide and same intent cannot dispatch a replacement",
+      "limitation": "offline native fixtures establish execution/account recovery, not model quality or the full backend/recovery matrix"
+    },
+    {
+      "id": "full-discovery-stage-evaluation",
+      "priority": "P1",
+      "status": "implemented; current source/isolated installed, full original/current local Docker entry and canonical receipt audit pass",
+      "current": "One thin entry delegates shared init composition; application-owned role configuration binds the frozen generator/judge and serial scheduling; no independent model/recovery loop",
+      "evidence": [
+        "native-discovery-stage-20261015/evidence.json"
+      ],
+      "limitation": "positive full-stage offline fixture; judgment packets retain per-arm provenance differences; no real-model or all-case quality claim"
+    },
+    {
+      "id": "generic-zcode-sandbox-completion",
+      "priority": "P1 precursor",
+      "status": "implemented; affected source/isolated wheel and actual installed local Docker/SSH conformance verified",
+      "owner": "copilot:providers/completion_worker.py / providers/zcode.py / shared sandbox backend and location",
+      "current": "one typed envelope calls the canonical adapter once, retains file spool and native events; original result reader cannot dispatch; missing/malformed results preserve pending",
+      "remaining": "native credential/admission and mixed-provider quality evaluation remain separately open; schema/session/byte-idle controls refuse before dispatch",
+      "evidence": [
+        "zcode-sandbox-completion-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "mixed-provider-native-role-mechanism",
+      "priority": "P1 precursor",
+      "status": "implemented; affected source/isolated wheel and actual current local Docker/SSH generation/shared-quality/receipt/recovery conformance verified",
+      "current": "shared-sandbox/2 freezes provider profiles and binaries; canonical registry decoders settle the same ledger; original v1 shape is retained; old mixed packages refuse before dispatch",
+      "remaining": "native subscription account proof, provider-level live settings, full native init and original/current quality comparison remain open",
+      "evidence": [
+        "mixed-provider-composition-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "trusted-provider-option-binding",
+      "priority": "P1 precursor",
+      "status": "implemented and source/installed/current local Docker/SSH plus actual settings-child drift conformance verified",
+      "current": "canonical safe options are frozen in profile and original run-completion/4 pin; registry/worker/preparation share validation and overlay; live mixed plans refuse missing explicit options",
+      "evidence": [
+        "provider-option-binding-20261015/evidence.json",
+        "provider-option-framework-20261015/result.json"
+      ]
+    },
+    {
+      "id": "provider-native-credential-source",
+      "priority": "P1 precursor",
+      "status": "implemented; installed local Docker/SSH fixture conformance and paired main/boundaries passed",
+      "remaining": "real vendor proxy/account validation, full init and original/current comparison; detailed recovery and release remain separate gates",
+      "evidence": [
+        "native-credential-source-20261015/evidence.json",
+        "native-credential-framework-20261015/result.json"
+      ]
+    },
+    {
+      "id": "current-native-module-stage",
+      "priority": "P1",
+      "status": "current installed local/SSH full stage passes with offline native CLI fixtures; original/current comparison and real-model quality remain open",
+      "evidence": [
+        "native-module-workflow-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "legacy-cli-generic-credential-source",
+      "priority": "P1",
+      "status": "canonical account-source lookup and environment-independent frozen Settings verified; old SDK mixed workflow comparison remains separate",
+      "owner": "evaluation shared_execution delegates Copilot canonical credential/admission/native functions",
+      "evidence": [
+        "legacy-native-source-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "frozen-evaluation-judgment-identity",
+      "priority": "P1",
+      "owner": "arm_runtime.model_roles / judgment_context / _host_timeout",
+      "status": "five judgment adapters and init migrate; source/current installed and original SDK identity-only entry contracts pass",
+      "removed_bodies": [
+        "per-entry role/settings construction and fixed fixture defaults",
+        "init independent role pair construction"
+      ],
+      "remaining": "complete original/current native mixed workflow comparison and independent quality remain separate",
+      "evidence": [
+        "evaluation-role-binding-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "current-native-depth-stages",
+      "priority": "P1",
+      "owner": "init_native_arm delegates installed knowledge-deepen; arm_runtime binds canonical dispatch context",
+      "status": "current installed full Strict/lightweight local and SSH Docker fixture conformance passed; source/current-wheel focused checks pass",
+      "callers": [
+        "depth_strict_native_arm",
+        "depth_lightweight_native_arm"
+      ],
+      "removed_bodies": [
+        "none: new thin stage entries reuse existing application and provider mechanisms"
+      ],
+      "retained_policy_differences": [
+        "Strict complete facet packet acceptance",
+        "lightweight per-facet acceptance and four lifetime generation attempts"
+      ],
+      "remaining": "original/current mixed native comparison, real-model quality and rollout remain open",
+      "evidence": [
+        "native-depth-workflow-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "knowledge-model-family-identity",
+      "owner": "kb_service.model_identity",
+      "priority": "P1",
+      "status": "all domain callers migrated; focused source/installed pass; final new-artifact integration open",
+      "callers": [
+        "models.roles_from_env",
+        "init_stages.run_stage discovery/unlimited admission",
+        "maintenance.run_cycle",
+        "maintenance_audit.BudgetGateway live and replay",
+        "maintenance_correction.propose_correction",
+        "native_depth_audit"
+      ],
+      "removed_bodies": [
+        "maintenance_audit.model_family",
+        "native_depth_audit._family",
+        "four inline role family comparisons"
+      ],
+      "retained_policy_differences": [
+        "hyphen-prefix configured role names",
+        "provider-qualified punctuation-delimited served names",
+        "caller-owned provider restrictions and waiver policies"
+      ],
+      "evidence": [
+        "model-family-owner-20261015/installed-result.json"
+      ]
+    },
+    {
+      "id": "legacy-mixed-provider-completion-host",
+      "owner": "evaluation host object codec delegates ArmRuntime/registry/complete_native",
+      "priority": "P1",
+      "status": "actual original/current complete modules local/SSH Docker fixture conformance passes; source/installed focused guards pass",
+      "callers": [
+        "original installed ModelGateway through arm_runtime.model_gateway",
+        "generic frozen run_paired manifests"
+      ],
+      "removed_bodies": [
+        "no vendor or retry body added; explicit host replaces unconditional v2 rejection only when hash-bound",
+        "paired manifest single-Codex hash assumption for v2"
+      ],
+      "retained_policy_differences": [
+        "original workflow generation/schema/review/acceptance",
+        "v1 CLI and Strict child compatibility",
+        "streaming/pacing/sessions/missing old attempt context refuse",
+        "default durable omission refuses; explicit private retention remains required"
+      ],
+      "remaining": [
+        "remaining init/discovery/maintenance scopes",
+        "independent quality and historical-backend parity",
+        "full new-artifact release gates"
+      ],
+      "evidence": [
+        "legacy-provider-host-20261015/evidence.json",
+        "legacy-provider-local-20261015/evidence.json"
+      ]
+    },
+    {
+      "id": "correction-provider-composition",
+      "owner": "canonical providers / ModelGateway; fixture declaration in role_profiles; durable recorder; ArmRuntime zero-model control scopes",
+      "migrated_callers": [
+        "foundation correction fixture",
+        "current evaluation gateway reconstruction",
+        "legacy provider host control allocation"
+      ],
+      "removed_bodies": [
+        "CapturedJudge Codex subclass and complete override",
+        "legacy provider host independent control allocation"
+      ],
+      "retained_policy": "explicit fixture-only generator; historical CLI auth inputs delegate; domain quota and model bindings retain authority",
+      "status": "Original/current local/SSH correction and matching-runtime completed-stage reconstruction pass; source/installed helpers and persistent gates pass",
+      "evidence": "correction-provider-composition-20261016/evidence.json",
+      "remaining": "independent quality and remaining backend/account/recovery/release scope",
+      "additional_evidence": "correction-ssh-conformance-20261016/evidence.json"
+    },
+    {
+      "id": "native-zcode-encrypted-cache",
+      "owner": "providers/zcode_credentials.py canonical selected-account projector",
+      "callers": [
+        "local_sandbox_profile on local/SSH host",
+        "private worker credential sidechannel"
+      ],
+      "status": "real Codex 0.162.1 and ZCode 0.16.9 identity/version/account controls pass local/SSH; no model calls",
+      "evidence": "encrypted-zcode-cache-20261016/evidence.json",
+      "remaining": "real API/network/entitlement, full new-pair integration and independent quality; release interpreter validation"
+    },
+    {
+      "id": "mixed-provider-native-quality-composition",
+      "priority": "P1",
+      "current": "Shared provider/account/profile mechanisms and original/current local/SSH workflow composition are connected. Current 73697bd2/9399980b deterministic source and installed pair pass, with exact environment complements and evaluator addenda. Remaining required work is native/quality/release acceptance, not an unconnected framework caller.",
+      "required": "Finish independent ten-stratum quality, remaining supported-backend/account/recovery matrices and real release/retention acceptance; preserve original paid/pending environments.",
+      "evidence": [
+        "native-discovery-stage-20261015/evidence.json",
+        "zcode-sandbox-completion-20261015/evidence.json",
+        "mixed-provider-composition-20261015/evidence.json",
+        "provider-option-binding-20261015/evidence.json",
+        "native-credential-source-20261015/evidence.json",
+        "native-module-workflow-20261015/evidence.json",
+        "native-discovery-mixed-20261016/four-way-evidence.json",
+        "native-discovery-relationships-20261016/evidence.json",
+        "correction-provider-composition-20261016/evidence.json",
+        "correction-ssh-conformance-20261016/evidence.json",
+        "discovery-boundary-exclusion-20261016/evidence.json",
+        "installed-evaluation-gate-20261016/evidence.json",
+        "encrypted-zcode-cache-20261016/evidence.json",
+        "current-candidate-integration-20261016/evidence.json"
+      ],
+      "framework_connection_closed": true,
+      "remaining_acceptance_retained": "Finish independent ten-stratum quality, remaining supported-backend/account/recovery matrices and real release/retention acceptance; preserve original paid/pending environments."
+    },
+    {
+      "id": "uncheckpointed-init-generation",
+      "priority": "P0",
+      "owner": "copilot:kb_service/quality_review.py:checkpoint_review via knowledge application composition",
+      "confirmed_unmigrated_caller": "copilot:kb_service/init_stages.py:_Skeleton._map_call",
+      "confirmed_evidence": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/history-unknown-reproduction-20261017/skeleton-result.json",
+      "remaining_audit": [
+        "call_discovery_model",
+        "_Knowledge._sections",
+        "_KnowledgeDepth._attempt",
+        "_Modules._card",
+        "_Stage._rules_call"
+      ],
+      "requirement": "One application generation checkpoint entry; migrate unprotected callers and remove superseded wrappers; preserve existing task-journal scopes, legacy identities and no unknown replacement.",
+      "status": "closed",
+      "migrated_callers": [
+        "_Skeleton._map_call",
+        "_Stage._rules_call (Skeleton/Deepen)",
+        "_Modules._card",
+        "_PrHistory._extract_one"
+      ],
+      "retained_task_authorities": [
+        "DiscoveryEngine._attempt_scope",
+        "init_knowledge_parallel._attempt_scope",
+        "_KnowledgeDepth._attempt checkpoint_review"
+      ],
+      "evidence": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/shared-generation-checkpoint-20261017/validation.json"
+    },
+    {
+      "id": "generation-workflow-policy-binding",
+      "priority": "P0",
+      "owner": "Copilot init application composition → canonical generation checkpoint",
+      "evidence": "current-paired-1160-integration-20261017/failure-reproduction.xml",
+      "requirement": "Bind cache/intent to injected workflow policy; refuse unbound legacy in-flight state without mutation or replacement.",
+      "status": "closed by exact source and installed checks",
+      "document": "single-capability-generation-workflow-policy.md",
+      "wheel_sha256": "710d5bfb06a588ae750374ce61574fa054e1cd93c40b1a88562eed4aa4100fef",
+      "verification": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/generation-workflow-policy-20261017/validation.json"
+    }
+  ],
+  "open_framework_connections": [],
+  "framework_stage_complete": true,
+  "full_objective_complete": false,
+  "release_approved": false,
+  "document": "single-capability-framework-closeout-current-20261017.md",
+  "validation": "/data/zhoutaichang/copilot/output/single-capability-completion-20261012/framework-closeout-current-20261017/framework-result.json",
+  "scope": "70 capability ownership/caller entries; 34 removed-body entries, not file counts. Per-entry older evidence retains its original version scope.",
+  "remaining_acceptance": [
+    {
+      "priority": "P1",
+      "item": "Frozen real Codex quality across review/init; retain failed Foundation/History outcomes, no quality claim from fixtures."
+    },
+    {
+      "priority": "P1",
+      "item": "Deep crash/concurrency/budget/publication reconciliation; original unknown outcomes use original identity and environment, never replacement dispatch."
+    },
+    {
+      "priority": "P2",
+      "item": "Other vendor native parity, served identity/cost precision, provider and Docker authentication."
+    },
+    {
+      "priority": "Release",
+      "item": "Immutable paired releases/pins, final acceptance, in-flight environment retention/drain, rollback and separately authorized rollout."
+    }
+  ]
+}

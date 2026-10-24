@@ -27,10 +27,9 @@ from types import SimpleNamespace
 from ..knowledge_service.l1 import check_tree
 from ..knowledge_service.lifecycle import LifecycleError, Page
 from ..knowledge_service.ops import (
-    INDEX_NAME, KnowledgeOperation, apply_operations, page_over_capacity,
+    INDEX_NAME, KnowledgeOperation, apply_operations, model_operations, page_over_capacity,
 )
-from .intake import routes_for
-from .models import ModelUnavailable
+from .intake import Draft, checkpoint_draft, draft_operations, prepare_operations, routes_for
 
 MAX_DIFF_BYTES = 16 * 1024
 MAX_REPAIRS = 2
@@ -208,51 +207,28 @@ def sweep_page(rt, lifecycle, *, page: str, files: dict[str, str], diff: str, hi
                "rules": active, "release_diff": diff, "audit_hints": hints}
     prompt = "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace(
         "<", "\\u003c") + "\n</untrusted_data>\n"
-    feedback = ""
-    last_error = ""
-    from ..trace_store import accept_attempt, trace_context
+    def scope_error(operations):
+        return f"\n\nEvery operation must target {page} only." if any(
+            op.page != page or (op.new_page and op.new_page != page) for op in operations) else ""
 
-    for attempt in range(MAX_REPAIRS + 1):
-        try:
-            with trace_context(attempt=attempt):
-                reply = rt.gateway.call_json(rt.generator, system=SWEEP_SYSTEM, prompt=prompt + feedback,
-                                             validate=_validate_sweep)
-        except ModelUnavailable as exc:
-            if "failed its schema" not in str(exc):
-                raise
-            feedback = f"\n\nYour previous answer did not match the JSON shape: {exc}."
-            last_error = str(exc)
-            continue
-        operations = [KnowledgeOperation.from_dict(item) for item in reply.data["operations"]]
-        if not operations:
-            return None
-        bad = [op for op in operations if op.page != page or (op.new_page and op.new_page != page)]
-        if bad:
-            feedback = f"\n\nEvery operation must target {page} only."
-            last_error = feedback.strip()
-            continue
-        try:
-            result = apply_operations(files, operations, release=release, today=today)
-            accept_attempt(attempt)
-            if generated_by is not None:
-                generated_by[page] = reply.role.label()
-            return operations, result
-        except LifecycleError as exc:
-            feedback = f"\n\nYour previous answer was rejected by the knowledge base: {exc}. Fix exactly that."
-            last_error = str(exc)
-    raise SweepPageFailed(f"{page}: {last_error}")
+    reply, accepted, attempts = draft_operations(rt.gateway, rt.generator, system=SWEEP_SYSTEM,
+        prompt=prompt, prepare=lambda reply: prepare_operations(reply, files, release=release, today=today,
+            scope_error=scope_error, application_repair=lambda error:
+                f"\n\nYour previous answer was rejected by the knowledge base: {error}. Fix exactly that."),
+        validate=_validate_sweep, max_repairs=MAX_REPAIRS,
+        schema_repair=lambda error: f"\n\nYour previous answer did not match the JSON shape: {error}.")
+    if accepted is None:
+        raise SweepPageFailed(f"{page}: {attempts[-1]['error']}")
+    if accepted[0]:
+        if generated_by is not None:
+            generated_by[page] = reply.role.label()
+        return accepted
+    return None
 
 
 def _validate_sweep(data: dict) -> None:
-    operations = data.get("operations")
-    if not isinstance(operations, list):
-        raise ValueError("operations must be a list")
-    for item in operations:
-        if not isinstance(item, dict) or item.get("kind") not in ("edit_same_meaning", "replace", "retire"):
-            raise ValueError("sweep operations are edit_same_meaning, replace or retire")
-        if item.get("allow_protected"):
-            raise ValueError("the generator may not request the human path")
-        KnowledgeOperation.from_dict(item)
+    model_operations(data, kinds=("edit_same_meaning", "replace", "retire"),
+                     kind_error="sweep operations are edit_same_meaning, replace or retire")
 
 
 def _active(section) -> bool:
@@ -289,6 +265,35 @@ def _progress(rt, lifecycle, sweep: dict) -> dict:
     return progress
 
 
+def _record_staged(progress: dict, changeset_id: str, key: str) -> None:
+    """One progress projection for live staging and recovery of committed gates."""
+    if changeset_id not in progress.setdefault("held", []):
+        progress["held"].append(changeset_id)
+    if key == "#t1":
+        progress["t1_done"] = True
+    elif key == "#purge":
+        progress["purge_done"] = True
+    elif key not in progress["done"]:
+        progress["done"].append(key)
+
+
+def _restore_staged(rt, lifecycle, progress: dict) -> None:
+    for kind in ("sweep", "purge"):
+        for row in rt.ledger.changesets_of_kind(lifecycle.repo, kind):
+            detail = row["detail"]
+            if (detail.get("sweep_instance") != progress["instance"]
+                    or detail.get("sweep_key") != progress["key"]):
+                continue
+            # Pending gates remain admission blockers; only a committed result
+            # proves that this unit completed review. Never infer legacy bindings.
+            if row["status"] == "review_pending" or not detail.get("decision"):
+                continue
+            key = detail.get("sweep_unit")
+            if not isinstance(key, str) or not key:
+                raise ValueError("committed sweep gate has no unit binding")
+            _record_staged(progress, row["id"], key)
+
+
 def run_sweep(rt, lifecycle, owner: str, sweep: dict, upstream: UpstreamRepo,
               audit_hints: dict[str, list[dict]] | None = None, reconciliation: int | None = None,
               base_sha: str | None = None) -> dict:
@@ -297,9 +302,12 @@ def run_sweep(rt, lifecycle, owner: str, sweep: dict, upstream: UpstreamRepo,
 
     # one identity per sweep instance, persisted before any work so every
     # resumed attempt traces under it (a fallback sweep reuses the tag)
+    from .runtime import require_settled_reviews
+    require_settled_reviews(rt, lifecycle.repo, kinds=('sweep', 'purge'))
     progress = _progress(rt, lifecycle, sweep)
-    if rt.ledger.get_cursor(lifecycle.repo, "sweep_progress") in (None, ""):
-        rt.ledger.set_cursor(lifecycle.repo, "sweep_progress", json.dumps(progress, sort_keys=True))
+    progress.setdefault("instance", uuid.uuid4().hex)
+    _restore_staged(rt, lifecycle, progress)
+    rt.ledger.set_cursor(lifecycle.repo, "sweep_progress", json.dumps(progress, sort_keys=True))
     run_id = sweep_run_id(lifecycle.repo, sweep, progress)
     with trace_context(playbook="kb-sweep", repo=lifecycle.repo, release=str(sweep.get("tag") or ""),
                        run_id=run_id):
@@ -360,12 +368,30 @@ def _run_sweep(rt, lifecycle, owner: str, sweep: dict, upstream: UpstreamRepo,
         rt.ledger.heartbeat(owner)
         try:
             key, holder = draft_key_for_page(lifecycle.repo, sweep, page), {}
+            def generate_page():
+                try:
+                    outcome = sweep_page(rt, lifecycle, page=page, files=base, diff=diff_cache[prefixes],
+                                         hints=(audit_hints or {}).get(page, []), sweep=sweep,
+                                         release=release, today=today, generated_by=generated_by)
+                except SweepPageFailed as exc:
+                    return Draft([], [], None, rationale=str(exc), rejected=True)
+                return (Draft([], *outcome, generator=generated_by.get(page, ''))
+                        if outcome is not None else Draft([], [], None))
+
             with trace_context(draft_key=key, _accepted=holder, step="draft"):
-                outcome = sweep_page(rt, lifecycle, page=page, files=base, diff=diff_cache[prefixes],
-                                     hints=(audit_hints or {}).get(page, []), sweep=sweep,
-                                     release=release, today=today, generated_by=generated_by)
-            if accepted_key(key, holder):
-                accepted[page] = accepted_key(key, holder)
+                draft, draft_trace = checkpoint_draft(rt.ledger, owner,
+                    unit_key=f"sweep:{progress['instance']}:{page}:{progress['attempts'].get(page, 0)}",
+                    base_sha=base_sha, accepted_trace=lambda: accepted_key(key, holder), generate=generate_page,
+                    policy_inputs={'system': SWEEP_SYSTEM, 'max_repairs': MAX_REPAIRS},
+                    repo=lifecycle.repo, generator=rt.generator, page=page, files=base, diff=diff_cache[prefixes],
+                    hints=(audit_hints or {}).get(page, []), sweep=sweep, release=release, today=today)
+            if draft.rejected:
+                raise SweepPageFailed(draft.rationale)
+            outcome = (draft.operations, draft.result) if draft.operations else None
+            if draft.generator:
+                generated_by[page] = draft.generator
+            if draft_trace:
+                accepted[page] = draft_trace
         except SweepPageFailed as exc:
             attempts = progress["attempts"].get(page, 0) + 1
             progress["attempts"][page] = attempts
@@ -395,14 +421,10 @@ def _run_sweep(rt, lifecycle, owner: str, sweep: dict, upstream: UpstreamRepo,
                                       external=external, operations=operations, result=result,
                                       evidence=evidence, event_ids=[], release=release, hold=True,
                                       draft_keys=[accepted[key]] if key in accepted else [],
-                                      extra_detail={"generator": generated_by.get(key, "")})
-        progress.setdefault("held", []).append(changeset_id)
-        if key == "#t1":
-            progress["t1_done"] = True
-        elif key == "#purge":
-            progress["purge_done"] = True
-        else:
-            progress["done"].append(key)
+                                      extra_detail={"generator": generated_by.get(key, ""),
+                                                    "sweep_instance": progress["instance"],
+                                                    "sweep_key": progress["key"], "sweep_unit": key})
+        _record_staged(progress, changeset_id, key)
     progress["t1_done"] = True
     progress["purge_done"] = True
     settled = all(page in progress["done"] for page in pages)

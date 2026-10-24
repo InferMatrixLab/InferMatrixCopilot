@@ -1,17 +1,19 @@
 """Bounded foundation workers; only their coordinator changes stage state."""
 from __future__ import annotations
 
+from ..budgeting import native_outcome_unknown
+
 import copy
 import hashlib
 import json
 import math
 import posixpath
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..knowledge_service.pinned_claims import Evidence, check_evidence
 from .init_support import InitError, InitRecord
 from .models import ModelGateway, ModelUnavailable
+from .evidence_bundle import merge_ranges
 
 
 def _hash(value):
@@ -117,12 +119,6 @@ def related_test_sources(stage, paths, limit=20_000):
         if not ranges:
             continue
         spans = [(n, min(len(lines), n + 20)) for n in imports] + ranges
-        merged = []
-        for start, end in sorted(spans):
-            if merged and start <= merged[-1][1] + 1:
-                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-            else:
-                merged.append((start, end))
         test_name = posixpath.basename(path).rsplit(".", 1)[0]
         test_name = re.sub(r"^test_|(?:_test|\.test|\.spec)$", "", test_name)
         # Broad entry modules can match many unrelated tests. Rank before the
@@ -131,7 +127,7 @@ def related_test_sources(stage, paths, limit=20_000):
         related_name = any(len(name) >= 5 and (name in test_name or test_name in name)
                            for name in basenames if len(test_name) >= 5)
         specificity = max((len(module.split(".")) for module in matched_modules), default=0)
-        candidates.append(((exact, related_name, specificity), path, entry, merged))
+        candidates.append(((exact, related_name, specificity), path, entry, merge_ranges(spans)))
     for _, path, entry, merged in sorted(candidates, key=lambda row: (tuple(-int(n) for n in row[0]), row[1])):
         lines = entry["lines"]
         for start, end in merged:
@@ -141,9 +137,22 @@ def related_test_sources(stage, paths, limit=20_000):
                 continue  # Never attest an incomplete line or silently fill gaps.
             out.append({"path": path, "start": start, "end": end, "text": text,
                         "total_lines": len(lines), "language": entry["language"],
-                        "test_context": "direct import/symbol localization; tests have not been executed"})
+                        "test_context": "direct import/symbol localization; source text only, no execution outcome evidence"})
             used += size
     return out
+
+
+def foundation_source_packet(stage, paths, *, read_sources, byte_limit):
+    """One bounded source/test packet for owner and feature foundation jobs.
+
+    Billing mode does not decide whether validation evidence is available.
+    Production ordering/range policy remains the caller's; actual test bytes
+    share its existing cap and never imply that tests ran or are absent.
+    """
+    tests = related_test_sources(stage, paths, limit=min(20_000, byte_limit))
+    test_bytes = sum(len(item["text"].encode("utf-8")) for item in tests)
+    source = read_sources(byte_limit - test_bytes)
+    return source + tests, len(tests)
 
 
 def range_is_offered(ranges, start, end):
@@ -222,12 +231,17 @@ class _CaptureGateway:
         if isinstance(self.gateway, ModelGateway):
             self.gateway._subscription_transports = {}  # each authenticated transport belongs to one worker
         self.last = {}
+        self.outcome_unknown = False
 
     def subscription_billing(self, role):
         return self.gateway.subscription_billing(role)
 
     def call_json(self, role, **kwargs):
-        reply = self.gateway.call_json(role, **kwargs)
+        try:
+            reply = self.gateway.call_json(role, **kwargs)
+        except BaseException as exc:
+            self.outcome_unknown |= native_outcome_unknown(exc)
+            raise
         self.last[role.name] = {"native_trace_id": reply.trace_id,
                                 "native_reply_sha256": reply.reply_sha256,
                                 "prompt_sha256": hashlib.sha256(kwargs["prompt"].encode()).hexdigest()}
@@ -235,9 +249,7 @@ class _CaptureGateway:
 
 
 def _worker(stage, job):
-    from .init_knowledge import knowledge_prompt, validate_sections
-    from .init_knowledge_inputs import foundation_evidence, knowledge_system
-    from .init_support import generate
+    from .init_knowledge_inputs import foundation_evidence, foundation_uses_full_packet
     from .init_stages import _one_line
     worker = copy.copy(stage)
     worker.head = dict(stage.head)
@@ -247,19 +259,16 @@ def _worker(stage, job):
     worker._foundation_payload = job["payload"]
     artifacts = []
     error = ""
+    budget_exhausted = False
     try:
-        if job["payload"].get("foundation_prompt_version") in (4, 5):
+        if foundation_uses_full_packet(job["payload"]):
             foundation_evidence(worker, job["payload"])
-        data = generate(worker.rt, worker.budget, worker.lifecycle.init, system=knowledge_system(job["payload"]),
-                        prompt=knowledge_prompt(job["payload"]), validate=validate_sections).data
-        for section in data["sections"]:
-            if section["facet"] not in job["requested"]:
-                continue
-            result = worker._section(job["owner"], job["page"], data, section, job["offered"])
+        for data, section, result in worker._sections(job["owner"], job["page"], job["payload"],
+                                                     job["offered"], job["requested"]):
             if result:
                 key, text, entries, label = result
                 receipt = worker.rt.gateway.last.get("judge", {})
-                if isinstance(stage.rt.gateway, ModelGateway) and not receipt.get("native_trace_id"):
+                if stage.rt.unlimited_subscription and isinstance(stage.rt.gateway, ModelGateway) and not receipt.get("native_trace_id"):
                     worker.record.unfinished.append(f"{key}: native judge receipt missing; retained in traces")
                     continue
                 artifacts.append({"key": key, "owner": job["owner"].owner, "page": job["page"],
@@ -272,17 +281,20 @@ def _worker(stage, job):
                                   "generator_receipt": worker.rt.gateway.last.get("generator", {}),
                                   "judge_receipt": receipt})
     except Exception as exc:
+        from .init_budget import BudgetExhausted
+        budget_exhausted = isinstance(exc, BudgetExhausted)
         error = f"{type(exc).__name__}: {exc}"
     result = {"input_sha256": _hash({"payload": job["payload"], "offered": job["offered"]}),
               "payload": job["payload"], "offered": job["offered"], "page": job["page"],
               "owner": job["owner"].owner, "requested": job["requested"],
               "artifacts": artifacts, "error": error, "verdicts": worker.record.verdicts,
-              "dropped": worker.record.dropped, "unfinished": worker.record.unfinished}
+              "dropped": worker.record.dropped, "unfinished": worker.record.unfinished,
+              "outcome_unknown": worker.rt.gateway.outcome_unknown, "budget_exhausted": budget_exhausted}
     result["result_sha256"] = _hash(result)
     return result
 
 
-def _validate_result(stage, result):
+def _validate_result(stage, result, *, require_native=False):
     if result.get("result_sha256") != _hash({k: v for k, v in result.items() if k != "result_sha256"}):
         raise InitError("foundation checkpoint artifact hash mismatch")
     if (result["payload"].get("pin") != stage.record.pin
@@ -293,9 +305,8 @@ def _validate_result(stage, result):
     if (result["requested"] != result["payload"]["facets"]
             or _hash(result["offered"]) != _hash(offered_ranges(result["payload"]["files"] + result["payload"]["docs"]))):
         raise InitError("foundation shown input or requested facets differ from generator payload")
-    from .init_knowledge_inputs import foundation_evidence, knowledge_system
-    knowledge_system(result["payload"])
-    if result["payload"].get("foundation_prompt_version") in (4, 5):
+    from .init_knowledge_inputs import foundation_evidence, foundation_uses_full_packet
+    if foundation_uses_full_packet(result["payload"]):
         if not stage.rt.unlimited_subscription:
             raise InitError("foundation full packet requires unlimited subscription")
         foundation_evidence(stage, result["payload"])
@@ -328,26 +339,29 @@ def _validate_result(stage, result):
             raise InitError("foundation generated evidence binding mismatch")
         if check_evidence(entries, stage.observer):
             raise InitError("foundation checkpoint pinned evidence mismatch")
-        if isinstance(stage.rt.gateway, ModelGateway):
+        if require_native or (stage.rt.unlimited_subscription and isinstance(stage.rt.gateway, ModelGateway)):
             _validate_native(stage, artifact, result)
 
 
 def _validate_native(stage, artifact, result):
     from ..trace_store import TraceStore
+    from ..knowledge_service.l1 import Block
+    from .gate import block_review_verdict
     from .judge_tuning import JUDGE_SYSTEM
     from .init_knowledge import knowledge_prompt
-    from .init_knowledge_inputs import foundation_evidence, knowledge_system
+    from .init_knowledge_inputs import foundation_evidence, knowledge_system, foundation_uses_full_packet
     from .init_stages import _Stage, _one_line, _page_frontmatter
     from .models import parse_json_object
     store = TraceStore(stage.rt.state_dir / "init" / "traces")
     receipt = artifact["judge_receipt"]
-    from .init_feature_discovery import _FeatureDiscovery
+    from .quality_review import verify_archived_receipt
     for name, role in (("generator", stage.rt.generator), ("judge", stage.rt.judge)):
         proof = artifact[name + "_receipt"]
         try:
-            _FeatureDiscovery._verify_archived_receipt(stage, {
+            verify_archived_receipt(store, {
                 "trace_id": proof["native_trace_id"], "reply_sha256": proof["native_reply_sha256"],
-                "requested": role.label()}, role)
+                "requested": role.label()}, role,
+                zcode_reasoning_level=getattr(stage.rt.gateway, "zcode_reasoning_level", "max"))
         except ModelUnavailable as exc:
             raise InitError(f"foundation native approval unavailable: {exc}") from exc
     try:
@@ -366,25 +380,18 @@ def _validate_native(stage, artifact, result):
                            and artifact["generator_title"] == generated.get("title")
                            and artifact["title"] == (_one_line(generated.get("title")) or f"{artifact['owner']} knowledge")
                            and store.blob(generator["inputs"]["system"]) == knowledge_system(result["payload"])
-                           and not generator.get("error") and generator["model"]["role"] == "generator"
-                           and generator["model"]["provider"] == stage.rt.generator.provider
-                           and generator["model"]["model"] == stage.rt.generator.model
-                           and generator["outputs"]["reply"] == "sha256:" + generator_receipt["native_reply_sha256"]
                            and hashlib.sha256(generator_prompt.encode()).hexdigest() == generator_receipt["prompt_sha256"])
-        valid = (generator_valid and not record.get("error") and record["model"]["role"] == "judge"
-                 and record["model"]["provider"] == stage.rt.judge.provider
-                 and record["model"]["model"] == stage.rt.judge.model
+        valid = (generator_valid
                  and store.blob(record["inputs"]["system"]) == JUDGE_SYSTEM
-                 and record["outputs"]["reply"] == "sha256:" + receipt["native_reply_sha256"]
                  and hashlib.sha256(prompt.encode()).hexdigest() == receipt["prompt_sha256"]
                  and payload["change"]["page"] == artifact["page"]
                  and payload["change"]["after"] == _page_frontmatter(artifact["title"], kind="architecture",
                        today=artifact["approved_today"], tags=stage.tags) + "\n" + artifact["text"]
                  and payload["evidence"] == (foundation_evidence(stage, result["payload"])
-                     if result["payload"].get("foundation_prompt_version") in (4, 5) else
+                     if foundation_uses_full_packet(result["payload"]) else
                      _Stage._judge_evidence(stage, [Evidence.from_dict(e) for e in artifact["evidence"]]))
-                 and all(reply["dimensions"].get(d) == "yes" for d in
-                         ("faithful", "does_not_weaken", "non_contradictory")))
+                 and block_review_verdict(reply, Block("prose", artifact["page"], "", "prose",
+                                                       artifact["text_sha256"])) == "pass")
     except (KeyError, ValueError, OSError, TypeError) as exc:
         raise InitError(f"foundation native approval unavailable: {exc}") from exc
     if not valid:
@@ -456,12 +463,144 @@ def validate_checkpoint(stage, previous, digest):
             _validate_result(context, result)
 
 
+def _dispatch_binding(stage, *, owner, payload, offered, page="", requested=()):
+    return {
+        "owner": owner, "binding": stage.record.inputs_digest,
+        "attempt": max((value.get("correction_round", 0) for value in
+                        payload.get("prior_review_feedback", {}).get("facets", {}).values()), default=0) + 1,
+        "input_sha256": _hash({"payload": payload, "offered": offered}),
+        "page": page, "requested": list(requested)}
+
+
+def _request_context(stage, saved):
+    """Keep large rendering context once per batch, outside worker mutations."""
+    from dataclasses import asdict
+    from .init_support import execution_snapshot
+    from ..trace_store import environment_fingerprint
+    validation = None
+    if hasattr(stage, "_coverage_policy_path"):
+        path = stage._coverage_policy_path()
+        validation = {"full_name": stage.lifecycle.full_name, "repo_dir": stage.repo_dir,
+                      "owners": [asdict(owner) for owner in stage.owners],
+                      "coverage_policy": stage.overlay.get(path) or stage.rt.knowledge.show(stage._base_sha, path)}
+    context = {
+        "schema": "foundation-context/1", "runtime": environment_fingerprint(),
+        "repo": stage.record.repo, "pin": stage.record.pin,
+        "binding": stage.record.inputs_digest, "kb_base_sha": stage.record.kb_base_sha,
+        "today": getattr(stage, "today", None), "tags": getattr(stage, "tags", None),
+        "head": getattr(stage, "head", None),
+        **execution_snapshot(stage.rt, stage.lifecycle.init if hasattr(stage, "lifecycle") else None),
+        "validation": validation,
+    }
+    context = json.loads(json.dumps(context, ensure_ascii=False))
+    digest = _hash(context)
+    contexts = saved.setdefault("contexts", {})
+    if digest in contexts and contexts[digest] != context:
+        raise InitError("foundation original rendering context changed")
+    contexts[digest] = context
+    return digest
+
+
+def _request_snapshot(job, context, sequence):
+    from dataclasses import asdict
+    return {"schema": "foundation-request/1", "context_sha256": context, "sequence": sequence,
+            "job": {**job, "owner": asdict(job["owner"])}}
+
+
+def original_job_request(stage, *, scope):
+    """Read the frozen task; this neither dispatches nor settles its outcome."""
+    from .quality_review import DispatchJournal
+    from ..trace_store import environment_fingerprint
+    saved = stage.record.coverage.get("foundation_jobs", {})
+    journal = DispatchJournal(saved.get("inflight", {}), None, None, requests=saved.get("requests"))
+    request = journal.original_request(scope=scope)
+    context = saved.get("contexts", {}).get(request.get("context_sha256"))
+    if (request.get("schema") != "foundation-request/1" or not isinstance(context, dict)
+            or _hash(context) != request["context_sha256"]
+            or context.get("schema") != "foundation-context/1"
+            or context.get("binding") != stage.record.inputs_digest
+            or context.get("repo") != stage.record.repo or context.get("pin") != stage.record.pin
+            or context.get("kb_base_sha") != stage.record.kb_base_sha
+            or context.get("runtime") != environment_fingerprint(refresh=True)):
+        raise InitError("foundation original request context is missing or mismatched")
+    try:
+        job = request["job"]
+        binding = _dispatch_binding(stage, owner=job["owner"]["owner"], payload=job["payload"],
+                                    offered=job["offered"], page=job.get("page", ""),
+                                    requested=job.get("requested", []))
+        if binding != saved["requests"][scope[0]]["binding"]:
+            raise ValueError("request differs from original dispatch binding")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InitError(f"foundation original job is invalid: {exc}") from exc
+    return {**request, "context": copy.deepcopy(context)}
+
+
+def replay_original_job(stage, store, *, scope):
+    """Recompute a frozen task under the caller's offline writer guard.
+
+    The returned calls still need account settlement before the intent clears.
+    No current model transport or current budget is used by the worker.
+    """
+    from dataclasses import replace
+    from .init_support import restore_execution
+    from .init_replay import OriginalTaskReplay, original_task_records
+    from .init_coverage import Owner
+    from .quality_review import _attempt_scope
+
+    request = original_job_request(stage, scope=scope)
+    context = request["context"]
+    if not {"subscription_generator", "prices", "init"}.issubset(context) or context["init"] is None:
+        raise InitError("foundation original execution settings are unavailable")
+    binding = stage.record.coverage["foundation_jobs"]["requests"][scope[0]]["binding"]
+    records = original_task_records(store, binding=binding, attempt=scope[1])
+    worker = copy.copy(stage)
+    worker.rt, init = restore_execution(stage.rt, context)
+    worker.lifecycle = replace(stage.lifecycle, init=init)
+    roles = [worker.rt.generator.label()] if worker.rt.subscription_generator or worker.rt.unlimited_subscription else []
+    if worker.rt.unlimited_subscription:
+        roles.append(worker.rt.judge.label())
+    replay = OriginalTaskReplay(store, records, binding=binding, attempt=scope[1],
+                                subscription_roles=roles, zcode_reasoning_level=context["zcode_reasoning_level"])
+    worker.rt.gateway = worker.budget = replay
+    worker.head, worker.today, worker.tags = context["head"], context["today"], context["tags"]
+    job = request["job"]
+    job["owner"] = Owner(**job["owner"])
+    with _attempt_scope(*scope):
+        result = _worker(worker, job)
+    if result["error"] or result["outcome_unknown"]:
+        raise InitError(f"foundation original worker did not complete: {result['error']}")
+    consumed = replay.consumed_records()
+    result["sequence"] = request["sequence"]
+    result["result_sha256"] = _hash({k: v for k, v in result.items() if k != "result_sha256"})
+    _validate_result(stage, result, require_native=True)
+    return result, consumed
+
+
 def restore_jobs(stage):
+    from .quality_review import DispatchJournal
+
     saved = stage.record.coverage.get("foundation_jobs", {})
     if saved and saved.get("binding") != stage.record.inputs_digest:
         raise InitError("foundation checkpoint input identity mismatch")
+    inflight = saved.get("inflight", {})
+
+    def binding_for(result):
+        return _dispatch_binding(stage, **{key: result[key] for key in
+            ("owner", "payload", "offered", "page", "requested")})
+
+    journal = DispatchJournal(inflight, binding_for, stage.budget.checkpoint_now,
+                              requests=saved.get("requests"))
     for result in sorted(saved.get("tasks", {}).values(), key=lambda item: item["sequence"]):
         _apply(stage, result)
+        # _apply validates the immutable result and its native approvals first.
+        # A saved failure with an unknown native outcome is not a completion.
+        if result.get("outcome_unknown") is not False:
+            continue
+        original = binding_for(result)
+        for key, intent in list(inflight.items()):
+            if intent == original:
+                journal.settle(result, result, None, lambda *_: None,
+                               scope=(key, intent["attempt"]))
     # This run has already replayed these immutable results, including native
     # approvals. Feedback preparation need not replay their archives twice.
     stage._foundation_validated_results = {r["result_sha256"] for r in saved.get("tasks", {}).values()}
@@ -490,6 +629,9 @@ def _validate_fresh(stage, result):
 
 def _with_review_feedback(stage, jobs, saved):
     """Same-version native resumes get advisory, per-facet correction history."""
+    from ..knowledge_service.drafting import AttemptPolicy
+
+    corrections = AttemptPolicy(4)
     for original in jobs:
         if (not stage.rt.unlimited_subscription
                 or original["payload"].get("foundation_prompt_version") not in (4, 5)):
@@ -513,7 +655,7 @@ def _with_review_feedback(stage, jobs, saved):
         for facet in original["requested"]:
             attempts = sorted((p for p in history.values() if facet in p["requested"]),
                               key=lambda p: p["sequence"])
-            if len(attempts) >= 4:  # Initial extraction plus at most three corrections.
+            if not corrections.allows(len(attempts)):  # Initial extraction plus at most three corrections.
                 stage.record.unfinished.append(f"{original['owner'].owner}/{facet}: three review corrections exhausted; remains unknown")
                 continue
             requested.append(facet)
@@ -565,32 +707,66 @@ def run_jobs(stage, jobs):
             pacer.prepare()
             stage.rt.gateway.configure_zcode_pacing(pacer)
     saved = stage.record.coverage.setdefault("foundation_jobs", {"binding": stage.record.inputs_digest, "tasks": {}})
+    saved.setdefault("unlimited_subscription", stage.rt.unlimited_subscription)
+    inflight = saved.setdefault("inflight", {})
+    from .quality_review import validate_dispatch_intents, validate_dispatch_requests
+
+    validate_dispatch_intents(inflight)
+    validate_dispatch_requests(saved.get("requests", {}))
+    if any(intent.get("binding") != stage.record.inputs_digest for intent in inflight.values()):
+        raise InitError("foundation pending dispatch belongs to a different frozen batch")
+    # Retain the original batch's authority even if feedback would construct a
+    # different prompt. A changed prompt is not evidence that a lost call ended.
+    held = {intent["owner"] for intent in inflight.values()}
+    for owner in sorted(held):
+        message = f"{owner}: foundation execution outcome unknown; reconcile original dispatch before correction"
+        if message not in stage.record.unfinished:
+            stage.record.unfinished.append(message)
+    jobs = [job for job in jobs if job["owner"].owner not in held]
     jobs = list(_with_review_feedback(stage, jobs, saved))
     if not jobs:
         return
     completed = {}
     sequence = max((r["sequence"] for r in saved["tasks"].values()), default=-1) + 1
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="kb-foundation") as pool:
-        futures = {pool.submit(_worker, stage, job): n for n, job in enumerate(jobs)}
-        for future in as_completed(futures):
-            n = futures[future]
-            result = future.result()
-            result["sequence"] = sequence + n
+    from .quality_review import DispatchJournal, drain_review_tasks
+
+    context = _request_context(stage, saved)
+    journal = DispatchJournal(inflight, lambda item: _dispatch_binding(stage,
+        owner=item[1]["owner"].owner, payload=item[1]["payload"], offered=item[1]["offered"],
+        page=item[1].get("page", ""), requested=item[1].get("requested", [])),
+        stage.budget.checkpoint_now,
+        requests=saved.setdefault("requests", {}),
+        snapshot=lambda item: _request_snapshot(item[1], context, sequence + item[0]),
+        uncertain=lambda result, error: error is not None or bool(result.get("outcome_unknown")))
+
+    def settle(item, result, error):
+        n, job = item
+        if error is not None:
+            raise error
+        result["sequence"] = sequence + n
+        result["result_sha256"] = _hash({k: v for k, v in result.items() if k != "result_sha256"})
+        try:
+            _validate_fresh(stage, result)
+        except InitError as exc:
+            result["error"] = str(exc)
+            result["artifacts"] = []
             result["result_sha256"] = _hash({k: v for k, v in result.items() if k != "result_sha256"})
-            try:
-                _validate_fresh(stage, result)
-            except InitError as exc:
-                result["error"] = str(exc)
-                result["artifacts"] = []
-                result["result_sha256"] = _hash({k: v for k, v in result.items() if k != "result_sha256"})
-            completed[n] = result
-            key = jobs[n]["owner"].owner + ":" + result["input_sha256"]
-            saved["tasks"][key] = result
-            stage.record.spent_usd = round(stage.budget.spent_usd, 6)
-            stage.record.save(stage.rt.state_dir)  # only this coordinator writes checkpoints
+        completed[n] = result
+        key = jobs[n]["owner"].owner + ":" + result["input_sha256"]
+        saved["tasks"][key] = result
+
+    drain_review_tasks(enumerate(jobs), lambda item: _worker(stage, item[1]), settle,
+                       concurrency=workers, journal=journal)
     # Completion order never affects pages, navigation or approval assembly.
     for n, job in enumerate(jobs):
         result = completed[n]
         if result["error"]:
-            stage.record.unfinished.append(f"{job['owner'].owner}: unusable foundation draft: {result['error']}")
+            owner = job["owner"].owner
+            prefix = (f"{owner}: unusable foundation draft" if stage.rt.unlimited_subscription else
+                      f"feature {owner[len('feature-'):]}: unusable draft" if owner.startswith("feature-") else
+                      f"knowledge owner {owner}: unusable draft")
+            stage.record.unfinished.append(f"{prefix}: {result['error']}")
         yield job, _apply(stage, result)
+        if result.get("budget_exhausted") and not stage.rt.unlimited_subscription:
+            from .init_budget import BudgetExhausted
+            raise BudgetExhausted(result["error"])

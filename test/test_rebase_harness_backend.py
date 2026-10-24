@@ -199,16 +199,20 @@ def test_tier_model_is_never_forwarded_to_a_harness(monkeypatch):
     import types as _types
 
     from infermatrix_copilot import tool_bridge
+    from infermatrix_copilot import llm
+    from infermatrix_copilot.budgeting import bind_call_budget
     from infermatrix_copilot.providers import registry
     from infermatrix_copilot.rebase_engine.module_rebase import _harness_attempt
 
     seen = {}
 
     class _T:
+        spec = _types.SimpleNamespace(id="cursor")
+
         def run_session(self, req):
+            from infermatrix_copilot.agent_loop import AgentOutcome
             seen["model"] = req.model
-            return _types.SimpleNamespace(truncated=False, text="ok",
-                                          iterations=0)
+            return AgentOutcome(text="ok", iterations=0, tool_calls=0)
 
     monkeypatch.setattr(registry, "transport_for_id", lambda *a, **k: _T())
     monkeypatch.setattr(tool_bridge, "write_bridge_spec", lambda **k: None)
@@ -220,11 +224,19 @@ def test_tier_model_is_never_forwarded_to_a_harness(monkeypatch):
         state_slice={}, baseline_ref="origin/main")
     scope = ToolScope(name="s", allowed_tools=frozenset(), path_scope=None,
                       read_only=True, root="/tmp")
-    asyncio.run(_harness_attempt(
-        "p", module="m", config=cfg, scope=scope, trace=None, tool_defs=[],
-        plan_prefix="/tmp/plans", require_plan_review=False))
+    settlements, captures = [], []
+    monkeypatch.setattr(llm, "capture_model_call", lambda *args, **kwargs: captures.append((args, kwargs)))
+    with bind_call_budget("rebase", lambda request: "ticket",
+                          lambda ticket, facts: settlements.append(dict(facts))):
+        asyncio.run(_harness_attempt(
+            "p", module="m", config=cfg, scope=scope, trace=None, tool_defs=[],
+            plan_prefix="/tmp/plans", require_plan_review=False))
 
     assert seen["model"] == "", seen            # empty, NOT "deepseek-flash"
+    assert len(settlements) == len(captures) == 1
+    assert settlements[0]["sent"] is True and settlements[0]["outcome"] == "completed"
+    assert settlements[0]["usage"] is None  # legacy zero counters are not usage attestation
+    assert captures[0][0][1:3] == ("rebase.module.m", "harness:cursor")
 
 
 def test_bridge_passes_repo_ROOT_not_repo_name(tmp_path, monkeypatch):

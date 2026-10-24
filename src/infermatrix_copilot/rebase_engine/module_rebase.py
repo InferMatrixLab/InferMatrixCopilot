@@ -175,7 +175,7 @@ async def _harness_attempt(prompt: str, *, module: str, config,
     """
     import asyncio
 
-    from ..providers import AgentSessionRequest
+    from ..providers import AgentSessionRequest, run_harness_session
     from ..providers.registry import transport_for_id
     from ..tool_bridge import write_bridge_spec
 
@@ -184,6 +184,7 @@ async def _harness_attempt(prompt: str, *, module: str, config,
     spec_path = write_bridge_spec(
         run_dir=run_dir, step_name=f"rebase.module.{module}", scope=scope,
         repo=config.repo,
+        knowledge_dir=getattr(config.settings, "knowledge_dir", None),
         rebase={
             "tool_schemas": str(Path(config.script_dir) / "tool_schemas.json"),
             "manifest_path": config.manifest_path,
@@ -207,7 +208,7 @@ async def _harness_attempt(prompt: str, *, module: str, config,
 
     before = _changed_files(scope.root)
     started = _time.time()
-    outcome = await asyncio.to_thread(transport.run_session, req)
+    outcome = await asyncio.to_thread(run_harness_session, transport, req)
 
     native, pre_gate = _native_writes(scope.root, run_dir, before, started)
     if native and trace is not None:

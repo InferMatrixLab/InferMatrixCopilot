@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Sequence
+
+from .init_coverage import Owner, most_specific, owner_for_paths
 from pathlib import PurePosixPath
 
 import yaml
@@ -89,3 +93,49 @@ def owner_rule_pages(head: dict[str, str], page: str) -> list[str]:
     target = PurePosixPath(page)
     return [p for p in head if PurePosixPath(p).parent == target.parent and
             (p == page or PurePosixPath(p).stem.startswith(target.stem + "-")) and p.endswith(".md")]
+
+
+CITATION_GUIDANCE = """Citation eligibility:
+For a component rule, every cited path must list that owner in
+citation_policy.component_evidence_owners. An empty list marks context-only
+source for component rules: it may inform a regression check but must not be
+cited as component-owned evidence. Ground the rule in an eligible implementation
+path; do not invent evidence when no eligible source supports it. For combined
+citations, the existing most-specific coverage and routing-order rule also
+selects the owner. More-specific owners take precedence over broad routes.
+These lists describe component path ownership only; they do not authorize a
+model-specific contract under a component. Model rules use the offered model
+scope and still require the correct named model. Do not evade a missing model
+page by generalizing a property of one model-specific method into a component
+rule; shared applicability must be demonstrated by the supplied source.
+"""
+
+
+@dataclass(frozen=True)
+class CitationPolicy:
+    """History's existing owner gate, also exposed as generation input data.
+
+    The descriptor records per-path necessary conditions. Collective routing
+    ties and model-name semantics remain checks on the completed candidate.
+    """
+    owners: Sequence[Owner]
+    models: list[dict]
+
+    def component_owners(self, path: str) -> list[Owner]:
+        return most_specific(path, self.owners)
+
+    def describe(self, paths: list[str]) -> dict:
+        return {"version": 1, "component_evidence_owners": {
+            path: [owner.owner for owner in self.component_owners(path)] for path in paths}}
+
+    def issue(self, owner: Owner, text: str, paths: list[str]) -> dict | None:
+        if not model_scope_valid(owner.owner, text, paths, self.models):
+            return {"kind": "model_scope", "owner": owner.owner, "paths": paths}
+        if not owner.owner.startswith("model:"):
+            selected = owner_for_paths(paths, self.owners)
+            outside = [path for path in paths if owner not in self.component_owners(path)]
+            if selected != owner or outside:
+                return {"kind": "component_scope", "owner": owner.owner,
+                        "unowned_paths": outside,
+                        "selected_owner": selected.owner if selected else None}
+        return None

@@ -22,13 +22,15 @@ hold:
   live or holds a real outcome; a reservation that never started is re-armed
   and relaunched under the same lock.
 
-Scope is deliberately narrow: `start_strict_review` only. Keying generic
-`start()` on a spec hash would be actively unsafe — `issue_answer` and
+Scope is explicit caller-supplied business keys, shared by Direct, Strict and
+quality reservations. Keying generic `start()` on a spec hash would be actively unsafe — `issue_answer` and
 `issue_filter` carry `pr=None` and no head, so every issue task in a repo would
 collapse onto one key and an answer for issue #1 could return the run for #500.
 """
 
 from __future__ import annotations
+
+from .persistence import atomic_write_bytes
 
 import hashlib
 import json
@@ -45,8 +47,8 @@ from .engine.lifecycle import fcntl, require_file_locking
 
 INDEX_DIR = ".idem"
 # Long enough that no plausible retry window outlives it, short enough to bound
-# the directory. The mapping is deliberately retained across terminal
-# completion, so unbounded growth is the default unless something reaps it.
+# the directory for resolved terminal runs. Unknown/interrupted bindings are
+# retained for reconciliation regardless of age.
 DEFAULT_RETENTION_DAYS = 30
 
 # Opaque to us; the caller supplies its own stable attempt identifier.
@@ -121,13 +123,27 @@ def key_lock(run_root: Path | str, key: str, *, timeout: float = 30.0):
 
 
 def read_entry(run_root: Path | str, key: str) -> Optional[dict]:
-    """The recorded entry for `key`, or None. A torn or unreadable entry reads
-    as absent, which simply means a fresh run — never a wrong one."""
+    """Return an existing binding; only an absent file permits a new run."""
+    return _read_entry_path(_entry_path(run_root, key), expected_key=key)
+
+
+def _read_entry_path(path: Path, *, expected_key: str | None = None) -> Optional[dict]:
     try:
-        data = json.loads(_entry_path(run_root, key).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # A dangling link is an unreadable binding, not proof of absence.
+        if path.is_symlink():
+            raise IdempotencyError("idempotency binding is unreadable; reconcile the original run")
         return None
-    return data if isinstance(data, dict) else None
+    except (OSError, ValueError) as exc:
+        raise IdempotencyError("idempotency binding is unreadable; reconcile the original run") from exc
+    if (not isinstance(data, dict)
+            or not isinstance(data.get("key"), str) or not KEY_RE.fullmatch(data["key"])
+            or (expected_key is not None and data["key"] != expected_key)
+            or not isinstance(data.get("run_id"), str) or not data["run_id"]
+            or data["run_id"] in (".", "..") or "/" in data["run_id"] or "\\" in data["run_id"]):
+        raise IdempotencyError("idempotency binding is invalid; reconcile the original run")
+    return data
 
 
 def write_entry(run_root: Path | str, key: str, run_id: str,
@@ -138,9 +154,7 @@ def write_entry(run_root: Path | str, key: str, run_id: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"key": key, "run_id": run_id, "spec_fingerprint": fingerprint,
                "created": time.time()}
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_bytes(path, json.dumps(payload, indent=2).encode("utf-8"))
 
 
 def relaunchable(run_dir: Path) -> bool:
@@ -152,6 +166,7 @@ def relaunchable(run_dir: Path) -> bool:
     did partial work and is a real outcome."""
     status = rs.read_status(run_dir) or {}
     return (status.get("state") == rs.INTERRUPTED
+            and "child_pid" in status
             and status.get("child_pid") is None)
 
 
@@ -187,26 +202,27 @@ def reap_stale(run_root: Path | str, *, retention_days: int = DEFAULT_RETENTION_
 
     for entry_file in sorted(index_dir(root).glob("*.json")):
         try:
-            entry = json.loads(entry_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            entry = {}
-        run_id = str((entry or {}).get("run_id") or "")
-        run_dir = root / run_id if run_id else None
-        missing = run_dir is None or not run_dir.exists()
-        # A missing run dir is not an error: the entry is stale by definition, so
-        # dropping it lets a later request with that key open a fresh run
-        # instead of resolving to a run that cannot be read.
-        if not missing:
-            status = rs.read_status(run_dir) or {}
-            if status.get("state") not in rs.TERMINAL:
-                continue  # never touch a live run's entry
-        if missing or float((entry or {}).get("created") or 0) < cutoff:
-            try:
-                with key_lock(root, str(entry.get("key") or "x"), timeout=1.0):
-                    entry_file.unlink(missing_ok=True)
-                counts["entries"] += 1
-            except (OSError, IdempotencyError):
+            entry = _read_entry_path(entry_file)
+            if entry is None or _entry_path(root, entry["key"]) != entry_file:
                 continue
+            with key_lock(root, entry["key"], timeout=1.0):
+                # Re-read under the lock: a prior observation must not erase a
+                # replacement binding. Unknown outcomes never expire here.
+                entry = read_entry(root, entry["key"])
+                if entry is None:
+                    continue
+                run_dir = (root / entry["run_id"]).resolve()
+                if run_dir.parent != root.resolve() or not run_dir.is_dir():
+                    continue
+                status = rs.read_status(run_dir) or {}
+                if status.get("state") not in rs.TERMINAL or status.get("state") == rs.INTERRUPTED:
+                    continue
+                created = entry.get("created")
+                if type(created) in (int, float) and 0 <= created < cutoff:
+                    entry_file.unlink(missing_ok=True)
+                    counts["entries"] += 1
+        except (OSError, IdempotencyError):
+            continue
 
     counts["worktrees"] = _reap_worktrees(cutoff, worktree_root)
     counts["refs"] = _reap_refs(root, repo_paths)

@@ -219,8 +219,7 @@ def _load(root: Path) -> dict[str, str]:
 
 
 def test_real_tree_operations_pass_both_validators(tmp_path):
-    import subprocess
-    import sys
+    from infermatrix_copilot.knowledge_service.validation import validate_workspace
 
     root = _copy_real_tree(tmp_path)
     files = _load(root)
@@ -247,10 +246,9 @@ def test_real_tree_operations_pass_both_validators(tmp_path):
     check = check_changeset(files, head, changes)
     codes = {i.code for i in check.issues}
     assert codes <= {"dangling_reference"}, check.issues
-    for tool in ("check_knowledge_tree.py", "check_wiki_lint.py"):
-        run = subprocess.run([sys.executable, str(root / "tools" / tool)],
-                             capture_output=True, text=True, cwd=root.parent)
-        assert run.returncode == 0, run.stdout + run.stderr
+    report = validate_workspace(root.parent)
+    assert len(report.results) == 2
+    assert report.passed, report.problems()
 
 
 def test_full_page_is_refused_with_a_split_hint():

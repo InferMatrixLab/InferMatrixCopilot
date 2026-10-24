@@ -5,9 +5,12 @@ bounded packets cover the entire declared inventory; unknowns remain explicit.
 """
 from __future__ import annotations
 
+from ..budgeting import native_outcome_unknown
+
+from ..persistence import atomic_write_bytes, immutable_write_bytes
+
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from concurrent.futures import as_completed
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import hashlib
@@ -16,13 +19,11 @@ import math
 import os
 from pathlib import Path
 import re
-import tempfile
-import threading
 import unicodedata
 
 import yaml
 
-from .init_budget import BudgetExhausted
+from .init_budget import Budget, BudgetExhausted
 from .init_stages import _Stage
 from .init_support import InitError, InitRecord, generate, inputs_digest
 from .models import ModelUnavailable
@@ -32,7 +33,10 @@ MAX_PACKET_CHARS = 24000
 MAX_CONFIGURED_PACKET_CHARS = 192000
 DEFAULT_START_INTERVAL_S = 15.0
 MAX_CANDIDATES = 24
+from ..knowledge_service.drafting import AttemptPolicy, run_attempts
+
 MAX_ATTEMPTS = 4
+CORRECTIONS = AttemptPolicy(MAX_ATTEMPTS)
 MAX_RESIDUAL_ROUNDS = 2
 MAX_SATURATION_SPLITS = 2
 MAX_BASELINE_CHARS = 16000
@@ -150,20 +154,10 @@ def write_full_discovery_report(state_dir, report):
     root = _report_archive_root(state_dir)
     root.mkdir(parents=True, exist_ok=True)
     path = root / (digest + ".json")
-    with tempfile.NamedTemporaryFile(dir=root, delete=False) as handle:
-        temporary = Path(handle.name)
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
     try:
-        try:
-            os.link(temporary, path)  # Exclusive atomic creation, never replacement.
-        except FileExistsError:
-            pass
-        if path.is_symlink() or path.read_bytes() != data:
-            raise InitError("immutable discovery report artifact differs; restore its original bytes")
-    finally:
-        temporary.unlink()
+        immutable_write_bytes(path, data, exist_ok=True)
+    except FileExistsError as exc:
+        raise InitError("immutable discovery report artifact differs; restore its original bytes") from exc
     return {"path": str(path), "sha256": digest, "size_bytes": len(data)}
 
 
@@ -232,7 +226,7 @@ def _hash(value):
 
 
 def _prompt(payload):
-    return "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace("<", "\\u003c") + "\n</untrusted_data>"
+    return "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True).replace("<", "\\u003c") + "\n</untrusted_data>"
 
 
 def validate_candidates(data):
@@ -415,12 +409,28 @@ def _decision_valid(row):
 
 def receipt(reply):
     """Only actual archived calls are usable for catalog acceptance."""
-    if not reply.trace_id or not re.fullmatch(r"[0-9a-f]{64}", reply.reply_sha256 or "") \
-            or hashlib.sha256(reply.text.encode()).hexdigest() != reply.reply_sha256:
-        raise ModelUnavailable("discovery native archive receipt is missing or inconsistent")
-    return {"trace_id": reply.trace_id, "reply_sha256": reply.reply_sha256,
-            "requested": reply.role.label(), "served_model": reply.served_model or None,
-            "usage": reply.usage, "seconds": reply.seconds, "cost_usd": reply.cost_usd}
+    from .quality_review import native_receipt
+
+    proof = native_receipt(reply, required=True)
+    if getattr(reply, "quality_receipt", None):
+        proof["quality_receipt"] = reply.quality_receipt
+    return proof
+
+
+def call_discovery_model(rt, budget, init, role, system, prompt, validate, *, verify_reply):
+    """One live/replay adapter for discovery's generation and quality calls."""
+    if role == "generator":
+        reply = generate(rt, budget, init, system=system, prompt=prompt, validate=validate)
+        verify_reply(reply)
+        return reply
+    if role != "judge":
+        raise ValueError("unknown discovery model role")
+    from .quality_review import QualityPolicy, review_call
+    return review_call(rt.gateway, rt.judge,
+        policy=QualityPolicy("feature-discovery", subscription=getattr(rt, "unlimited_subscription", False),
+                             archive="verified"),
+        system=system, prompt=prompt, validate=validate,
+        budget=budget, charge_usd=init.judge_call_usd, verify_reply=verify_reply)
 
 
 def _offered_reference(index, chunks, ref):
@@ -442,33 +452,37 @@ def _offered_reference(index, chunks, ref):
     return True
 
 
-class _ConcurrentBudget:
-    """Protect reservation accounting without serializing model execution."""
-    def __init__(self, budget, journal=None, identity=""):
-        self.budget, self.lock = budget, threading.Lock()
-        self.journal, self.identity = journal, identity
+def _discovery_budget(budget: Budget, journal: Path | None = None, identity: str = "") -> Budget:
+    """Adapt discovery's durable journal to the shared reservation owner."""
+    calls = {} if journal is not None else None
+    spent_usd = budget.spent_usd
+    if journal is not None and journal.exists():
+        from ..budgeting import reservation_fits
+        saved = json.loads(journal.read_text())
+        if not isinstance(saved, dict) or saved.get("identity") != identity:
+            raise ValueError("discovery reservation journal identity differs")
+        if saved.get("schema") not in (None, "discovery-budget/2"):
+            raise ValueError("unsupported discovery budget journal schema")
+        reservation_fits(None, saved["spent_usd"], saved["reserved_usd"], 0)
+        total = saved["spent_usd"] + saved["reserved_usd"]
+        # V2 is the accounting authority; the stage record mirrors its total.
+        # Legacy aggregates migrate from the conservative maximum once.
+        spent_usd = total if saved.get("schema") == "discovery-budget/2" else max(spent_usd, total)
+        calls = saved.get("calls", {})  # Legacy aggregates have no invented call identities.
+        if not isinstance(calls, dict):
+            raise ValueError("invalid discovery budget call journal")
+        # Validate this journal's own total before a higher host checkpoint can
+        # mask an inconsistent entry. The shared owner validates every call.
+        Budget(None, spent_usd=saved["spent_usd"] + saved["reserved_usd"], calls=calls)
 
-    def _persist(self):
-        if self.journal is None:
+    def checkpoint(spent: float, reserved: float) -> None:
+        if journal is None:
             return
-        self.journal.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.journal.with_suffix(".tmp")
-        temp.write_text(_json({"identity": self.identity, "spent_usd": self.budget.spent_usd,
-                              "reserved_usd": self.budget._reserved}))
-        temp.replace(self.journal)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(journal, _json({"schema": "discovery-budget/2", "identity": identity, "spent_usd": spent,
+                                          "reserved_usd": reserved, "calls": calls}).encode())
 
-    @contextmanager
-    def reserve(self, amount):
-        cm = self.budget.reserve(amount)
-        with self.lock:
-            reservation = cm.__enter__()
-            self._persist()
-        try:
-            yield reservation
-        finally:
-            with self.lock:
-                cm.__exit__(None, None, None)
-                self._persist()
+    return Budget(budget.limit_usd, spent_usd=spent_usd, checkpoint=checkpoint, calls=calls)
 
 
 class DiscoveryEngine:
@@ -478,7 +492,7 @@ class DiscoveryEngine:
     results and use a shared generator/judge concurrency ceiling.
     """
     def __init__(self, index, *, seeds, owners, state, call, save, concurrency=13, repository="", pin="",
-                 packet_chars=None, scan_paths=None):
+                 packet_chars=None, scan_paths=None, execution=None):
         packet_chars = MAX_PACKET_CHARS if packet_chars is None else packet_chars
         if isinstance(packet_chars, bool) or not isinstance(packet_chars, int) \
                 or not MAX_PACKET_CHARS <= packet_chars <= MAX_CONFIGURED_PACKET_CHARS:
@@ -486,6 +500,7 @@ class DiscoveryEngine:
         self.index, self.seeds, self.owners, self.state = index, seeds, owners, state
         self.call, self.save, self.concurrency = call, save, concurrency
         self.repository, self.pin = repository, pin
+        self.execution = deepcopy(execution)
         self.packet_chars = packet_chars
         self.scan_paths = None if scan_paths is None else frozenset(scan_paths)
         if self.scan_paths is not None and any(path not in index.entries for path in self.scan_paths):
@@ -502,6 +517,179 @@ class DiscoveryEngine:
         from .feature_discovery_index import contract_units
         self.units = [unit for unit in contract_units(index)
                       if self.scan_paths is None or unit["path"] in self.scan_paths]
+
+    def _execute_task(self, task, policy):
+        """Execute one policy-bound task; scheduling and settlement stay outside."""
+        kind = policy["kind"]
+        if kind == "extract":
+            key, packet, _, _ = task
+            return self._extract(key, packet, policy["baseline"])
+        if kind == "repair":
+            key, original, decision, _, _, revised = task
+            return (self._review([revised], policy["baseline"]) if revised is not None else
+                    self._repair_extract(key, original, decision, policy["baseline"]))
+        if kind == "candidate":
+            return self._review(task, policy["baseline"])
+        if kind == "boundary":
+            return self._review(task, policy["baseline"], audit=_boundary_context(policy["marker"]))
+        if kind == "consolidation":
+            return self._review_consolidation(task, policy["features"], policy["marker"])
+        raise ValueError("unknown discovery task policy")
+
+    def _run_tasks(self, phase, tasks, settle, *, request_context, **options):
+        from .quality_review import DispatchJournal, drain_review_tasks, validate_dispatch_intents, validate_dispatch_requests
+        from ..trace_store import environment_fingerprint
+
+        pending = self.state.setdefault("dispatch_intents", {})
+        validate_dispatch_intents(pending)
+        validate_dispatch_requests(self.state.get("dispatch_requests", {}))
+        if pending:
+            raise ModelUnavailable("discovery execution outcome unknown; reconcile original dispatch before retry",
+                                   allow_fallback=False)
+
+        def checkpoint(update):
+            update()
+            self.save()
+
+        context = {"schema": "discovery-context/1", "runtime": environment_fingerprint(),
+                   "repository": self.repository, "pin": self.pin, "index": self.index.identity,
+                   "seeds": self.seeds, "owners": self.owners, "packet_chars": self.packet_chars,
+                   "scan_paths": sorted(self.scan_paths) if self.scan_paths is not None else None,
+                   "execution": self.execution,
+                   "policy": request_context,
+                   "state": {key: value for key, value in self.state.items()
+                             if key not in {"dispatch_intents", "dispatch_requests", "dispatch_contexts"}}}
+        context = json.loads(json.dumps(context, ensure_ascii=False))
+        context_key = _hash(context)
+        self.state.setdefault("dispatch_contexts", {})[context_key] = context
+        journal = DispatchJournal(pending, lambda task: {
+            "phase": phase, "repository": self.repository, "pin": self.pin,
+            "task_sha256": _hash(task), "context_sha256": context_key,
+            "attempt": (task[3] if phase == "repair" else
+                        max((self.state["review_attempts"].get(row["id"], 0) for row in task), default=0) + 1
+                        if phase == "review" else self.state["tasks"].get(task[0], {}).get("attempts", 0) + 1)},
+            checkpoint, requests=self.state.setdefault("dispatch_requests", {}),
+            snapshot=lambda task: {"schema": "discovery-request/1", "phase": phase,
+                                   "context_sha256": context_key, "task": task},
+            uncertain=lambda value, error: bool(
+                (isinstance(value, dict) and value.get("outcome_unknown")) or
+                native_outcome_unknown(error)))
+        if context["policy"]["kind"] == "consolidation":
+            self._prepare_consolidation_context(context["policy"]["features"])
+        return drain_review_tasks(tasks, lambda task: self._execute_task(task, context["policy"]),
+                                  settle, journal=journal, **options)
+
+    def original_request(self, *, scope):
+        """Read original task inputs without dispatch, repair or settlement."""
+        from .quality_review import DispatchJournal
+        from ..trace_store import environment_fingerprint
+
+        journal = DispatchJournal(self.state.get("dispatch_intents", {}), None, None,
+                                  requests=self.state.get("dispatch_requests"))
+        request = journal.original_request(scope=scope)
+        binding = self.state["dispatch_requests"][scope[0]]["binding"]
+        context = self.state.get("dispatch_contexts", {}).get(request.get("context_sha256"))
+        if (request.get("schema") != "discovery-request/1" or not isinstance(context, dict)
+                or context.get("schema") != "discovery-context/1"
+                or _hash(context) != request.get("context_sha256")
+                or binding.get("context_sha256") != request.get("context_sha256")
+                or binding.get("phase") != request.get("phase")
+                or binding.get("task_sha256") != _hash(request.get("task"))
+                or context.get("repository") != self.repository or binding.get("repository") != self.repository
+                or context.get("pin") != self.pin or binding.get("pin") != self.pin
+                or _hash(context.get("index")) != _hash(self.index.identity)
+                or context.get("runtime") != environment_fingerprint(refresh=True)):
+            raise ModelUnavailable("original discovery request context is missing or mismatched", allow_fallback=False)
+        allowed = {"extract": {"extract"}, "repair": {"repair"},
+                   "review": {"candidate", "boundary", "consolidation"}}
+        if context.get("policy", {}).get("kind") not in allowed.get(request["phase"], set()):
+            raise ModelUnavailable("original discovery task policy is unavailable", allow_fallback=False)
+        return {**request, "context": deepcopy(context)}
+
+    def replay_original_task(self, store, *, scope):
+        """Replay retained calls under the application's offline writer guard.
+
+        Return original call facts for separate account/result settlement.
+        This does not clear an intent or execute follow-up work.
+        """
+        from functools import partial
+        from types import SimpleNamespace
+        from .init_support import restore_execution
+        from .init_replay import OriginalTaskReplay, original_task_records
+        from .quality_review import _attempt_scope, native_receipt, verify_archived_receipt
+
+        request = self.original_request(scope=scope)
+        context = request["context"]
+        if not isinstance(context.get("execution"), dict):
+            raise ModelUnavailable("original discovery execution settings are unavailable", allow_fallback=False)
+        rt, init = restore_execution(SimpleNamespace(), context["execution"])
+        binding = self.state["dispatch_requests"][scope[0]]["binding"]
+        records = original_task_records(store, binding=binding, attempt=scope[1])
+        roles = [rt.generator.label()] if rt.subscription_generator or rt.unlimited_subscription else []
+        if rt.unlimited_subscription:
+            roles.append(rt.judge.label())
+        replay = OriginalTaskReplay(store, records, binding=binding, attempt=scope[1], subscription_roles=roles,
+                                    zcode_reasoning_level=context["execution"]["zcode_reasoning_level"])
+        rt.gateway = replay
+        by_id = {record["id"]: record for record in records}
+        def verify(reply):
+            verify_archived_receipt(store, native_receipt(reply), reply.role, reply.text,
+                                   zcode_reasoning_level=replay.zcode_reasoning_level, record=by_id[reply.trace_id])
+        worker = DiscoveryEngine(self.index, seeds=context["seeds"], owners=context["owners"],
+            state=context["state"], call=partial(call_discovery_model, rt, replay, init, verify_reply=verify),
+            save=lambda: None, concurrency=1, repository=context["repository"], pin=context["pin"],
+            packet_chars=context["packet_chars"], scan_paths=context["scan_paths"], execution=context["execution"])
+        with _attempt_scope(*scope):
+            result = worker._execute_task(request["task"], context["policy"])
+        return result, replay.consumed_records()
+
+    def prepare_original_result(self, store, *, scope):
+        """Prepare a detached state update; the host must settle accounts first.
+
+        Preserve independent completed work and refuse changes to this task's
+        inputs or result authority. The returned intent remains pending until
+        the host checkpoints the proposal through the shared dispatch journal.
+        """
+        request = self.original_request(scope=scope)
+        result, calls = self.replay_original_task(store, scope=scope)
+        digest = _hash({"scope": scope, "result": result})
+        previous = self.state.get("reconciled_dispatches", {}).get(scope[0])
+        if previous is not None:
+            if previous != digest:
+                raise ModelUnavailable("original discovery result is immutable", allow_fallback=False)
+            return deepcopy(self.state), calls, digest
+        if scope[0] not in self.state.get("dispatch_intents", {}):
+            raise ModelUnavailable("original discovery task is not pending", allow_fallback=False)
+        context, task = request["context"], request["task"]
+        kind, frozen = context["policy"]["kind"], context["state"]
+        if kind == "extract":
+            targets, tables = [task[0]], ("tasks",)
+        elif kind == "repair":
+            targets, tables = [task[0]], ("candidates", "reviews", "review_attempts", "repair_drafts", "repairs")
+        else:
+            targets = [row["id"] for row in task]
+            tables = (("candidates", "reviews", "review_attempts") if kind == "candidate" else
+                      ("candidates", "reviews", "boundary_reviews") if kind == "boundary" else
+                      ("candidates", "boundary_reviews", "consolidation_reviews"))
+        if any(self.state.get(table, {}).get(key) != frozen.get(table, {}).get(key)
+               for table in tables for key in targets):
+            raise ModelUnavailable("original discovery result authority changed", allow_fallback=False)
+        if kind in {"boundary", "consolidation"}:
+            marker = f"catalog_{kind}_audit"
+            if self.state.get(marker) != frozen.get(marker):
+                raise ModelUnavailable("original discovery audit changed", allow_fallback=False)
+        proposed = deepcopy(self.state)
+        worker = DiscoveryEngine(self.index, seeds=context["seeds"], owners=context["owners"], state=proposed,
+            call=None, save=lambda: None, repository=context["repository"], pin=context["pin"],
+            packet_chars=context["packet_chars"], scan_paths=context["scan_paths"], execution=context["execution"])
+        if kind == "extract":
+            worker._accept_extraction(task, result)
+        elif kind == "repair":
+            worker._accept_repair(task, result)
+        else:
+            worker._accept_reviews(task, result, context["policy"])
+        proposed.setdefault("reconciled_dispatches", {})[scope[0]] = digest
+        return proposed, calls, digest
 
     def _baseline(self):
         return [{"catalog_status": "existing_feature", **{k: row.get(k) for k in ("id", "title", "owner", "source_globs")}} for row in self.seeds] + [
@@ -542,7 +730,7 @@ class DiscoveryEngine:
         payload["lead_limitations"] = "Localization leads, not certified features or runtime/test relationships."
         last_error = self.state["tasks"].get(key, {}).get("reason", "")
         attempts = self.state["tasks"].get(key, {}).get("attempts", 0)
-        for attempt in range(attempts, MAX_ATTEMPTS):
+        def attempt_once(last_error, attempt):
             try:
                 reply = self.call("generator", SYSTEM_DISCOVER, _prompt({**payload, "repair_reason": last_error}), validate_candidates)
                 proof = receipt(reply)
@@ -561,16 +749,23 @@ class DiscoveryEngine:
                     row["generator_receipts"] = [proof]
                     row["origin_rounds"] = ["source", payload["round"]] if payload["round"].startswith("residual") else [payload["round"]]
                     checked.append(row)
-                return {"status": "complete", "attempts": attempt + 1, "candidates": checked, "invalid_candidates": invalid, "receipt": proof,
-                        "candidate_limit_reached": len(reply.data["candidates"]) == MAX_CANDIDATES}
+                return reply, {"status": "complete", "attempts": attempt + 1, "candidates": checked, "invalid_candidates": invalid, "receipt": proof,
+                        "candidate_limit_reached": len(reply.data["candidates"]) == MAX_CANDIDATES}, None, ""
             except BudgetExhausted:
                 raise
             except ModelUnavailable as exc:
-                return {"status": "unknown", "attempts": attempt + 1, "reason": str(exc), "candidates": []}
+                return None, {"status": "unknown", "attempts": attempt + 1, "reason": str(exc), "candidates": [],
+                              "outcome_unknown": native_outcome_unknown(exc)}, None, str(exc)
             except ValueError as exc:
-                last_error = str(exc)
+                return None, None, str(exc), str(exc)
+
+        _, accepted, observations = run_attempts(attempt_once, policy=CORRECTIONS,
+                                                completed=attempts, feedback=last_error)
+        if accepted is not None:
+            return accepted
         return {"status": "unknown", "attempts": MAX_ATTEMPTS,
-                "reason": last_error or "initial extraction and three corrections exhausted", "candidates": []}
+                "reason": (observations[-1]["error"] if observations else last_error)
+                or "initial extraction and three corrections exhausted", "candidates": []}
 
     def _collect(self, task, *, invalidate=True):
         for incoming in task.get("candidates", []):
@@ -637,6 +832,30 @@ class DiscoveryEngine:
             if current and checked.get("candidate_sha256") and checked["candidate_sha256"] != _hash(current):
                 self.state["review_attempts"][key] = max(self.state["review_attempts"].get(key, 0), checked.get("attempts", 0))
 
+    def _accept_extraction(self, item, result):
+        """Apply one extraction result; follow-up scheduling stays with the host."""
+        key, _, depth, parent = item
+        result.update(split_depth=depth, split_parent=parent)
+        self.state["tasks"][key] = result
+        self._collect(result)
+
+    def _accept_reviews(self, rows, decisions, policy):
+        """Apply primary or supplemental judgments using their own authority."""
+        kind = policy["kind"]
+        if kind not in {"candidate", "boundary", "consolidation"}:
+            raise ValueError("unknown discovery review result policy")
+        for row in rows:
+            result = {**decisions[row["id"]], "candidate_sha256": _hash(row)}
+            if kind == "candidate":
+                result["attempts"] = self.state["review_attempts"].get(row["id"], 0) + 1
+                self.state["review_attempts"][row["id"]] = result["attempts"]
+                self.state["reviews"][row["id"]] = result
+            else:
+                source, proof = (("reviews", "primary_review_sha256") if kind == "boundary"
+                                 else ("boundary_reviews", "boundary_review_sha256"))
+                self.state.setdefault(f"{kind}_reviews", {})[row["id"]] = {
+                    **result, proof: _hash(self.state[source][row["id"]])}
+
     def _run_packet_work(self, kind, packets):
         ready, visited = deque(), set()
 
@@ -663,32 +882,33 @@ class DiscoveryEngine:
 
         for packet in packets:
             schedule(packet)
-        baseline, stopped = self._baseline(), False
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            pending = {}
-            while ready or pending:
-                while not stopped and ready and len(pending) < self.concurrency:
-                    key, packet, depth, parent = ready.popleft()
-                    pending[pool.submit(self._extract, key, packet, baseline)] = (key, packet, depth, parent)
-                if not pending:
-                    break
-                future = next(as_completed(pending))
-                key, packet, depth, parent = pending.pop(future)
-                try:
-                    task = future.result()
-                except BudgetExhausted:
-                    stopped = True
-                    self.state["tasks"].setdefault(key, {}).update(status="pending", reason="budget exhausted")
-                else:
-                    task.update(split_depth=depth, split_parent=parent)
-                    self.state["tasks"][key] = task
-                    self._collect(task)
-                    if task.get("candidate_limit_reached"):
-                        expand(key, packet, depth)
-                self.save()
+
+        baseline = self._baseline()
+        initial = list(ready)
+        ready.clear()
+
+        def settle(item, task, error):
+            key, packet, depth, parent = item
+            if isinstance(error, BudgetExhausted):
+                self.state["tasks"].setdefault(key, {}).update(status="pending", reason="budget exhausted")
+            elif error is not None:
+                raise error
+            else:
+                self._accept_extraction(item, task)
+                if task.get("candidate_limit_reached"):
+                    expand(key, packet, depth)
+            self.save()
+            followups = list(ready)
+            ready.clear()
+            return followups
+
+        completed = self._run_tasks("extract", initial, settle, concurrency=self.concurrency,
+                                      request_context={"kind": "extract", "baseline": baseline},
+                                      stop_on=(BudgetExhausted,), completion_order=as_completed,
+                                      followups_first=False)
         self._rebuild_candidates()
         self.save()
-        return not stopped
+        return completed
 
     def scan(self):
         for kind in ("doc", "source"):
@@ -751,31 +971,36 @@ class DiscoveryEngine:
                    if (key not in self.state["reviews"] or
                        self.state["reviews"][key].get("candidate_sha256") and
                        self.state["reviews"][key]["candidate_sha256"] != _hash(row))
-                   and self.state["review_attempts"].get(key, 0) < MAX_ATTEMPTS]
+                   and CORRECTIONS.allows(self.state["review_attempts"].get(key, 0))]
         baseline = self._baseline()
-        batches = [pending[n:n + 12] for n in range(0, len(pending), 12)]
-        stopped = False
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            for start in range(0, len(batches), self.concurrency):
-                jobs = {pool.submit(self._review, rows, baseline): rows for rows in batches[start:start + self.concurrency]}
-                for future in as_completed(jobs):
-                    rows = jobs[future]
-                    try:
-                        decisions = future.result()
-                    except BudgetExhausted:
-                        stopped = True
-                        continue
-                    except (ModelUnavailable, ValueError) as exc:
-                        decisions = {r["id"]: {"supported": "unsure", "relation": "unknown", "related_id": "", "reason": str(exc), "repair_blocked": True} for r in rows}
-                    for row in rows:
-                        result = decisions[row["id"]]
-                        result["attempts"] = self.state["review_attempts"].get(row["id"], 0) + 1
-                        self.state["review_attempts"][row["id"]] = result["attempts"]
-                        self.state["reviews"][row["id"]] = result
-                    self.save()
-                if stopped:
-                    return False
+
+        if not self._review_batches(pending,
+                                    request_context={"kind": "candidate", "baseline": baseline}):
+            return False
         return self._repair_parallel(baseline)
+
+    def _review_batches(self, pending, *, request_context):
+        """Drain each bounded tranche and durably retain all completed decisions."""
+        batches = [pending[n:n + 12] for n in range(0, len(pending), 12)]
+
+        def settle(rows, decisions, error):
+            if isinstance(error, BudgetExhausted):
+                return
+            if isinstance(error, (ModelUnavailable, ValueError)):
+                decisions = {r["id"]: {"supported": "unsure", "relation": "unknown", "related_id": "",
+                    "reason": str(error), "repair_blocked": True} for r in rows}
+            elif error is not None:
+                raise error
+            self._accept_reviews(rows, decisions, request_context)
+            self.save()
+
+        for start in range(0, len(batches), self.concurrency):
+            if not self._run_tasks("review", batches[start:start + self.concurrency], settle,
+                                      request_context=request_context,
+                                      concurrency=self.concurrency, stop_on=(BudgetExhausted,),
+                                      completion_order=as_completed):
+                return False
+        return True
 
     def _repair_extract(self, key, original, decision, baseline):
         """One immutable extraction result; only the coordinator checkpoints it."""
@@ -799,69 +1024,65 @@ class DiscoveryEngine:
         revised["origin_rounds"] = original["origin_rounds"]
         return revised
 
+    def _accept_repair(self, item, result, error=None):
+        """Apply repair policy and return its next action without scheduling it."""
+        key, original, decision, attempt, repair_base, revised = item
+        if isinstance(error, BudgetExhausted):
+            return "budget"
+        if isinstance(error, ModelUnavailable):
+            self.state["reviews"][key] = {"supported": "unsure", "relation": "unknown", "related_id": "", "reason": str(error),
+                "attempts": decision.get("attempts", 1), "repair_blocked": True}
+            return "stop"
+        if isinstance(error, ValueError):
+            decision = {"supported": "unsure", "relation": "unknown", "related_id": "", "reason": str(error), "attempts": attempt}
+        elif error is not None:
+            raise error
+        elif revised is None:
+            self.state.setdefault("repair_drafts", {})[key] = {
+                "base_sha256": _hash(original), "attempt": attempt, "candidate": deepcopy(result)}
+            return "review"
+        else:
+            self.state["candidates"][key] = revised
+            self.state.setdefault("repairs", {})[key] = {"base_sha256": repair_base, "candidate": deepcopy(revised)}
+            decision = {**result[key], "attempts": attempt}
+        self.state.get("repair_drafts", {}).pop(key, None)
+        self.state["reviews"][key] = decision
+        self.state["review_attempts"][key] = max(self.state["review_attempts"].get(key, 0), decision.get("attempts", 0))
+        return "retry"
+
+
     def _repair_parallel(self, baseline):
         # A candidate has at most one native call in flight. Extract and judge
         # share the same ceiling, with every draft saved before its judge starts.
         def eligible(key):
             row, decision = self.state["candidates"][key], self.state["reviews"].get(key, {})
-            return decision.get("supported") != "yes" and self.state["review_attempts"].get(key, decision.get("attempts", 0)) < MAX_ATTEMPTS \
+            return decision.get("supported") != "yes" and CORRECTIONS.allows(self.state["review_attempts"].get(key, decision.get("attempts", 0))) \
                 and not decision.get("repair_blocked") \
                 and any(ref["path"] in self.index.production for ref in row["evidence"])
 
-        ready = deque(key for key in sorted(self.state["candidates"]) if eligible(key))
-        stopped = False
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            pending = {}
-            while ready or pending:
-                while not stopped and ready and len(pending) < self.concurrency:
-                    key = ready.popleft()
-                    original = deepcopy(self.state["candidates"][key])
-                    decision = deepcopy(self.state["reviews"].get(key, {}))
-                    attempt = self.state["review_attempts"].get(key, decision.get("attempts", 0)) + 1
-                    repair_base = self.state.get("repairs", {}).get(key, {}).get("base_sha256", _hash(original))
-                    draft = self.state.get("repair_drafts", {}).get(key)
-                    if draft and draft["base_sha256"] == _hash(original) and draft["attempt"] == attempt:
-                        revised = deepcopy(draft["candidate"])
-                        phase = "judge"
-                        future = pool.submit(self._review, [revised], baseline)
-                    else:
-                        revised = None
-                        phase = "extract"
-                        future = pool.submit(self._repair_extract, key, original, decision, baseline)
-                    pending[future] = (key, original, decision, attempt, repair_base, phase, revised)
-                if not pending:
-                    break
-                future = next(as_completed(pending))
-                key, original, decision, attempt, repair_base, phase, revised = pending.pop(future)
-                try:
-                    result = future.result()
-                    if phase == "extract":
-                        self.state.setdefault("repair_drafts", {})[key] = {
-                            "base_sha256": _hash(original), "attempt": attempt, "candidate": deepcopy(result)}
-                        self.save()
-                        ready.appendleft(key)  # Judge the durable draft before another correction.
-                        continue
-                    self.state["candidates"][key] = revised
-                    self.state.setdefault("repairs", {})[key] = {"base_sha256": repair_base, "candidate": deepcopy(revised)}
-                    decision = {**result[key], "attempts": attempt}
-                except BudgetExhausted:
-                    # Stop new dispatch but drain and checkpoint all successes.
-                    stopped = True
-                    continue
-                except ModelUnavailable as exc:
-                    self.state["reviews"][key] = {"supported": "unsure", "relation": "unknown", "related_id": "", "reason": str(exc),
-                        "attempts": decision.get("attempts", 1), "repair_blocked": True}
-                    self.save()  # Preserve a successful draft for explicit channel retry.
-                    continue
-                except ValueError as exc:
-                    decision = {"supported": "unsure", "relation": "unknown", "related_id": "", "reason": str(exc), "attempts": attempt}
-                self.state.get("repair_drafts", {}).pop(key, None)
-                self.state["reviews"][key] = decision
-                self.state["review_attempts"][key] = max(self.state["review_attempts"].get(key, 0), decision.get("attempts", 0))
-                self.save()
-                if eligible(key):
-                    ready.append(key)
-        return not stopped
+
+        def task(key):
+            original = deepcopy(self.state["candidates"][key])
+            decision = deepcopy(self.state["reviews"].get(key, {}))
+            attempt = self.state["review_attempts"].get(key, decision.get("attempts", 0)) + 1
+            repair_base = self.state.get("repairs", {}).get(key, {}).get("base_sha256", _hash(original))
+            draft = self.state.get("repair_drafts", {}).get(key)
+            revised = (deepcopy(draft["candidate"]) if draft and draft["base_sha256"] == _hash(original)
+                       and draft["attempt"] == attempt else None)
+            return key, original, decision, attempt, repair_base, revised
+
+        def settle(item, result, error):
+            action = self._accept_repair(item, result, error)
+            if action == "budget":
+                return
+            self.save()  # Persist a draft before its independent judgment.
+            key = item[0]
+            return [task(key)] if action == "review" or (action == "retry" and eligible(key)) else []
+
+        return self._run_tasks("repair", (task(key) for key in sorted(self.state["candidates"]) if eligible(key)),
+                                  settle, concurrency=self.concurrency,
+                                  request_context={"kind": "repair", "baseline": baseline},
+                                  stop_on=(BudgetExhausted,), completion_order=as_completed)
 
     def unit_resolution(self, features=None, outcomes=None):
         """Only independently accepted line anchors explain an inventory unit.
@@ -1006,43 +1227,31 @@ class DiscoveryEngine:
                 if self.state["reviews"].get(key, {}).get("relation") == "new"
                 and self._implemented_approval(row, self.state["reviews"][key])]
         identity = _boundary_identity(self.seeds, self.state, repository=self.repository, pin=self.pin)
+        baseline = self._baseline()
+        return self._audit_catalog(rows, name="boundary", identity=identity, source="reviews",
+            request_context={"baseline": baseline},
+            current=_boundary_current,
+            order=lambda r: (re.sub(r"-[a-f0-9]{8}$", "", r["id"]), r["id"]))
+
+    def _audit_catalog(self, rows, *, name, identity, source, current, order, request_context):
+        """Persist one supplemental audit, retaining successful batches on budget exhaustion."""
         marker = {"identity": identity, "candidate_ids": [r["id"] for r in rows], "done": False}
-        previous = self.state.get("catalog_boundary_audit", {})
+        audit_key, reviews_key = f"catalog_{name}_audit", f"{name}_reviews"
+        previous = self.state.get(audit_key, {})
         if previous.get("identity") != identity or previous.get("candidate_ids") != marker["candidate_ids"]:
             if previous:
-                self.state.setdefault("boundary_history", []).append({"audit": deepcopy(previous),
-                    "reviews": deepcopy(self.state.get("boundary_reviews", {}))})
-            self.state["boundary_reviews"] = {}
-        self.state["catalog_boundary_audit"] = marker
-        decisions = self.state.setdefault("boundary_reviews", {})
-        pending = [r for r in rows if not _boundary_current(r, self.state["reviews"][r["id"]], decisions.get(r["id"], {}))]
-        # Collision families stay adjacent so the reviewer can classify aliases
-        # against one another, while the complete formal baseline remains visible.
-        pending.sort(key=lambda r: (re.sub(r"-[a-f0-9]{8}$", "", r["id"]), r["id"]))
-        batches = [pending[n:n + 12] for n in range(0, len(pending), 12)]
-        baseline = self._baseline()
+                self.state.setdefault(f"{name}_history", []).append({"audit": deepcopy(previous),
+                    "reviews": deepcopy(self.state.get(reviews_key, {}))})
+            self.state[reviews_key] = {}
+        self.state[audit_key] = marker
+        decisions = self.state.setdefault(reviews_key, {})
+        pending = sorted((r for r in rows if not current(r, self.state[source][r["id"]],
+                          decisions.get(r["id"], {}))), key=order)
+
         self.save()
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            for start in range(0, len(batches), self.concurrency):
-                jobs = {pool.submit(self._review, batch, baseline, audit=_boundary_context(marker)): batch
-                        for batch in batches[start:start + self.concurrency]}
-                stopped = False
-                for future in as_completed(jobs):
-                    batch = jobs[future]
-                    try:
-                        results = future.result()
-                    except BudgetExhausted:
-                        stopped = True
-                        continue
-                    except (ModelUnavailable, ValueError) as exc:
-                        results = {r["id"]: {"supported": "unsure", "relation": "unknown", "related_id": "",
-                            "reason": str(exc), "repair_blocked": True} for r in batch}
-                    for row in batch:
-                        decisions[row["id"]] = {**results[row["id"]], "candidate_sha256": _hash(row),
-                            "primary_review_sha256": _hash(self.state["reviews"][row["id"]])}
-                    self.save()
-                if stopped:
-                    return False
+        if not self._review_batches(pending,
+                                    request_context={**request_context, "kind": name, "marker": marker}):
+            return False
         marker["done"] = True
         self.save()
         return True
@@ -1110,19 +1319,15 @@ class DiscoveryEngine:
         bridges.sort(key=lambda item: (-item[0], item[1]["path"], item[1]["start"]))
         unique = {_json(excerpt): excerpt for _, excerpt in bridges}
         def merged(items):
+            from .evidence_bundle import merge_ranges
+
             ranges = {}
             for item in items:
                 ranges.setdefault(item["path"], []).append((item["start"], item["end"]))
             result = []
             for path, intervals in sorted(ranges.items()):
-                combined = []
-                for start, end in sorted(intervals):
-                    if combined and start <= combined[-1][1] + 1:
-                        combined[-1] = (combined[-1][0], max(end, combined[-1][1]))
-                    else:
-                        combined.append((start, end))
                 result.extend(evidence_excerpt(self.index, {"path": path, "start": start, "end": end})
-                              for start, end in combined)
+                              for start, end in merge_ranges(intervals))
             return result
         excerpts = merged(excerpts)
         consumers = []
@@ -1170,45 +1375,10 @@ class DiscoveryEngine:
     def audit_catalog_consolidation(self, features):
         identity = _consolidation_identity(self.seeds, self.state, features, repository=self.repository, pin=self.pin)
         keys = [r["id"] for r in _consolidation_summaries(self.state, features, self.seeds)]
-        marker = {"identity": identity, "candidate_ids": keys, "done": False}
-        previous = self.state.get("catalog_consolidation_audit", {})
-        if previous.get("identity") != identity or previous.get("candidate_ids") != keys:
-            if previous:
-                self.state.setdefault("consolidation_history", []).append({"audit": deepcopy(previous),
-                    "reviews": deepcopy(self.state.get("consolidation_reviews", {}))})
-            self.state["consolidation_reviews"] = {}
-        self.state["catalog_consolidation_audit"] = marker
-        reviews = self.state.setdefault("consolidation_reviews", {})
-        pending = [self.state["candidates"][k] for k in keys if not _consolidation_current(
-            self.state["candidates"][k], self.state["boundary_reviews"][k], reviews.get(k, {}))]
-        pending.sort(key=lambda r: (r["owner"], re.sub(r"-[a-f0-9]{8}$", "", r["id"]), r["id"]))
-        batches = [pending[n:n + 12] for n in range(0, len(pending), 12)]
-        self._prepare_consolidation_context(features)
-        self.save()
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            for start in range(0, len(batches), self.concurrency):
-                jobs = {pool.submit(self._review_consolidation, b, features, marker): b
-                        for b in batches[start:start + self.concurrency]}
-                stopped = False
-                for future in as_completed(jobs):
-                    batch = jobs[future]
-                    try:
-                        results = future.result()
-                    except BudgetExhausted:
-                        stopped = True
-                        continue
-                    except (ModelUnavailable, ValueError) as exc:
-                        results = {r["id"]: {"supported": "unsure", "relation": "unknown", "related_id": "",
-                            "reason": str(exc), "repair_blocked": True} for r in batch}
-                    for row in batch:
-                        reviews[row["id"]] = {**results[row["id"]], "candidate_sha256": _hash(row),
-                            "boundary_review_sha256": _hash(self.state["boundary_reviews"][row["id"]])}
-                    self.save()
-                if stopped:
-                    return False
-        marker["done"] = True
-        self.save()
-        return True
+        return self._audit_catalog([self.state["candidates"][k] for k in keys],
+            request_context={"features": features},
+            name="consolidation", identity=identity, source="boundary_reviews", current=_consolidation_current,
+            order=lambda r: (r["owner"], re.sub(r"-[a-f0-9]{8}$", "", r["id"]), r["id"]))
 
     def catalog(self, repo_dir, *, require_boundary=False, consolidation_features=None):
         from .feature_discovery_index import validate_evidence
@@ -1319,28 +1489,11 @@ class DiscoveryEngine:
 
 @dataclass
 class _FeatureDiscovery(_Stage):
+
+    GENERATION_TASK_JOURNALED = True
+
     STAGE = "feature-discovery"
     retry_unfinished: bool = False
-
-    def run(self):
-        """Hold the batch lease before reading or replacing any checkpoint.
-
-        A competing invocation must leave the active writer's record and
-        reservation journal intact, including when it is a cached preview.
-        """
-        import fcntl
-
-        lock_path = Path(self.rt.state_dir) / "init" / self.lifecycle.repo / "feature-discovery.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise InitError("this discovery batch is already running; checkpoint left unchanged") from exc
-            try:
-                return super().run()
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _refresh_quick_maps(self):
         return []  # Catalog publication never changes knowledge pages.
@@ -1396,47 +1549,44 @@ class _FeatureDiscovery(_Stage):
             raise InitError("discovery compact report identity differs")
         return verify_full_discovery_report(self.rt.state_dir, report, record.discovery)
 
-    def _publish(self, changed):
+    def _prepare_publication(self, changed):
         try:
             self._verify_report_record(self.record, changed)
             if self.record.discovery.get("catalog_renderer_version") != CATALOG_RENDERER_VERSION:
                 raise InitError("discovery catalog requires the current renderer before publication")
         except InitError as exc:
             return self._blocked([str(exc)])
-        return super()._publish(changed)
+        return super()._prepare_publication(changed)
 
     def _boundary_record_ready(self, previous):
         state = previous.discovery
         if not state.get("catalog_boundary_audit", {}).get("done") or not state.get("index_sha256"):
             return False
-        from .feature_discovery_index import load_discovery_index
+        from .feature_discovery_index import load_index_snapshot
         # A checkpoint cannot declare an empty audit subset for implemented new
         # candidates. Recover the verified inventory, independent of proposals.
-        for path in (Path(self.rt.state_dir) / "feature-discovery-index").glob("*.json"):
-            try:
-                index = load_discovery_index(path)
-            except ValueError:
-                continue
-            if index.sha256 == state["index_sha256"] and index.identity["pin"] == previous.pin:
-                seeds = self._boundary_seeds(previous.kb_base_sha)
-                if not _boundary_ready(seeds, state, repository=self.lifecycle.full_name,
-                                       pin=previous.pin, production_paths=index.production):
-                    return False
-                from .init_coverage import owner_table
-                overlay = getattr(self, "overlay", {})
-                repo_dir = self.lifecycle.knowledge_dir
-                routes = overlay.get(f"{repo_dir}/_routes.yaml") or self.rt.knowledge.show(
-                    previous.kb_base_sha, f"{repo_dir}/_routes.yaml")
-                manifest_text = overlay.get(self._manifest_path()) or self.rt.knowledge.show(
-                    previous.kb_base_sha, self._manifest_path())
-                _, owners = owner_table(routes, yaml.safe_load(manifest_text or "") or {})
-                engine = DiscoveryEngine(index, seeds=seeds, owners=[], state=state, call=None, save=lambda: None,
-                                         repository=self.lifecycle.full_name, pin=previous.pin)
-                provisional, _ = _route_catalog(*engine.catalog(repo_dir, require_boundary=True),
-                                                seeds, owners, repo_dir)
-                return _consolidation_ready(seeds, state, provisional,
-                                            repository=self.lifecycle.full_name, pin=previous.pin)
-        return False
+        try:
+            index = load_index_snapshot(Path(self.rt.state_dir) / 'feature-discovery-index',
+                sha256=state['index_sha256'], pin=previous.pin, skip_invalid=True)
+        except ValueError:
+            return False
+        seeds = self._boundary_seeds(previous.kb_base_sha)
+        if not _boundary_ready(seeds, state, repository=self.lifecycle.full_name,
+                               pin=previous.pin, production_paths=index.production):
+            return False
+        from .init_coverage import owner_table
+        overlay = getattr(self, 'overlay', {})
+        repo_dir = self.lifecycle.knowledge_dir
+        routes = overlay.get(f'{repo_dir}/_routes.yaml') or self.rt.knowledge.show(
+            previous.kb_base_sha, f'{repo_dir}/_routes.yaml')
+        manifest_text = overlay.get(self._manifest_path()) or self.rt.knowledge.show(
+            previous.kb_base_sha, self._manifest_path())
+        _, owners = owner_table(routes, yaml.safe_load(manifest_text or '') or {})
+        engine = DiscoveryEngine(index, seeds=seeds, owners=[], state=state, call=None, save=lambda: None,
+                                 repository=self.lifecycle.full_name, pin=previous.pin)
+        provisional, _ = _route_catalog(*engine.catalog(repo_dir, require_boundary=True), seeds, owners, repo_dir)
+        return _consolidation_ready(seeds, state, provisional,
+                                    repository=self.lifecycle.full_name, pin=previous.pin)
 
     def _boundary_seeds(self, base_sha):
         text = self.rt.knowledge.show(base_sha, self._coverage_policy_path())
@@ -1501,10 +1651,11 @@ class _FeatureDiscovery(_Stage):
             self.budget.spent_usd = previous.spent_usd
             journal = Path(self.rt.state_dir) / "init" / self.lifecycle.repo / "discovery-budget.json"
             if journal.exists():
-                saved = json.loads(journal.read_text())
-                if saved.get("identity") != previous.discovery.get("identity"):
-                    return ["discovery reservation journal identity differs"]
-                self.budget.spent_usd = max(self.budget.spent_usd, saved["spent_usd"] + saved["reserved_usd"])
+                try:
+                    self.budget = _discovery_budget(self.budget, journal, previous.discovery.get("identity"))
+                    self.record.spent_usd = self.budget.spent_usd
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    return [str(exc)]
         if getattr(self.rt, "unlimited_subscription", False):
             self.budget.limit_usd = None
         return []
@@ -1513,43 +1664,12 @@ class _FeatureDiscovery(_Stage):
         self._verify_archived_receipt(receipt(reply), reply.role, reply.text)
 
     def _verify_archived_receipt(self, proof, expected_role, text=None):
-        import zlib
         from ..trace_store import TraceStore
-        try:
-            if not re.fullmatch(r"[0-9a-f]{64}", proof.get("reply_sha256", "")):
-                raise ValueError("reply content hash is missing")
-            if proof.get("requested") != expected_role.label():
-                raise ValueError("receipt role differs from the configured discovery role")
-            store = TraceStore(Path(self.rt.state_dir) / "init" / "traces")
-            record = store.get(proof["trace_id"])
-            if record.get("error") or record.get("outputs", {}).get("reply") != "sha256:" + proof["reply_sha256"]:
-                raise ValueError("reply differs from archived successful call")
-            archived_reply = store.blob(record["outputs"]["reply"])
-            if hashlib.sha256(archived_reply.encode()).hexdigest() != proof["reply_sha256"] or (text is not None and archived_reply != text):
-                raise ValueError("reply archive blob differs")
-            attempt_id = record.get("result", {}).get("native_attempt_id", "")
-            if not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
-                raise ValueError("native attempt archive is missing")
-            attempt = json.loads((store.root / "attempts" / attempt_id / "attempt.json").read_text())
-            if attempt.get("status") != "complete" or attempt.get("trace_id") != proof["trace_id"]:
-                raise ValueError("native attempt is incomplete or bound to another call")
-            for blob in list(record.get("inputs", {}).values()) + [attempt["native_events_sha256"]]:
-                store.blob(blob)
-            model = record.get("model", {})
-            if model.get("model") != expected_role.model or model.get("provider") != expected_role.provider \
-                    or model.get("effort", "") != expected_role.effort:
-                raise ValueError("archive model differs from requested discovery role")
-            if expected_role.provider == "zcode":
-                configured_level = getattr(self.rt.gateway, "zcode_reasoning_level", "max")
-                if model.get("native_reasoning_level") != configured_level \
-                        or attempt.get("model", {}).get("native_reasoning_level") != configured_level:
-                    raise ValueError("archive effective Zcode reasoning level differs or is unrecorded")
-            served = model.get("served_model")
-            if expected_role.provider == "zcode" and expected_role.model.casefold() == "glm-5.3" and served \
-                    and re.sub(r"[^a-z0-9]", "", served.casefold()) != "glm53":
-                raise ValueError("served Zcode model differs from GLM-5.3")
-        except (KeyError, OSError, ValueError, TypeError, AttributeError, EOFError, zlib.error) as exc:
-            raise ModelUnavailable(f"native discovery archive could not be replayed: {exc}") from exc
+        from .quality_review import verify_archived_receipt
+
+        return verify_archived_receipt(
+            TraceStore(Path(self.rt.state_dir) / "init" / "traces"), proof, expected_role, text,
+            zcode_reasoning_level=getattr(self.rt.gateway, "zcode_reasoning_level", "max"))
 
     def _verify_saved_approval(self, key, row, checked):
         from ..trace_store import TraceStore
@@ -1568,17 +1688,13 @@ class _FeatureDiscovery(_Stage):
             if len(offered) != 1 or _hash(offered[0]) != checked.get("candidate_sha256") \
                     or checked.get("candidate_sha256") != _hash(row):
                 raise ValueError("native independent review did not assess this candidate content")
+            return payload
         except (KeyError, IndexError, TypeError, AttributeError, ValueError, OSError) as exc:
             raise ModelUnavailable(f"native approval binding differs: {exc}") from exc
 
     def _verify_boundary_approval(self, key, row, checked, state):
-        self._verify_saved_approval(key, row, checked)
-        from ..trace_store import TraceStore
+        payload = self._verify_saved_approval(key, row, checked)
         try:
-            store = TraceStore(Path(self.rt.state_dir) / "init" / "traces")
-            record = store.get(checked["judge_receipt"]["trace_id"])
-            prompt = store.blob(record["inputs"]["prompt"])
-            payload = json.loads(prompt.split("<untrusted_data>\n", 1)[1].rsplit("\n</untrusted_data>", 1)[0])
             marker = state["catalog_boundary_audit"]
             if payload.get("catalog_boundary_audit") != _boundary_context(marker):
                 raise ValueError("native catalog boundary audit identity differs")
@@ -1618,33 +1734,24 @@ class _FeatureDiscovery(_Stage):
                     "related_id": "", "reason": str(exc), "attempts": MAX_ATTEMPTS}
                 state.get("repair_drafts", {}).pop(key, None)
                 failures.append(key)
-        for key, checked in state.get("boundary_reviews", {}).items():
-            if checked.get("supported") != "yes":
-                continue
-            try:
-                self._verify_archived_receipt(checked["judge_receipt"], self.rt.judge)
-                self._verify_boundary_approval(key, state["candidates"][key], checked, state)
-            except (ModelUnavailable, KeyError) as exc:
-                checked.update(supported="unsure", relation="unknown", related_id="", reason=str(exc),
-                               repair_blocked=True)
-                state.get("catalog_boundary_audit", {})["done"] = False
-                # Keep the valid primary proof and scan; this candidate simply
-                # cannot promote without a usable supplemental approval.
-        for key, checked in state.get("consolidation_reviews", {}).items():
-            if checked.get("supported") != "yes":
-                continue
-            try:
-                self._verify_archived_receipt(checked["judge_receipt"], self.rt.judge)
-                self._verify_consolidation_approval(key, state["candidates"][key], checked, state)
-            except (ModelUnavailable, KeyError) as exc:
-                checked.update(supported="unsure", relation="unknown", related_id="", reason=str(exc), repair_blocked=True)
-                state.get("catalog_consolidation_audit", {})["done"] = False
+        for name, verify in (("boundary", self._verify_boundary_approval),
+                             ("consolidation", self._verify_consolidation_approval)):
+            for key, checked in state.get(f"{name}_reviews", {}).items():
+                if checked.get("supported") != "yes":
+                    continue
+                try:
+                    self._verify_archived_receipt(checked["judge_receipt"], self.rt.judge)
+                    verify(key, state["candidates"][key], checked, state)
+                except (ModelUnavailable, KeyError) as exc:
+                    checked.update(supported="unsure", relation="unknown", related_id="", reason=str(exc),
+                                   repair_blocked=True)
+                    state.get(f"catalog_{name}_audit", {})["done"] = False
         return failures
 
     def _verify_consolidation_approval(self, key, row, checked, state):
         self._verify_saved_approval(key, row, checked)
         from ..trace_store import TraceStore
-        from .feature_discovery_index import load_discovery_index, evidence_excerpt
+        from .feature_discovery_index import load_index_snapshot, evidence_excerpt
         try:
             store = TraceStore(Path(self.rt.state_dir) / "init" / "traces")
             record = store.get(checked["judge_receipt"]["trace_id"])
@@ -1662,8 +1769,8 @@ class _FeatureDiscovery(_Stage):
                 raise ValueError("native consolidation omitted formal entries")
             index = getattr(self, "_consolidation_index", None)
             if index is None or index.sha256 != state["index_sha256"]:
-                index = next((idx for path in (Path(self.rt.state_dir) / "feature-discovery-index").glob("*.json")
-                    if (idx := load_discovery_index(path)).sha256 == state["index_sha256"]), None)
+                index = load_index_snapshot(Path(self.rt.state_dir) / 'feature-discovery-index',
+                                            sha256=state['index_sha256'], pin=marker['identity']['pin'])
                 self._consolidation_index = index
             if index is None or index.identity["pin"] != marker["identity"]["pin"]:
                 raise ValueError("native consolidation source inventory differs")
@@ -1755,7 +1862,8 @@ class _FeatureDiscovery(_Stage):
                 # Content rejections retain their cumulative attempt count.
                 # Only a blocked native channel resumes; exhausted content does
                 # not acquire three more repairs on every explicit retry.
-        budget = _ConcurrentBudget(self.budget, Path(self.rt.state_dir) / "init" / self.lifecycle.repo / "discovery-budget.json", identity)
+        self.budget = _discovery_budget(self.budget, Path(self.rt.state_dir) / "init" / self.lifecycle.repo / "discovery-budget.json", identity)
+        budget = self.budget
         if hasattr(self.rt.gateway, "configure_zcode_pacing") and self.rt.generator.provider == "zcode":
             from .depth_pacing import SharedZcodePacer
             pacer = SharedZcodePacer(Path(self.rt.state_dir) / "init" / "discovery-zcode-pacing.json",
@@ -1763,24 +1871,17 @@ class _FeatureDiscovery(_Stage):
             pacer.prepare()
             self.rt.gateway.configure_zcode_pacing(pacer)
 
-        def call(role, system, prompt, validate):
-            if role == "generator":
-                reply = generate(self.rt, budget, self.lifecycle.init, system=system, prompt=prompt, validate=validate)
-                self._verify_native_receipt(reply)
-                return reply
-            if getattr(self.rt, "unlimited_subscription", False) and not self.rt.gateway.subscription_billing(self.rt.judge):
-                raise ModelUnavailable("discovery judge subscription unavailable")
-            with budget.reserve(self.lifecycle.init.judge_call_usd) as reservation:
-                reply = self.rt.gateway.call_json(self.rt.judge, system=system, prompt=prompt, validate=validate)
-                reservation.charge(self.lifecycle.init.judge_call_usd)
-            self._verify_native_receipt(reply)
-            return reply
+        from functools import partial
+        call = partial(call_discovery_model, self.rt, budget, self.lifecycle.init,
+                       verify_reply=self._verify_native_receipt)
 
         def save():
             self.record.spent_usd = self.budget.spent_usd
             self.record.save(self.rt.state_dir)
 
+        from .init_support import execution_snapshot
         engine = DiscoveryEngine(index, seeds=seeds, owners=[o.owner for o in self.owners], state=state,
+                                 execution=execution_snapshot(self.rt, self.lifecycle.init),
                                  call=call, save=save, concurrency=getattr(self.rt, "discovery_concurrency", 13),
                                  repository=self.lifecycle.full_name, pin=self.record.pin,
                                  packet_chars=self.discovery_run_config["packet_chars"],
@@ -1898,17 +1999,23 @@ class _FeatureDiscovery(_Stage):
                      report_sha256=hashlib.sha256(report_text.encode()).hexdigest())
         other = {path: (original_text, rendered), report_path: (self.rt.knowledge.show(self._base_sha, report_path), report_text)}
 
-        def check_other(changed, before, after):
-            if changed not in other or after is None:
-                return ["discovery may only write its own catalog and compact report"]
-            if changed == path:
-                a, b = yaml.safe_load(before) if before else raw, yaml.safe_load(after)
-                if {k: v for k, v in a.items() if k not in ("features", "catalog_sources")} != \
-                        {k: v for k, v in b.items() if k not in ("features", "catalog_sources")}:
-                    return ["discovery must not alter production scope, targets or permissions"]
-                load_policy(after, self.repo_dir)
-            elif hashlib.sha256(after.encode()).hexdigest() != state["report_sha256"]:
-                return ["discovery report hash mismatch"]
-            return []
+        self._check_context = {"catalog_base": raw}
         self.record.coverage["feature_discovery"] = {"feature_count": len(features), "counts": dict(counts)}
-        return self._conclude({}, [], other=other, check_other=check_other)
+        return self._conclude({}, [], other=other, check_other=self._check_other)
+
+    def _check_other(self, changed, before, after):
+        from .knowledge_coverage import load_policy
+
+        path = self._coverage_policy_path()
+        if changed not in (path, self.record.discovery["report_path"]) or after is None:
+            return ["discovery may only write its own catalog and compact report"]
+        if changed == path:
+            a = yaml.safe_load(before) if before else self._draft["check_context"]["catalog_base"]
+            b = yaml.safe_load(after)
+            if {k: v for k, v in a.items() if k not in ("features", "catalog_sources")} != \
+                    {k: v for k, v in b.items() if k not in ("features", "catalog_sources")}:
+                return ["discovery must not alter production scope, targets or permissions"]
+            load_policy(after, self.repo_dir)
+        elif hashlib.sha256(after.encode()).hexdigest() != self.record.discovery["report_sha256"]:
+            return ["discovery report hash mismatch"]
+        return []

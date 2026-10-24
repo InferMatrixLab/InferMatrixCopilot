@@ -5,6 +5,9 @@ identity depends on source and scanning scope, not the eventual feature list.
 """
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+from ..git_objects import tree_entries
+
 import ast
 from dataclasses import dataclass
 import fnmatch
@@ -14,7 +17,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
-import uuid
 
 INDEX_VERSION = "feature-discovery-index-v2"
 CONTRACT_UNIT_VERSION = "contract-units-v1"
@@ -148,12 +150,10 @@ def _tracked(tree, pin):
         raise ValueError("discovery index needs unchanged tracked files at the fixed source SHA")
     raw = _git_output(tree, "ls-tree", "-r", "-z", pin)
     names = []
-    for entry in raw.split(b"\0"):
-        if not entry: continue
-        metadata, name = entry.split(b"\t", 1)
+    for mode, kind, oid, name in tree_entries(raw):
         # Submodules and symlinks are recorded separately by their parent; do
         # not read targets outside the pinned tree as repository evidence.
-        if metadata.startswith((b"100644 ", b"100755 ")):
+        if mode in ("100644", "100755"):
             names.append(name.decode("utf-8"))
     return sorted(names), hashlib.sha256(raw).hexdigest()
 
@@ -183,6 +183,28 @@ def load_discovery_index(cache_path, *, identity=None):
         return DiscoveryIndex(data, checksum)
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid discovery index: {exc}") from exc
+
+
+def load_index_snapshot(cache_dir, *, sha256, pin, skip_invalid=False):
+    """Read a retained immutable index; never rebuild or fetch missing evidence."""
+    cache_dir = Path(cache_dir)
+    if (not isinstance(sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', sha256)
+            or cache_dir.is_symlink() or not cache_dir.is_dir()):
+        raise ValueError('original discovery index is unavailable')
+    for path in sorted(cache_dir.glob('*.json')):
+        try:
+            if path.is_symlink():
+                raise ValueError('discovery index must be a regular local snapshot')
+            index = load_discovery_index(path)
+        except ValueError:
+            if skip_invalid:
+                continue
+            raise
+        if index.sha256 == sha256:
+            if index.identity['pin'] != pin:
+                raise ValueError('original discovery index pin differs')
+            return index
+    raise ValueError('original discovery index is unavailable')
 
 
 def build_discovery_index(tree, *, pin, scope, doc_globs=(), cache_path=None):
@@ -273,12 +295,7 @@ def build_discovery_index(tree, *, pin, scope, doc_globs=(), cache_path=None):
     if cache_path is not None:
         destination = Path(cache_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            temporary.write_text(json.dumps({"data": data, "sha256": index.sha256}, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, destination)
-        finally:
-            if temporary.exists(): temporary.unlink()
+        atomic_write_bytes(destination, json.dumps({"data": data, "sha256": index.sha256}, ensure_ascii=False).encode("utf-8"))
     return index
 
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .model_identity import model_family
+
+import asyncio
 import json
 import os
 from dataclasses import replace
@@ -9,32 +12,21 @@ from pathlib import Path, PurePosixPath
 
 from . import merge
 from .gate import check_consistency
-from .maintenance_audit import AUDIT_SYSTEM, BudgetGateway, audit_unit, digest
+from .maintenance_audit import BudgetGateway, audit_unit, digest
 from .maintenance_calibration import calibrate, candidate, current
-from .maintenance_correction import CORRECTION_SYSTEM, propose_correction
-from .maintenance_settings import MaintenanceConfig
+from .maintenance_correction import propose_correction
+from .maintenance_policy import (
+    settings, policy_digest, eligible_repos as _eligible, readiness,
+    correction_publishable, required_ci,
+)
+
 from .maintenance_store import BudgetExceeded, MaintenanceStore
 from .maintenance_units import enumerate_units, select_units
 from .models import ModelUnavailable
 from .outbox import atomic_write_json
 
-
-def settings(rt):
-    return getattr(rt, "maintenance", None) or MaintenanceConfig()
-
-
-def policy_digest(rt, config=None):
-    config = config or settings(rt)
-    return config.digest(judge=rt.judge.label(), generator=rt.generator.label(),
-                         prompts={"audit": AUDIT_SYSTEM, "correction": CORRECTION_SYSTEM,
-                                 "required_checks": os.environ.get("KB_MAINTENANCE_REQUIRED_CHECKS", '["suite"]'),
-                                 "implementation": {name: digest((Path(__file__).parent / name).read_text()) for name in
-                                     ("maintenance.py", "maintenance_audit.py", "maintenance_correction.py", "maintenance_calibration.py", "gate.py", "maintenance_units.py", "maintenance_store.py", "containment.py", "containment_drill.py", "containment_transport.py", "merge.py", "runtime.py", "outbox.py", "publisher.py", "judge_tuning.py", "maintenance_settings.py", "../knowledge_service/l1.py", "../knowledge_service/gate_verifier.py", "../knowledge_service/containment.py")}})
-
-
-def _eligible(rt):
-    return sorted(lifecycle.repo for lifecycle in rt.registry.values()
-                  if lifecycle.enabled and lifecycle.publishes and lifecycle.full_name)
+# Compatibility for existing internal callers; new callers use maintenance_policy.
+_required_ci = required_ci
 
 
 def _units(rt, snapshot, repos=None):
@@ -61,6 +53,99 @@ def plan(rt, repos=None):
             "unpriced_roles": [role.label() for role in (rt.generator, rt.judge) if role.label() not in config.costs]}
 
 
+def status(rt, repos=None):
+    """Read the authoritative maintenance report without dispatching work."""
+    result = plan(rt, repos=repos)
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+    snapshot = result.get("snapshot")
+    _, units = _units(rt, snapshot, repos) if snapshot else ({}, [])
+    findings = [{"id": row["id"], "run_id": row["run_id"], "unit_id": row["unit_id"],
+                 "repo": row["unit"]["repo"], "outcome": row["outcome"], "created_at": row["created_at"],
+                 "reason": row["detail"].get("reason", "")}
+                for row in store.findings() if repos is None or row["unit"]["repo"] in repos]
+    return {**result, "requests": [r for r in store.pending_requests()
+                                  if repos is None or r["repo"] in {*repos, "*"}],
+            "runs": store.runs(), "findings": findings,
+            "operational": operational_status(rt, store, units)}
+
+
+def request(rt, request_id, repos=None, *, options=None):
+    """Enqueue one repository or all; never claim the lease or call a model."""
+    if repos is not None:
+        if len(repos) != 1:
+            raise ValueError("maintenance requests require one repository or all")
+        repo = repos[0]
+        resolution = bool((options or {}).get("resolution"))
+        if repo not in rt.registry and not resolution:
+            raise ValueError(f"unknown maintenance repository: {repo}")
+        if not resolution and not rt.registry[repo].enabled:
+            raise ValueError(f"maintenance repository is disabled: {repo}")
+    else:
+        repo = "*"
+    detail = dict(options or {})
+    if not detail.get("resolution"):
+        detail = {"kind": "maintenance", "calibrate": False, "drill": False, **detail}
+        if detail["calibrate"] and detail["drill"]:
+            raise ValueError("maintenance calibration and drill are mutually exclusive")
+    store = MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner)
+    return store.enqueue_request(request_id, repo, detail, now=rt.clock())
+
+
+async def run_due_async(rt, *, on_correction=None):
+    """Govern correction then audit; SQLite remains the domain checkpoint."""
+    from ..app.workflow_execution import WorkflowExecution
+    from ..config import Settings
+    from ..engine.registry import StepRegistry
+    from ..engine.step import StepResult, StepSpec
+    from ..playbooks.store import Playbook, PlaybookStep
+    from .maintenance_store import cycle_date
+
+    if rt.lease_owner is None:
+        raise ValueError("maintenance execution requires the scheduler lease")
+    with rt.ledger.fenced(rt.lease_owner):
+        pass
+    identity = {"cycle_date": cycle_date(rt.clock()), "policy_sha256": policy_digest(rt)}
+    fingerprint = digest(json.dumps(identity, sort_keys=True))
+    run_dir = rt.state_dir / "runs" / "knowledge-maintenance" / fingerprint
+    resources = {"rt": rt, "on_correction": on_correction, "results": {}}
+
+    async def handle(ctx):
+        active = ctx.runtime["rt"]
+        phase = ctx.params["phase"]
+        try:
+            with active.ledger.fenced(active.lease_owner):
+                pass  # every phase revalidates authority; no outer cached success
+            result = advance_corrections(active) if phase == "corrections" else tick(active)
+            if phase == "corrections" and ctx.runtime["on_correction"] is not None:
+                for event in result:
+                    ctx.runtime["on_correction"](event)
+            ctx.runtime["results"][phase] = result
+            return StepResult(True, summary=f"maintenance {phase}", checkpoint=False)
+        except Exception as exc:
+            ctx.runtime["error"] = exc
+            raise
+
+    registry, steps = StepRegistry(), []
+    for phase, operation in (("corrections", "correction"), ("maintenance", "nightly_audit")):
+        name = f"knowledge.maintain.{operation}"
+        registry.register(StepSpec(name, "deterministic", "knowledge", handle, checkpoint=False))
+        steps.append(PlaybookStep(phase, name, params={"phase": phase}))
+    playbook = Playbook("knowledge-maintain", 1, "locked", [], [], steps)
+    execution = WorkflowExecution(getattr(rt, "settings", None) or Settings(_env_file=None), registry)
+    outcome = await execution.execute(playbook, run_dir=run_dir, state=identity,
+                                      runtime=resources, fingerprint=fingerprint)
+    if "error" in resources:
+        raise resources["error"]
+    if outcome.status != "done":
+        raise RuntimeError(outcome.blocked_reason or "maintenance workflow failed")
+    return resources["results"]
+
+
+def run_due(rt, *, on_correction=None):
+    """Synchronous compatibility entry; async schedulers await run_due_async."""
+    return asyncio.run(run_due_async(rt, on_correction=on_correction))
+
+
 def _human(rt, unit, reason, finding=None):
     identity = digest(json.dumps([unit["unit_id"], unit["content_sha256"], reason], sort_keys=True))
     if not rt.ledger.get_cursor(unit["repo"], "maintenance-human:" + identity):
@@ -68,12 +153,6 @@ def _human(rt, unit, reason, finding=None):
         rt.ledger.set_cursor(unit["repo"], "maintenance-human:" + identity, str(rt.clock()))
     if finding:
         candidate(rt, unit, finding)
-
-
-def readiness(rt, store, policy):
-    report = store.report(now=rt.clock(), policy_sha256=policy, eligible_repos=_eligible(rt))
-    from .containment_drill import acceptance_current
-    return report["seven_valid_nights_ready"] and current(rt, policy) and bool(settings(rt).consumers) and acceptance_current(rt, policy)
 
 
 def _correction(rt, lifecycle, store, run, unit, finding, base):
@@ -129,7 +208,7 @@ def tick(rt):
         return None
     if not operator_request:
         # A waiver in another workflow cannot authorize semantic self-review.
-        if rt.generator.model.casefold().split("-")[0] == rt.judge.model.casefold().split("-")[0]:
+        if model_family(rt.generator.model) == model_family(rt.judge.model):
             return {"status": "independent_reviewer_required"}
     selected_repos = None if request is None or request["repo"] == "*" else [request["repo"]]
     resumable = [r for r in store.runs() if r["status"] in {"running", "failed", "limited", "paused"}
@@ -155,7 +234,7 @@ def tick(rt):
     if operator_request or request and request["detail"].get("calibrate"):
         try:
             if request["detail"].get("resolution"):
-                from .maintenance_commands import apply_resolution
+                from .maintenance_resolution import apply_resolution
                 result = apply_resolution(rt, store, request)
             elif request["detail"].get("drill"):
                 from .containment_drill import run_revocation_drill
@@ -249,47 +328,6 @@ def tick(rt):
             "budget_limited": limited}
 
 
-def correction_publishable(rt, changeset):
-    """Additional admission requirements never replace the existing full gate."""
-    from .containment import pending_holds
-    config = settings(rt)
-    policy = policy_digest(rt, config)
-    if not config.enabled or changeset["detail"].get("maintenance_policy") != policy:
-        return "maintenance policy changed or disabled"
-    if not readiness(rt, MaintenanceStore(rt.ledger, lease_owner=rt.lease_owner), policy):
-        return "seven valid shadow nights or current maintenance calibration missing"
-    if not current(rt, policy, observed_model=changeset["detail"].get("source_audit", {}).get("reviewer"),
-                   observed_generator=changeset["detail"].get("served_generator")):
-        return "observed maintenance model changed; recalibration required"
-    if not pending_holds(rt).get("ready"):
-        return "containment propagation incomplete"
-    return ""
-
-
-def _required_ci(rt, changeset):
-    """Read exact-head statuses. Unknown or missing required checks keep the hold."""
-    required = json.loads(os.environ.get("KB_MAINTENANCE_REQUIRED_CHECKS", '["suite"]'))
-    if not isinstance(required, list) or not required or any(not isinstance(v, str) or not v for v in required):
-        raise ValueError("maintenance required checks must be a nonempty JSON list")
-    head = changeset.get("head_sha")
-    if not head:
-        raise ValueError("correction has no reviewed PR head")
-    from .merge import knowledge_repository
-    repository = knowledge_repository()
-    checks = rt.github.get(f"/repos/{repository}/commits/{head}/check-runs")
-    states = rt.github.get(f"/repos/{repository}/commits/{head}/status")
-    observed = {}
-    for check in checks.get("check_runs", []):
-        if check.get("head_sha") == head:
-            passed = check.get("status") == "completed" and check.get("conclusion") == "success"
-            observed[check["name"]] = observed.get(check["name"], True) and passed
-    for check in states.get("statuses", []):
-        observed[check["context"]] = observed.get(check["context"], True) and check.get("state") == "success"
-    if not all(observed.get(name) is True for name in required):
-        raise ValueError("correction exact-head CI is incomplete")
-    return {"repository": repository, "head_sha": head, "required": required, "checks": checks, "statuses": states}
-
-
 def advance_corrections(rt):
     """Resume held publication and restore only verified newly active bytes."""
     from .containment import pending_holds, record_restoration
@@ -332,7 +370,7 @@ def advance_corrections(rt):
             if not active or any(files.get(page) != text for page, text in data["files"].items()):
                 continue
             try:
-                ci = _required_ci(rt, changeset)
+                ci = required_ci(rt, changeset)
                 original = detail["original_unit"]
                 from .maintenance_audit import source_evidence
                 evidence = source_evidence(rt, lifecycle, original)

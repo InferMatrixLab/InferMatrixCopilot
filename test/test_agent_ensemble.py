@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import pytest
 
 from infermatrix_copilot.engine.agent_runtime import (
     BASE_OUTPUT_SCHEMA,
@@ -437,6 +438,11 @@ def test_coverage_promotion_converts_findings_to_comments(settings, trace,
     kept = result.outputs["review_comments"]
     assert len(kept) == 2
     assert "remains unfixed" in kept[1]["comment"]
+    from infermatrix_copilot.review.severity import SEVERITY_GUIDANCE
+    assert SEVERITY_GUIDANCE in llm.calls[-1]["system"]
+    # The reducer and investigator use the same definitions as promotion.
+    assert SEVERITY_GUIDANCE in llm.calls[-2]["system"]
+    assert SEVERITY_GUIDANCE in llm.calls[0]["messages"][0]["content"]
     assert next(trace.events("review_coverage_promoted"))["added"] == 1
     assert "2 actionable finding(s)." in result.outputs["review_summary"]
     assert "merged" not in result.outputs["review_summary"]
@@ -605,6 +611,9 @@ def test_verify_pass_drops_refuted_demotes_unverifiable(settings, trace,
     assert by_file["d.py"]["comment"] == "garbage verdict for me"  # fail-open
     ev = next(trace.events("review_comments_verified"))
     assert (ev["total"], ev["dropped"], ev["demoted"]) == (4, 1, 1)
+    from infermatrix_copilot.review.severity import SEVERITY_GUIDANCE
+    for call in llm.calls[-4:]:
+        assert SEVERITY_GUIDANCE in call["messages"][0]["content"]
     assert not llm._replies
 
 
@@ -1327,6 +1336,40 @@ def _blocked():
     from infermatrix_copilot.engine.step import StepResult
     return StepResult(True, summary="ok"), {"status": "blocked",
                                             "items": [], "_tools_used": []}
+
+
+@pytest.mark.parametrize("phase", ["first", "retry"])
+@pytest.mark.parametrize("kind", ["pending", "unfinished", "forbidden", "sandbox", "host_timeout"])
+def test_unresolved_member_never_dispatches_tier(settings, trace, tmp_path,
+                                                monkeypatch, phase, kind):
+    error = RuntimeError("original native outcome requires reconciliation")
+    if kind == "pending":
+        error.native_outcome_pending = True
+    elif kind == "unfinished":
+        error.native_call_sent = True
+        error.native_call_completed = False
+    elif kind == "forbidden":
+        error.allow_fallback = False
+    elif kind == "sandbox":
+        from infermatrix_copilot.sandbox.base import SandboxPending
+        error = SandboxPending("original execution unresolved")
+    else:
+        from infermatrix_copilot.providers.json_session import JSONSessionError
+        error = JSONSessionError("legacy host timeout", timeout=True)
+    calls = []
+
+    async def fake_step(ctx, **kw):
+        calls.append(kw)
+        if phase == "first" or kw["step_name"].endswith("/retry"):
+            raise error
+        return _ok()
+
+    with pytest.raises(RuntimeError) as caught:
+        _routed_run(settings, trace, tmp_path, fake_step, monkeypatch)
+    assert caught.value is error
+    assert len(calls) == (1 if phase == "first" else 2)
+    assert all(call.get("model_override") == "composer-2.5" for call in calls)
+    assert not list(trace.events("moa_member_fallback"))
 
 
 def test_first_pass_typed_failure_falls_back_to_tier(settings, trace, tmp_path,

@@ -266,15 +266,19 @@ class Copilot:
                  resuming: bool = False, held_lock: RunLock | None = None,
                  planned_context: RepositoryContext | None = None) -> int:
         """Compatibility entry point; application keeps the last-run summary."""
+        return self._execute_result(playbook, spec, run_dir,
+            resolution_mode=resolution_mode, tier=tier, resuming=resuming,
+            held_lock=held_lock, planned_context=planned_context).exit_code
+
+    def _execute_result(self, playbook, spec: TaskSpec, run_dir: Path, **kwargs):
+        """Carry the workflow state locally through reserved-run persistence."""
         self.last_run_dir = run_dir
         self.last_blocked_reason = ""
         result = self.workflow_execution.run(
-            playbook, spec, run_dir, resolution_mode=resolution_mode,
-            tier=tier, resuming=resuming, held_lock=held_lock,
-            planned_context=planned_context, llm=self.llm,
+            playbook, spec, run_dir, llm=self.llm, **kwargs,
         )
         self.last_blocked_reason = result.blocked_reason
-        return result.exit_code
+        return result
 
     def run_queue(self, specs: list[TaskSpec], *, assume_yes: bool = False,
                   plan_only: bool = False) -> int:
@@ -406,7 +410,7 @@ class Copilot:
         }, indent=2))
         rs.mark(run_dir, rs.RUNNING)
         try:
-            code = self._execute(resolution.playbook, spec, run_dir,
+            result = self._execute_result(resolution.playbook, spec, run_dir,
                                  resolution_mode=resolution.mode, tier=resolution.tier,
                                  held_lock=lock, planned_context=repo_context)
         except Exception as exc:  # a crash still leaves a terminal record
@@ -417,9 +421,10 @@ class Copilot:
         # nothing to distinguish a stale-head refusal from a missing tier or a
         # failed checkout — the reason was previously printed to the child's
         # console and discarded.
-        rs.mark(run_dir, {0: rs.DONE, BLOCKED_EXIT: rs.BLOCKED}.get(code, rs.FAILED),
-                note=self.last_blocked_reason if code == BLOCKED_EXIT else "")
-        return code
+        rs.mark(run_dir, result.state or
+                {0: rs.DONE, BLOCKED_EXIT: rs.BLOCKED}.get(result.exit_code, rs.FAILED),
+                note=result.blocked_reason)
+        return result.exit_code
 
     def _adapter_for(self, repo: str):
         """Compatibility lookup; a broken known adapter remains an error."""

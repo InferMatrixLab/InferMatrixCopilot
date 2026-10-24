@@ -111,6 +111,7 @@ def test_openai_tool_calls_round_trip_through_internal_protocol():
     assert reply.tool_uses[0].input == {"path": "a.py"}
     assert reply.usage == {
         "input_tokens": 12,
+        "input_tokens_include_cache": True,
         "output_tokens": 3,
         "cache_read_input_tokens": 4,
         "cache_creation_input_tokens": 0,

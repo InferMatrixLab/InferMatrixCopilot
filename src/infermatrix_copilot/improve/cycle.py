@@ -13,6 +13,8 @@ never on GitHub.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import datetime as dt
 import json
 import time
@@ -24,7 +26,7 @@ from ..trace_store import TraceStore, bind_store, file_lock, trace_context
 from .enroll import declarations_for
 from .budget import Governor, governed
 from .ledger import Ledger
-from .lints import Baseline, Finding, catalogue, run_lints, unit_usd
+from .lints import COST_POLICY, Baseline, Finding, catalogue, run_lints, unit_cost
 from .reader import UNIT_LOOKBACK, Unit, collect_units, cursor_path, week_bounds
 
 WORSEN_RATIO = 1.5      # a lint's defect rate this cycle / last cycle
@@ -53,6 +55,7 @@ class WorkflowStats:
     quarantined: list[str] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     usd: float = 0.0
+    cost_unknown_calls: int = 0
     seconds: float = 0.0
 
     def lint_table(self) -> dict[str, dict]:
@@ -79,9 +82,7 @@ def _cursor(ledger_dir: Path) -> dict:
 def _save_cursor(ledger_dir: Path, data: dict) -> None:
     path = cursor_path(ledger_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_bytes(path, json.dumps(data, indent=1).encode("utf-8"))
 
 
 def is_due(now: float, last_run_at: float, *, weekday: int, hour: int, tz: dt.tzinfo | None = None) -> bool:
@@ -187,7 +188,7 @@ def _run_cycle_locked(store: TraceStore, settings: Any, ledger_dir: Path, *, now
         report_workflows: dict[str, dict] = {}
         for workflow, stats in sorted(by_workflow.items()):
             prior = ledger.load(workflow)
-            baseline = Baseline(usd=list(prior.baseline.get("usd") or []),
+            baseline = Baseline(usd=list(prior.baseline.get("planning_usd") or []),
                                 seconds=list(prior.baseline.get("seconds") or []),
                                 parse_failure_rate=float(prior.baseline.get("parse_failure_rate") or 0.0),
                                 settings=settings)
@@ -203,10 +204,12 @@ def _run_cycle_locked(store: TraceStore, settings: Any, ledger_dir: Path, *, now
                 if any(f.quarantine for f in findings):
                     stats.quarantined.append(unit.unit_id)
                     continue
-                usd = unit_usd(unit, settings)
-                stats.usd += usd
+                cost = unit_cost(unit, settings)
+                stats.usd += cost.known_usd
+                stats.cost_unknown_calls += cost.unknown_calls
                 stats.seconds += unit.seconds
-                usd_samples.append(usd)
+                if cost.usd is not None:
+                    usd_samples.append(cost.usd)
                 seconds_samples.append(unit.seconds)
                 calls = unit.model_calls
                 parse_total += len(calls)
@@ -216,7 +219,8 @@ def _run_cycle_locked(store: TraceStore, settings: Any, ledger_dir: Path, *, now
                                      units=len(stats.units), quarantined=len(stats.quarantined),
                                      usd=stats.usd, seconds=stats.seconds, lints=table,
                                      usd_samples=usd_samples, seconds_samples=seconds_samples,
-                                     parse_failure_rate=(parse_failed / parse_total) if parse_total else 0.0)
+                                     parse_failure_rate=(parse_failed / parse_total) if parse_total else 0.0,
+                                     cost_policy=COST_POLICY, cost_unknown_calls=stats.cost_unknown_calls)
             # Tier 1 proposals: a lint that worsened beyond the ratio with enough units
             for lint_id, entry in table.items():
                 if lint_id in ("L13", "L00"):
@@ -241,6 +245,7 @@ def _run_cycle_locked(store: TraceStore, settings: Any, ledger_dir: Path, *, now
             report_workflows[workflow] = {
                 "tier": stats.tier, "declared": stats.declared, "units": len(stats.units),
                 "quarantined": len(stats.quarantined), "usd": round(stats.usd, 4),
+                "cost_unknown_calls": stats.cost_unknown_calls, "cost_policy": COST_POLICY,
                 "seconds": round(stats.seconds, 1), "lints": table, "stale": stale,
                 "channel_dead": ledger.channel_dead(workflow, now), "hold": wl.hold,
                 "findings": [{"lint": f.lint, "unit": f.unit_id, "detail": f.detail, "evidence": list(f.evidence)}
@@ -340,8 +345,11 @@ def _write_report(ledger_dir: Path, report: dict) -> Path:
     lines.append("|---|---|---|---|---|---|")
     for workflow, d in sorted(report["workflows"].items()):
         lints = ", ".join(f"{k}:{v['units']}" for k, v in d["lints"].items()) or "none"
+        cost = f"{d['usd']:.3f}"
+        if d.get('cost_unknown_calls'):
+            cost += f" + unknown ({d['cost_unknown_calls']} calls)"
         lines.append(f"| {workflow} | {d['tier']}{'' if d['declared'] else ' (undeclared)'} | {d['units']} | "
-                     f"{d['quarantined']} | {d['usd']:.3f} | {lints} |")
+                     f"{d['quarantined']} | {cost} | {lints} |")
     lines.append("")
     if report["proposals_opened"]:
         lines.append("## Tier 1 proposals opened")

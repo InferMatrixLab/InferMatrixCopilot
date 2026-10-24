@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from ..git_objects import batch_blobs, checked_read, tree_entries
+
 from .sources import SourceError
 
 COMMIT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -117,11 +119,7 @@ class GitSource:
         if pin in self._inventories:
             return {path: dict(meta) for path, meta in self._inventories[pin].items()}
         result = {}
-        for row in self._git("ls-tree", "-r", "-z", "--full-tree", pin).split(b"\0"):
-            if not row:
-                continue
-            meta, name = row.split(b"\t", 1)
-            mode, kind, oid = meta.decode("ascii").split()
+        for mode, kind, oid, name in tree_entries(self._git("ls-tree", "-r", "-z", "--full-tree", pin)):
             path = name.decode("utf-8")
             if kind == "blob" and mode in ("100644", "100755"):
                 result[path] = {"mode": mode, "oid": oid}
@@ -151,26 +149,15 @@ class GitSource:
                               capture_output=True, check=False)
         if proc.returncode:
             raise SourceError(f"Git source export failed (exit {proc.returncode})")
-        offset = 0
-        for relative, meta in inventory.items():
-            end = proc.stdout.find(b"\n", offset)
-            header = proc.stdout[offset:end].split() if end >= offset else []
-            if len(header) != 3 or header[0].decode("ascii") != meta["oid"] or header[1] != b"blob" or not header[2].isdigit():
-                raise SourceError("committed source export object is invalid")
-            size = int(header[2])
-            content = proc.stdout[end + 1:end + 1 + size]
-            offset = end + 1 + size
-            if len(content) != size or proc.stdout[offset:offset + 1] != b"\n":
-                raise SourceError("committed source export is incomplete")
-            offset += 1
+        contents = checked_read(SourceError, list,
+                                batch_blobs(proc.stdout, [meta["oid"] for meta in inventory.values()]))
+        for (relative, meta), content in zip(inventory.items(), contents):
             target = (root / relative).resolve()
             if not target.is_relative_to(root):
                 raise SourceError("committed source path escapes destination")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
             target.chmod(0o755 if meta["mode"] == "100755" else 0o644)
-        if offset != len(proc.stdout):
-            raise SourceError("committed source export contains unexpected objects")
         return root
 
 

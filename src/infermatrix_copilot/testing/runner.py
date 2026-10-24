@@ -1,13 +1,9 @@
 """Single-test executor — port of test_runner.sh's `run_ci_cmd_with_watchdog`
 (local mode; remote-exec was retired with the shell layer).
 
-Timeout layering (invariant, pinned by tests): the **primary** timer fires at
-`job.timeout_sec` and kills the whole process group (the shell's `timeout(1)`
-only killed the direct child, leaving pytest workers holding GPU memory — the
-outer Python killpg existed to reap them; here one timer does both). The
-watchdog may kill earlier on log patterns. The **safety** timer at
-`timeout_sec + PY_TIMEOUT_MARGIN_SEC` fires strictly later and SIGKILLs the
-group — it only matters if the primary path itself wedged.
+Process lifecycle, deadlines, combined output and identity-checked descendant
+cleanup delegate to the neutral supervisor. GPU admission, watchdog decisions,
+coverage fallback and outcome interpretation remain test-domain policies.
 
 One deliberate divergence from the shell, by design (plan §7): a hardware
 gate produces an explicit `skipped` outcome instead of the shell's rc=0,
@@ -19,9 +15,11 @@ from __future__ import annotations
 
 import os
 import re
-import signal
-import subprocess
 import threading
+import time
+
+from ..process_execution import run_process
+from ..process_tree import _record_walk, _kill_group, terminate_tree
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -214,48 +212,6 @@ def strip_cov_flags(command: str) -> str:
     return command
 
 
-def _record_walk(idmap: dict[int, int], walked: "list[int]", *,
-                 root: int, root_parent: int, root_birth: int | None = None,
-                 stat_ids: "Callable[[int], tuple[int, int] | None]" = None,
-                 ) -> None:
-    """Fold one descendant walk into the accumulate-only snapshot map.
-
-    Identity is bound to DISCOVERY: a pid can exit and be reused between the
-    pgrep walk and the /proc read, and recording the unrelated new holder's
-    (perfectly valid) starttime would launder it past the kill-time identity
-    check. One stat read yields (ppid, starttime) atomically, and a pid is
-    recorded — or an existing record overwritten — only when it sits on a
-    fully VALIDATED ancestry chain: the leader must be parented by the
-    runner itself AND (once captured) match its immutable `root_birth` —
-    the runner spawns many short-lived children (pgrep, git, the next job),
-    so a recycled leader pid can wear the right ppid and only the birth
-    time distinguishes the stranger. Every other node's parent must itself
-    be validated: merely appearing in the walked set is not enough — when
-    an intermediate pid is reused, its stranger children still name a
-    "walked" parent, and accepting them would launder the stranger's
-    subtree. Unverifiable pids (died mid-walk, reparented in the gap) are
-    skipped; earlier records for them survive."""
-    from .process_tree import _proc_stat_ids as _default_stat
-    stat_ids = stat_ids or _default_stat
-    info = {p: stat_ids(p) for p in dict.fromkeys(walked)}
-    validated: set[int] = set()
-    if (info.get(root) is not None and info[root][0] == root_parent
-            and (root_birth is None or info[root][1] == root_birth)):
-        validated.add(root)
-    # fixpoint over parent links (walk order is not topological)
-    changed = True
-    while changed:
-        changed = False
-        for p, ids in info.items():
-            if p in validated or ids is None:
-                continue
-            if ids[0] in validated:
-                validated.add(p)
-                changed = True
-    for p in validated:
-        idmap[p] = info[p][1]
-
-
 def _exec_wrap(command: str) -> str:
     return command if "set +e" in command else f"set -e\n{command}"
 
@@ -443,40 +399,21 @@ class TestRunner:
     # -- internals ------------------------------------------------------------
     def _run_setup(self, job: TestJob, env: dict[str, str],
                    log_file: Path) -> None:
-        """Setup is best-effort but every failure mode leaves a diagnostic:
-        nonzero rc is logged, a timeout kills the setup's whole process group
-        (its own session, so background children can't outlive it and race
-        the main test), and none of it ever aborts the job."""
+        """Best-effort setup delegates lifecycle and combined logging."""
         note = ""
         try:
-            with open(log_file, "a", encoding="utf-8") as lf:
-                proc = subprocess.Popen(["bash", "-c", job.setup],
-                                        cwd=self.repo_root, env=env,
-                                        stdout=lf, stderr=lf,
-                                        start_new_session=True)
-                # pgid is captured while the leader is certainly alive: the
-                # group must be killable even after the leader exits, or a
-                # TERM-ignoring background child survives into the main test
-                try:
-                    pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = proc.pid
-                try:
-                    rc = proc.wait(timeout=job.timeout_sec)
-                    if rc != 0:
-                        note = f"[setup] ignored failure: rc={rc}"
-                except subprocess.TimeoutExpired:
-                    _kill_group(pgid, signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    note = (f"[setup] ignored failure: timeout after "
-                            f"{job.timeout_sec}s (process group killed)")
-                finally:
-                    # unconditional group KILL: the leader exiting promptly
-                    # must not spare children that ignored the TERM
-                    _kill_group(pgid, signal.SIGKILL)
+            with open(log_file, "ab", buffering=0) as lf:
+                outcome = run_process(
+                    ["bash", "-c", job.setup], cwd=self.repo_root, env=env,
+                    deadline=time.monotonic() + job.timeout_sec,
+                    merge_stderr=True, termination_grace_s=10,
+                    descendant_interval_s=self.SNAPSHOT_INTERVAL,
+                    on_chunk=lambda _channel, data: lf.write(data))
+            if outcome.reason == "absolute":
+                note = (f"[setup] ignored failure: timeout after "
+                        f"{job.timeout_sec}s (process group killed)")
+            elif outcome.returncode != 0:
+                note = f"[setup] ignored failure: rc={outcome.returncode}"
         except OSError as exc:
             note = f"[setup] ignored failure: {type(exc).__name__}: {exc}"
         if note:
@@ -488,137 +425,50 @@ class TestRunner:
 
     def _spawn(self, exec_cmd: str, job: TestJob, env: dict[str, str],
                log_file: Path, *, append: bool) -> tuple[int, bool, bool]:
-        timed_out = threading.Event()
-        # scope this attempt's watchdog to bytes IT produces — setup output
-        # and previous-attempt tails are not this attempt's evidence
+        # Only this attempt's bytes participate in watchdog/fallback decisions.
         try:
             attempt_offset = log_file.stat().st_size if append else 0
         except OSError:
             attempt_offset = 0
-        with open(log_file, "a" if append else "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(["bash", "-c", exec_cmd],
-                                    cwd=self.repo_root, env=env,
-                                    stdout=lf, stderr=lf,
-                                    start_new_session=True)
-            # capture the pgid while the leader is certainly alive: the final
-            # watchdog scan runs after proc.wait(), and a short command that
-            # logs a critical line, backgrounds a child, and exits must still
-            # have its group killable through the reaped leader's pgid
-            try:
-                pgid = os.getpgid(proc.pid)
-            except ProcessLookupError:
-                pgid = proc.pid
-            # a dedicated thread snapshots the live descendant tree on a fast
-            # fixed cadence (independent of the 10 s watchdog poll): after
-            # the leader is reaped, setsid'd children are reparented to init
-            # and only the snapshot still names them. Each walk records
-            # (pid, /proc starttime) and the map only ever GROWS: a walk that
-            # races the leader's exit sees an already-reparented (empty) tree,
-            # and letting it shrink the map is exactly how a setsid'd child
-            # escapes the final kill. Reused pids are safe to accumulate —
-            # kill_tree drops any pid whose live starttime no longer matches
-            # the recorded one. A child that both spawns and is orphaned
-            # inside one cadence window is the documented residual (bounded
-            # by SNAPSHOT_INTERVAL).
-            from .process_tree import collect_descendants
-            tree: dict[str, dict[int, int]] = {"idmap": {}}
-            own_pid = os.getpid()
-            _record_walk(tree["idmap"], [proc.pid],
-                         root=proc.pid, root_parent=own_pid)
-            # the leader's identity is captured ONCE and immutable from here:
-            # later walks must match it exactly or record nothing
-            root_birth = tree["idmap"].get(proc.pid)
-            stop_snap = threading.Event()
+        cancelled = threading.Event()
+        watchdog = None
 
-            def _snapshot():
-                if proc.poll() is None:
-                    _record_walk(tree["idmap"], collect_descendants(proc.pid),
-                                 root=proc.pid, root_parent=own_pid,
-                                 root_birth=root_birth)
-
-            def _snap_loop():
-                while not stop_snap.is_set() and proc.poll() is None:
-                    _snapshot()
-                    stop_snap.wait(self.SNAPSHOT_INTERVAL)
-
-            snap_thread = threading.Thread(target=_snap_loop, daemon=True)
-            snap_thread.start()
-
-            def _kill_snapshot():
-                self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
-
-            watchdog = None
+        def started(pid, stopping):
+            nonlocal watchdog
             if self.patterns is not None:
                 watchdog = LogWatchdog(
-                    self.patterns, log_file, proc.pid, job.key,
+                    self.patterns, log_file, pid, job.key,
                     check_interval=self.watchdog_interval,
                     review_fn=self.review_fn, record_fn=self.record_fn,
                     report_fn=self.report_fn, start_offset=attempt_offset,
-                    kill_fn=lambda pid: _kill_snapshot()).start()
+                    pid_alive=lambda _pid: not stopping.is_set(),
+                    kill_fn=lambda _pid: cancelled.set()).start()
 
-            def primary():
-                timed_out.set()
-                _snapshot()  # leader still alive here: refresh before killing
-                self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
-
-            def safety():  # only matters if the primary path wedged
-                _kill_group(pgid, signal.SIGKILL)
-
-            t_primary = threading.Timer(job.timeout_sec, primary)
-            t_safety = threading.Timer(job.timeout_sec + PY_TIMEOUT_MARGIN_SEC,
-                                       safety)
-            t_primary.start()
-            t_safety.start()
-            try:
-                rc = proc.wait()
-            finally:
-                stop_snap.set()
-                snap_thread.join(timeout=10)
-                # cancel then JOIN: a fired primary timer is mid-escalation in
-                # its own thread — returning before it finishes would let the
-                # next job start while own-pgroup descendants still hold GPUs
-                t_primary.cancel()
-                t_safety.cancel()
-                t_primary.join()
-                t_safety.join()
-                if watchdog is not None:
-                    watchdog.stop()
-                    # final scan: a job shorter than the poll interval (or a
-                    # line written after the last poll) must still be seen —
-                    # "CUDA out of memory" + exit 0 is not a pass
-                    watchdog.check_once()
-        wd_hit = bool(watchdog is not None and watchdog.result.triggered)
-        if timed_out.is_set():
-            rc = TIMEOUT_RC
-        return rc, wd_hit, timed_out.is_set()
+        try:
+            with open(log_file, "ab" if append else "wb", buffering=0) as lf:
+                outcome = run_process(
+                    ["bash", "-c", exec_cmd], cwd=self.repo_root, env=env,
+                    deadline=time.monotonic() + job.timeout_sec,
+                    merge_stderr=True, descendant_grace_s=2,
+                    descendant_interval_s=self.SNAPSHOT_INTERVAL,
+                    cancel=cancelled, on_started=started,
+                    on_chunk=lambda _channel, data: lf.write(data))
+        finally:
+            if watchdog is not None:
+                watchdog.stop()
+        # The supervisor has reaped the leader and its recorded descendants.
+        # A fast command still needs the final semantic scan of its complete log.
+        if watchdog is not None:
+            watchdog.check_once()
+        timed_out = outcome.reason == "absolute"
+        return (TIMEOUT_RC if timed_out else outcome.returncode,
+                bool(watchdog is not None and watchdog.result.triggered), timed_out)
 
     @staticmethod
     def _terminate_tree(pid: int, pgid: int,
                         snapshot: dict[int, int | None] | None = None) -> None:
-        """Kill the leader's process group AND every descendant individually:
-        spawn-mode multiprocessing children create their own process groups —
-        killpg alone never reaches them, and the leader exiting must not end
-        the escalation while they hold GPU memory. `kill_tree` owns
-        TERM → grace → KILL per pid, survivors logged. `pgid` is pre-captured
-        and `snapshot` carries the accumulated pid → starttime descendant
-        map, so this also works after the leader was reaped and its setsid'd
-        children were reparented away; the starttimes let kill_tree drop
-        pids the kernel has since reused.
-
-        No expansion happens HERE: pre-walking and passing the results to
-        kill_tree would promote identity-less walked pids to trusted legacy
-        roots, bypassing the ancestry validation. Instead only the
-        identity-carrying snapshot pids are handed over as roots, and
-        kill_tree performs the single, validated expansion (pre- and
-        post-walk root identity checks, ancestry-chained acceptance). With
-        no recorded identity at all, escalation is killpg-only."""
-        from .process_tree import kill_tree
-
-        snapshot = dict(snapshot or {})
-        _kill_group(pgid, signal.SIGTERM)
-        if snapshot:
-            kill_tree(sorted(snapshot), identity=snapshot)
-        _kill_group(pgid, signal.SIGKILL)
+        """Compatibility delegation for explicitly supplied legacy identities."""
+        terminate_tree(pid, pgid, snapshot, group_kill=_kill_group)
 
     @staticmethod
     def _log_has(log_file: Path, pattern: str, *,
@@ -633,11 +483,3 @@ class TestRunner:
                 return any(rx.search(line) for line in f)
         except OSError:
             return False
-
-
-def _kill_group(pgid: int, sig: int) -> None:
-    """killpg by a pre-captured pgid — usable after the leader has exited."""
-    try:
-        os.killpg(pgid, sig)
-    except OSError:
-        pass

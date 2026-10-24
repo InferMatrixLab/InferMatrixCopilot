@@ -167,7 +167,7 @@ def test_a_governed_run_binds_the_governor_in_a_real_subprocess(tmp_path, settin
 import asyncio, json, os
 from pathlib import Path
 from infermatrix_copilot.config import Settings
-from infermatrix_copilot.engine.executor import Executor
+from infermatrix_copilot.app.workflow_execution import WorkflowExecution
 from infermatrix_copilot.engine.registry import StepRegistry
 from infermatrix_copilot.engine.step import StepResult, StepSpec
 from infermatrix_copilot.playbooks.store import Playbook, PlaybookStep
@@ -185,10 +185,10 @@ settings = Settings(_env_file=None, run_root=Path(os.environ["RUN_ROOT"]), repo_
 registry = StepRegistry()
 registry.register(StepSpec("x.governed", "deterministic", "read", step, ""))
 run_dir = Path(os.environ["RUN_ROOT"]) / "run-1"
-ex = Executor(registry, settings, run_dir=run_dir, trace=RunTrace(run_dir / "t.jsonl"))
+ex = WorkflowExecution(settings, registry)
 pb = Playbook(name="p", version=1, status="active", task_kinds=["pr_review"], repos=[],
               steps=[PlaybookStep(id="g", step="x.governed")])
-out = asyncio.run(ex.run(pb, {"task_spec": {"repo": "demo"}}))
+out = asyncio.run(ex.execute(pb, run_dir=run_dir, state={"task_spec": {"repo": "demo"}}))
 print(json.dumps({"status": out.status, "reason": out.blocked_reason}))
 '''
     env = {**os.environ, "IMPROVE_GOVERNED": "1", "IMPROVE_LEDGER_DIR": str(tmp_path / "ledger"),

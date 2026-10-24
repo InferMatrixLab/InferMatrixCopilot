@@ -15,7 +15,7 @@ lifecycle existed. Parsing then rendering an untouched page returns its exact
 bytes, so an operation changes only the sections it targets.
 
 This module needs only the standard library and PyYAML and imports nothing
-else from the package.
+else except the shared format contract from the package.
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ from dataclasses import dataclass, field, replace
 from typing import Iterable
 
 import yaml
+
+from .format import (
+    APPEND_HEADING as _TOP_RULE, RULE_HEADING, ANY_RULE_HEADING, FRONTMATTER, frontmatter_value,
+)
 
 DEPTH_FACETS = ("flow", "api", "configuration", "dependencies", "failure_modes", "tradeoffs", "validation")
 DEPTH_ABSENCE_DETECTOR = "static-test-association-v2"
@@ -111,14 +115,37 @@ def depth_sections(text: str) -> list[dict]:
                      "gap_label": "no_statically_associated_test_entry" if basis == "verified_absent" else None})
     return [row for row in rows if counts[(row["feature"], row["facet"])] == 1]
 
-RULE_HEADING = re.compile(r"^(?P<level>#{2,3})\s+(?P<rule>[A-Za-z0-9][A-Za-z0-9-]{1,40})\s+[—-]\s+\S")
-_TOP_RULE = re.compile(r"^##\s+[A-Za-z0-9][A-Za-z0-9-]{1,40}\s+[—-]\s+\S")
-ANY_RULE_HEADING = re.compile(
-    r"^#{2,6}\s+(?P<rule>[A-Za-z0-9][A-Za-z0-9-]{1,40})(?=\s|$)", re.MULTILINE)
 FOOTER = re.compile(r"^<!--\s*kb:rule\s+(?P<attrs>.*?)\s*-->\s*$")
 _ATTR = re.compile(r'(?P<key>[a-z_]+)=(?:"(?P<quoted>[^"]*)"|(?P<bare>[^\s"]+))')
-FRONTMATTER = re.compile(r"\A---\r?\n(?P<body>.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
 CITATION = re.compile(r"\^\[(?P<ref>[^\]\n]{1,60})\]")
+
+
+def rule_heading_ids(text: str) -> tuple[str, ...]:
+    """Raw heading IDs, in order, including repeats and nested headings.
+
+    Callers decide which pages and fenced text belong to their contract.
+    """
+    return tuple(match.group("rule") for match in ANY_RULE_HEADING.finditer(text))
+
+
+def repeated_rule_id(text: str) -> str:
+    ids = rule_heading_ids(text)
+    seen: set[str] = set()
+    for rule_id in ids:
+        if rule_id in seen:
+            return rule_id
+        seen.add(rule_id)
+    return ""
+
+
+def first_taken_rule_id(ids, occupied, introduced=(), tombstoned=()) -> str:
+    """Check a whole candidate before reserving any of its rule identities."""
+    seen: set[str] = set()
+    for rule_id in ids:
+        if rule_id in occupied or rule_id in introduced or rule_id in tombstoned or rule_id in seen:
+            return rule_id
+        seen.add(rule_id)
+    return ""
 
 STATUSES = ("active", "retired")
 FOOTER_KEYS = (
@@ -274,7 +301,7 @@ class Section:
 
     @property
     def nested_rule_ids(self) -> tuple[str, ...]:
-        return tuple(m.group("rule") for m in ANY_RULE_HEADING.finditer(self.text))
+        return rule_heading_ids(self.text)
 
     @property
     def citations(self) -> tuple[str, ...]:
@@ -358,11 +385,8 @@ class Page:
         return replace(self, frontmatter=pattern.sub(f"{key}: {value}", self.frontmatter, count=1))
 
     def frontmatter_data(self) -> dict:
-        match = FRONTMATTER.match(self.frontmatter)
-        if not match:
-            return {}
         try:
-            data = yaml.safe_load(match.group("body")) or {}
+            data = frontmatter_value(self.frontmatter) or {}
         except yaml.YAMLError as exc:
             raise LifecycleError(f"frontmatter is not valid YAML: {exc}") from exc
         if not isinstance(data, dict):

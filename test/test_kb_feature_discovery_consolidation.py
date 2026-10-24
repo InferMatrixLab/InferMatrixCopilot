@@ -19,7 +19,7 @@ from infermatrix_copilot.kb_service.init_budget import BudgetExhausted
 from infermatrix_copilot.kb_service.models import ModelUnavailable, ModelRole
 from test_kb_feature_discovery import candidate, reply
 from test_kb_feature_discovery_boundary import engine, decisions
-from test_kb_feature_discovery_stage import _setup, _run, _report, _policy
+from test_kb_feature_discovery_stage import _setup, _run, _report, _policy, _save_legacy_record
 from test_kb_init_skeleton import world  # noqa: F401
 
 
@@ -58,6 +58,11 @@ def test_cross_layer_capability_with_different_aliases_is_one_canonical_feature(
         return reply(role, data)
     e.call = consolidate
     assert e.audit_catalog_consolidation(provisional)
+    policies = [context['policy'] for context in e.state['dispatch_contexts'].values()]
+    assert any(policy['kind'] == 'boundary' and 'baseline' in policy for policy in policies)
+    assert any(policy['kind'] == 'consolidation' and policy['features'] == provisional for policy in policies)
+    assert all(request['binding']['context_sha256'] == request['request']['context_sha256']
+               for request in e.state['dispatch_requests'].values())
     features, outcomes = e.catalog('repos/library', require_boundary=True, consolidation_features=provisional)
     assert [f['id'] for f in features] == ['backend-export']
     assert set(features[0]['source_globs']) == {'src/session.py', 'src/web.ts'}
@@ -221,7 +226,7 @@ def test_pre_consolidation_preview_reuses_scan_primary_boundary_without_retry(wo
     first.discovery.update(full_artifact=artifact, report_sha256=hashlib.sha256(text.encode()).hexdigest())
     if published:
         first.status = 'published'
-    first.save(rt.state_dir)
+    _save_legacy_record(rt, first)
     count = len(script.calls)
     current = _run(rt, lifecycle)
     assert current.status == ('published' if published else 'dry_run'), current.problems
@@ -335,7 +340,7 @@ def test_earlier_renderer_rerenders_unpublished_without_any_native_calls(world, 
     first.discovery.update(full_artifact=artifact, report_sha256=hashlib.sha256(text.encode()).hexdigest())
     if published:
         first.status = 'published'
-    first.save(rt.state_dir)
+    _save_legacy_record(rt, first)
     calls = len(script.calls)
     current = _run(rt, lifecycle)
     assert current.status == ('published' if published else 'dry_run'), current.problems

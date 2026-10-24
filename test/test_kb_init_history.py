@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from infermatrix_copilot.kb_service.init_history import MAX_PR_BODY_BYTES, SYSTEM_HISTORY, SYSTEM_REVIEW, _PrHistory, _body_key
+from infermatrix_copilot.kb_service.init_history import MAX_PR_BODY_BYTES, PAYLOADS_ENV, SYSTEM_HISTORY, SYSTEM_HISTORY_LEGACY, SYSTEM_HISTORY_V1, SYSTEM_HISTORY_V2, SYSTEM_REVIEW, _PrHistory, _body_key
 from infermatrix_copilot.kb_service.init_stages import run_stage
 from infermatrix_copilot.kb_service.init_support import InitError, InitPublisher, InitRecord
 from infermatrix_copilot.kb_service.models import ModelReply, ModelRole, ModelUnavailable
@@ -33,17 +33,19 @@ def _rule(number):
 
 
 class HistoryGateway(CodeGateway):
-    def __init__(self, *, fail_review=0, review_verdict="approve", fail_extract=0, extract_cost=0.01, **kwargs):
+    def __init__(self, *, fail_review=0, review_verdict="approve", fail_extract=0, extract_cost=0.01,
+                 expected_record_payload=False, **kwargs):
         super().__init__(**kwargs)
         self.fail_review, self.review_verdict, self.fail_extract = fail_review, review_verdict, fail_extract
         self.extract_calls, self.review_calls = [], []
         self.duplicate = False
         self.extract_cost = extract_cost
+        self.expected_record_payload = expected_record_payload
 
     def call_json(self, role, *, system, prompt, validate=None, max_budget_usd=None, record_payload=True):
         payload = _payload(prompt)
-        if system == SYSTEM_HISTORY:
-            assert record_payload is False
+        if system in (SYSTEM_HISTORY, SYSTEM_HISTORY_LEGACY, SYSTEM_HISTORY_V1, SYSTEM_HISTORY_V2):
+            assert record_payload is self.expected_record_payload
             number = payload["pr"]["number"]
             self.extract_calls.append(number)
             if self.fail_extract:
@@ -66,7 +68,7 @@ class HistoryGateway(CodeGateway):
         if validate:
             validate(data)
         return ModelReply(role, data, json.dumps(data), role.model, {}, 0.1,
-                          cost_usd=self.extract_cost if system == SYSTEM_HISTORY else 0.01)
+                          cost_usd=self.extract_cost if system in (SYSTEM_HISTORY, SYSTEM_HISTORY_LEGACY, SYSTEM_HISTORY_V1, SYSTEM_HISTORY_V2) else 0.01)
 
 
 class HistorySource:
@@ -159,7 +161,9 @@ def test_failed_codex_preview_resumes_review_without_reextracting(world):
     rt = _runtime(world, gateway, github=source)
     first = run_stage(rt, _modules_lifecycle(), "pr-history", dry_run=True)
     assert first.status == "blocked" and "Codex unavailable" in first.problems[0]
-    assert "prepared" not in first.pr and "number" not in first.pr
+    # Preview publication is now frozen before the exact-head review. It
+    # remains a local dry run and never gains a GitHub PR number.
+    assert "prepared" in first.pr and "number" not in first.pr
     resumed = run_stage(rt, _modules_lifecycle(), "pr-history", dry_run=True)
     assert resumed.status == "dry_run", resumed.problems
     assert gateway.extract_calls == [101, 102, 103] and len(gateway.review_calls) == 2
@@ -271,6 +275,8 @@ def test_publish_recovers_create_failure_and_reviews_one_aggregate_pr(world):
     assert gateway.review_calls == [] and fake.ready_calls == []
     # A checkpoint produced by an older writer may have a GitHub-sized body
     # failure after pushing. Rebuild presentation without changing the series.
+    first.pr.pop("validation", None)  # simulate the legacy prepared format
+    first.save(rt.state_dir)
     prepared = Path(first.pr["prepared"])
     data = json.loads(prepared.read_text())
     data["body"] = "x" * 70_000
@@ -471,9 +477,23 @@ def test_a_failed_review_or_changed_head_never_readies_the_pr(world, failure):
     assert fake.draft and not fake.ready_calls
 
 
-def test_duplicate_bodies_do_not_make_empty_upgrade_commits(world):
+@pytest.mark.parametrize('bare', [False, True])
+def test_duplicate_bodies_do_not_make_empty_upgrade_commits(world, bare):
     gateway, source = _setup(world)
     gateway.duplicate = True
+    if bare:
+        from dataclasses import replace
+        original_call = gateway.call_json
+        def bare_reply(role, *, system, prompt, **request):
+            reply = original_call(role, system=system, prompt=prompt, **request)
+            if system == SYSTEM_HISTORY:
+                data = json.loads(json.dumps(reply.data))
+                for rule in data['rules']:
+                    for field in ['title', 'trigger', 'must', 'forbid', 'acceptance']:
+                        rule[field] = rule[field].replace('`', '')
+                reply = replace(reply, data=data, text=json.dumps(data))
+            return reply
+        gateway.call_json = bare_reply
     # Offer the same source for the second PR too, to isolate deduplication.
     original = source.history_evidence
     def read(full_name, number):
@@ -536,3 +556,47 @@ def test_series_refuses_empty_commits_and_wrong_reviewer(world):
     with pytest.raises(InitError, match="codex provider"):
         run_stage(_runtime(world, environ={"KB_INIT_REVIEWER": "claude-code:some-model"}),
                   _modules_lifecycle(), "pr-history", dry_run=True)
+
+
+def test_explicit_history_payload_retention_binds_batch_and_trace(world):
+    from infermatrix_copilot.trace_store import current_context
+    gateway, source = _setup(world, HistoryGateway(expected_record_payload=True))
+    original = gateway.call_json
+    contexts = []
+    def observe(role, *, system, prompt, **kwargs):
+        if system in (SYSTEM_HISTORY, SYSTEM_HISTORY_LEGACY, SYSTEM_HISTORY_V1, SYSTEM_HISTORY_V2):
+            contexts.append(current_context())
+        return original(role, system=system, prompt=prompt, **kwargs)
+    gateway.call_json = observe
+    rt = _runtime(world, gateway, github=source, environ={PAYLOADS_ENV: 'retain-private'})
+    first = run_stage(rt, _modules_lifecycle(), 'pr-history', dry_run=True)
+    assert first.status == 'dry_run', first.problems
+    assert first.history['payloads'] == 'retain-private'
+    assert len(contexts) == 3 and all(row['history_payloads'] == 'retain-private' for row in contexts)
+    saved = InitRecord.load(rt.state_dir, 'toy', 'pr-history')
+    assert saved.history['payloads'] == 'retain-private'
+    second = run_stage(rt, _modules_lifecycle(), 'pr-history', dry_run=True)
+    assert second.pr == first.pr and len(contexts) == 3
+    assert gateway.extract_calls == [101, 102, 103] and len(gateway.review_calls) == 1
+
+
+@pytest.mark.parametrize('initial,changed', [('omit', 'retain-private'), ('retain-private', 'omit')])
+def test_history_payload_policy_drift_cannot_reextract_or_replace_existing_batch(world, initial, changed):
+    gateway, source = _setup(world, HistoryGateway(expected_record_payload=initial == 'retain-private'))
+    rt = _runtime(world, gateway, github=source, environ={PAYLOADS_ENV: initial})
+    first = run_stage(rt, _modules_lifecycle(), 'pr-history', dry_run=True)
+    assert first.status == 'dry_run', first.problems
+    history = json.loads(json.dumps(first.history)); calls = list(gateway.extract_calls)
+    rt.environ = {PAYLOADS_ENV: changed}
+    blocked = run_stage(rt, _modules_lifecycle(), 'pr-history', dry_run=True)
+    assert blocked.status == 'blocked' and 'inputs changed' in blocked.problems[0]
+    assert gateway.extract_calls == calls and len(gateway.review_calls) == 1
+    assert blocked.history == history and blocked.spent_usd == first.spent_usd
+
+
+@pytest.mark.parametrize('value', ['retain', 'true', '', 'untrusted'])
+def test_invalid_history_payload_policy_refuses_before_source_or_model_work(world, value):
+    rt = _runtime(world, environ={PAYLOADS_ENV: value})
+    with pytest.raises(InitError, match=PAYLOADS_ENV):
+        run_stage(rt, _modules_lifecycle(), 'pr-history', dry_run=True)
+    assert rt.gateway.calls == []

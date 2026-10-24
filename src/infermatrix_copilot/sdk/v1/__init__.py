@@ -1,14 +1,10 @@
 """InferMatrixCopilot embedded SDK v1 public surface."""
 
-from .direct import DirectClient, get_capabilities
-from ...knowledge_context import ContextBudget
-from .knowledge import KnowledgeCurator, KnowledgeValidatorError
-from ...knowledge_service.containment import (
-    ContainmentError, knowledge_maintenance_status, knowledge_usage_record,
-    knowledge_availability_check, knowledge_publication_guard, knowledge_policy_install,
-)
+from importlib import import_module
+
 from .models import (
     DIRECT_API_VERSION,
+    DURABLE_REVIEW_API_VERSION,
     KNOWLEDGE_API_VERSION,
     QUALITY_API_VERSION,
     SDK_API_VERSION,
@@ -21,6 +17,8 @@ from .models import (
     DirectCompletionRequest,
     DirectReviewPlan,
     DirectReviewRequest,
+    DirectReviewRunRequest,
+    ReviewRunRequest,
     DocumentNotFoundError,
     DocumentPage,
     DocumentRef,
@@ -48,11 +46,64 @@ from .models import (
     StrictReviewRequest,
     StrictRunHandle,
     StrictRuntimeConfig,
+    ReviewRuntimeConfig,
+    ReviewRunHandle,
+    ReviewPollResult,
+    ReviewFinding,
+    ReviewResult,
     UnsupportedRepositoryError,
 )
-from .strict import StrictRuntime
-from .rfc import RFC_API_VERSION, RFCClient, RFCClientError, Principal, SourceRef
-from ...trace_store import SCHEMA as TRACE_SCHEMA, TraceStore, redact, trace_context
+# Data contracts remain cold. Implementation imports occur only when a host
+# requests that capability, so a knowledge worker can import shared DTOs while
+# its own modules are still initializing.
+_LAZY = {
+    "knowledge_init_role_error": ("...kb_service.init_role_policy", "knowledge_init_role_error"),
+    "review_evidence_error": ("...review.publication_policy", "review_evidence_error"),
+    "feedback_disposition_error": ("...review.dispositions", "feedback_disposition_error"),
+    "readonly_environment": ("...execution_environment", "readonly_environment"),
+    **{name: ("...providers.descriptors", name) for name in (
+        "ProviderDescriptor", "provider_descriptor", "provider_descriptors", "provider_readiness", "provider_version", "provider_worker_limit")},
+    **{name: ("...review.direct_prompt", name) for name in (
+        "build_direct_review_prompt", "direct_review_schema", "REQUIRED_REVIEW_CHECKS")},
+    **{name: ("...review.diff", name) for name in ("diff_index", "patch_index", "normalize_path")},
+    **{name: ("...review.publication_policy", name) for name in ("review_head_error", "feedback_alignment_error")},
+    **{name: ("...knowledge_service.evidence", name) for name in (
+        "bugfix_record_identity", "resolve_bugfix_repository", "parse_bugfix_record", "knowledge_diff_excerpt",
+        "knowledge_changed_paths", "BUGFIX_RECORD_MARKER", "LEGACY_BUGFIX_RECORD_MARKER", "DIFF_EXCERPT_BYTES")},
+    **{name: (".rfc", name) for name in (
+        "RFC_API_VERSION", "RFCClient", "RFCClientError", "Principal", "SourceRef")},
+    "DirectClient": (".direct", "DirectClient"),
+    "get_capabilities": (".direct", "get_capabilities"),
+    "StrictRuntime": (".strict", "StrictRuntime"),
+    "ReviewRuntime": (".strict", "ReviewRuntime"),
+    **{name: (".strict", name) for name in ("decode_review_result", "strict_finding")},
+    "JSONSessionError": ("...providers.json_session", "JSONSessionError"),
+    **{name: (".review_result", name) for name in ("parse_direct_result", "ReviewParseError", "normalize_direct_evidence", "review_summary_errors")},
+    **{name: (".rechecks", name) for name in ("checked_rechecks", "check_disposition_proof")},
+    "ContextBudget": ("...knowledge_context", "ContextBudget"),
+    "KnowledgeCurator": (".knowledge", "KnowledgeCurator"),
+    "KnowledgeValidatorError": (".knowledge", "KnowledgeValidatorError"),
+    **{name: ("...knowledge_service.containment", name) for name in (
+        "ContainmentError", "knowledge_maintenance_status", "knowledge_usage_record",
+        "knowledge_availability_check", "knowledge_publication_guard", "knowledge_policy_install",
+    )},
+    "TRACE_SCHEMA": ("...trace_store", "SCHEMA"),
+    **{name: ("...trace_store", name) for name in ("TraceStore", "redact", "trace_context")},
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, attribute = _LAZY[name]
+    value = getattr(import_module(module, __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__ = [
     "RFC_API_VERSION",
@@ -61,6 +112,7 @@ __all__ = [
     "Principal",
     "SourceRef",
     "DIRECT_API_VERSION",
+    "DURABLE_REVIEW_API_VERSION",
     "KNOWLEDGE_API_VERSION",
     "QUALITY_API_VERSION",
     "SDK_API_VERSION",
@@ -82,6 +134,8 @@ __all__ = [
     "DirectCompletionRequest",
     "DirectReviewPlan",
     "DirectReviewRequest",
+    "DirectReviewRunRequest",
+    "ReviewRunRequest",
     "DocumentNotFoundError",
     "DocumentPage",
     "DocumentRef",
@@ -112,9 +166,26 @@ __all__ = [
     "StrictRunHandle",
     "StrictRuntimeConfig",
     "StrictRuntime",
+    "ReviewRuntime",
+    "decode_review_result",
+    "strict_finding",
+    "JSONSessionError",
+    "ReviewFinding",
+    "ReviewResult",
+    "ReviewParseError",
+    "parse_direct_result",
+    "normalize_direct_evidence",
+    "review_summary_errors",
+    "checked_rechecks",
+    "check_disposition_proof",
+    "ReviewRuntimeConfig",
+    "ReviewRunHandle",
+    "ReviewPollResult",
     "TraceStore",
     "UnsupportedRepositoryError",
     "get_capabilities",
     "redact",
     "trace_context",
 ]
+
+__all__ = sorted(set(__all__) | set(_LAZY))

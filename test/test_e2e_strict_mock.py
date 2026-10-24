@@ -183,6 +183,29 @@ def strict(settings, tmp_path, monkeypatch):
 
 
 # ── the happy path ────────────────────────────────────────────────────────────
+def test_public_sdk_strict_request_reaches_workflow_and_typed_publication_input(strict, monkeypatch):
+    from infermatrix_copilot.sdk.v1 import (
+        RepositoryRef, ReviewRuntime, StrictReviewRequest, review_head_error,
+    )
+    # Retain the fixture's real run service and workflow; only the transport
+    # boundary is in-process so its scripted model is available to the executor.
+    monkeypatch.setattr(strict.core._q, "put", lambda *_: None)
+    runtime = object.__new__(ReviewRuntime)
+    runtime._core = strict.core
+    request = StrictReviewRequest(RepositoryRef("widget", "acme/widget"), 7, strict.head,
+                                  "", "sdk-framework", review_depth="light")
+    reserved = runtime.reserve_review(request)
+    assert reserved.created
+    assert runtime.start_review(request).run_id == reserved.run_id
+    assert strict.run(reserved.run_id) == 0
+    result = runtime.get_result(reserved.run_id)
+    assert result.terminal and result.review.reviewed_head_sha == strict.head
+    assert result.review.verdict == "REQUEST CHANGES" and result.review.findings
+    assert review_head_error(result.review.reviewed_head_sha, strict.head) == ""
+    assert review_head_error(result.review.reviewed_head_sha, "f" * 40)
+    assert "report_path" not in result.payload
+
+
 def test_pinned_review_returns_a_structured_result(strict):
     """What the reviewbot actually consumes: a verdict and findings as data, at
     a head it named, with no Markdown to scrape."""
@@ -330,3 +353,44 @@ def test_a_key_reused_for_a_different_pr_is_refused(strict):
     assert strict.run(run_id) == 0
     with pytest.raises(idem.IdempotencyError, match="different request"):
         strict.start(pr=8, idempotency_key="k")
+
+
+@pytest.mark.parametrize('kind', ['pending', 'unfinished', 'sandbox', 'host_timeout', 'not_sent', 'cleanup'])
+def test_strict_unknown_native_outcome_keeps_original_sdk_identity(strict, monkeypatch, kind):
+    from infermatrix_copilot.sdk.v1 import RepositoryRef, ReviewRuntime, StrictReviewRequest
+    from infermatrix_copilot.providers.json_session import JSONSessionError
+    from infermatrix_copilot.sandbox.base import SandboxPending
+    error = JSONSessionError('injected missing original response', timeout=kind in ('host_timeout', 'not_sent'))
+    if kind == 'pending':
+        error.native_outcome_pending = True
+    elif kind == 'unfinished':
+        error.native_call_sent, error.native_call_completed = True, False
+    elif kind == 'sandbox':
+        error = SandboxPending('injected original execution requires reconciliation')
+    elif kind == 'not_sent':
+        error.native_call_sent = False
+    elif kind == 'cleanup':
+        from infermatrix_copilot.process_execution import ProcessCleanupError, ProcessOutcome
+        error = ProcessCleanupError(ProcessOutcome('partial', '', 0))
+    calls = []
+
+    def unknown(**kwargs):
+        calls.append(True)
+        raise error
+
+    monkeypatch.setattr(strict.llm, 'create', unknown)
+    monkeypatch.setattr(strict.core._q, 'put', lambda *_: None)
+    runtime = object.__new__(ReviewRuntime)
+    runtime._core = strict.core
+    request = StrictReviewRequest(RepositoryRef('widget', 'acme/widget'), 7, strict.head,
+                                 '', 'original-unknown-' + kind, review_depth='light')
+    handle = runtime.reserve_review(request)
+    assert runtime.start_review(request).run_id == handle.run_id
+    assert strict.run(handle.run_id) != 0
+    expected = rs.BLOCKED if kind == 'not_sent' else rs.INTERRUPTED
+    assert runtime.get_status(handle.run_id).state == expected
+    assert runtime.get_result(handle.run_id).state == expected
+    assert runtime.start_review(request).run_id == handle.run_id
+    assert strict.run(handle.run_id) == 0  # duplicate child cannot execute again
+    assert len(calls) == 1
+    assert runtime.get_result(handle.run_id).state == expected

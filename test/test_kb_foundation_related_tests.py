@@ -38,7 +38,7 @@ def test_direct_imports_and_late_assertions_include_nested_multilanguage_tests(t
     assert chosen and any(assertion in item["text"] for item in chosen)
     if source != "opaque/tool.strange":
         assert any(item["start"] > 180 for item in chosen)
-    assert all("not been executed" in item["test_context"] for item in chosen)
+    assert all("source text only, no execution outcome evidence" in item["test_context"] for item in chosen)
     assert all(item["path"] != "tests/test_name_only_tool.py" for item in excerpts)
     assert sum(len(item["text"].encode()) for item in excerpts) <= 20000
 
@@ -74,3 +74,23 @@ def test_specific_capability_test_survives_earlier_shared_entry_test_budget(tmp_
     assert excerpts[0]["path"] == "tests/test_share_image_export.py"
     assert any("assert ShareImageExportManager().export()" in item["text"] for item in excerpts)
     assert sum(len(item["text"].encode()) for item in excerpts) <= 600
+
+
+@pytest.mark.parametrize("limit", [1, 600, 100000])
+def test_foundation_packet_reserves_actual_test_bytes_inside_one_existing_cap(tmp_path, limit):
+    from infermatrix_copilot.kb_service.init_knowledge_parallel import foundation_source_packet
+    stage = _stage(tmp_path)
+    budgets = []
+    def read_sources(remaining):
+        budgets.append(remaining)
+        return [{"path":"src/tool.py", "text":"源" * (remaining // 3)}]
+    packet, count = foundation_source_packet(stage, ["src/tool.py"],
+        read_sources=read_sources, byte_limit=limit)
+    tests = [item for item in packet if item.get("test_context")]
+    assert count == len(tests)
+    assert budgets == [limit - sum(len(item["text"].encode()) for item in tests)]
+    assert sum(len(item["text"].encode()) for item in packet) <= limit
+    assert all("source text only, no execution outcome evidence" in item["test_context"] for item in tests)
+    assert all("tests have not been executed" not in item["test_context"] for item in tests)
+    if limit == 100000:
+        assert any("assert SpecificTool().run() == 7" in item["text"] for item in tests)

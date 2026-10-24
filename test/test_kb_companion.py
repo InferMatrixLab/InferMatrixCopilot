@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sqlite3
 from dataclasses import replace
+
+import pytest
 
 from infermatrix_copilot.kb_service import merge
 from infermatrix_copilot.kb_service.companion import rewrite
@@ -212,31 +215,81 @@ def test_a_companion_merged_during_a_pause_is_rebuilt_after_resume(tmp_path):
     assert rt.ledger.changeset(companion_id)["status"] == "merged"
 
 
-def test_a_crash_before_linking_still_rebuilds_the_change_when_the_companion_merges(tmp_path):
+def test_legacy_unlinked_companion_still_rebuilds_parent_after_merge(tmp_path):
     from infermatrix_copilot.knowledge_service.signing import generate_private_key, load_public_key, public_key_text
 
     rt, lifecycle = _retiring_runtime(tmp_path)
     publisher = generate_private_key(tmp_path / "publisher.pem")
     rt.publisher_public_key = load_public_key(public_key_text(publisher.public_key()))
-    real_update = rt.ledger.update_changeset
-
-    def crash(changeset_id, **fields):
-        if fields.get("status") == "companion_pending":
-            raise RuntimeError("crash before linking")
-        return real_update(changeset_id, **fields)
-
-    rt.ledger.update_changeset = crash
     collect_events(rt, lifecycle)
-    try:
-        run_intake(rt, lifecycle)
-    except RuntimeError:
-        pass
-    rt.ledger.update_changeset = real_update
+    knowledge_id = run_intake(rt, lifecycle)
+    # Persisted legacy rows can have a child without the parent link. New gate
+    # settlement creates both atomically, so construct that old shape explicitly.
+    detail = dict(rt.ledger.changeset(knowledge_id)['detail'])
+    detail.pop('companion')
+    rt.ledger.update_changeset(knowledge_id, status='human', detail=detail)
     (knowledge,) = [cs for cs in rt.ledger.changesets("demo", ("human",)) if cs["kind"] == "intake"]
     assert "companion" not in knowledge["detail"]
-    from infermatrix_copilot.kb_service.scheduler import Scheduler
-    Scheduler(rt)._repo_tick(lifecycle)                   # recovery publishes the staged companion
     _companion_open(tmp_path, rt, lifecycle, publisher, knowledge["id"], 54)
     events = merge.advance(rt, lifecycle)
     assert any(e.startswith(f"rebuilt {knowledge['id']}") or e == f"rebuild_failed {knowledge['id']}"
                for e in events)
+
+
+@pytest.mark.parametrize('failure_at', ['artifact', 'transaction', 'commit_reply'])
+def test_companion_receipt_recovers_one_atomic_parent_child_without_publication(tmp_path, monkeypatch, failure_at):
+    from infermatrix_copilot import persistence
+    from infermatrix_copilot.kb_service.cli import main
+    from infermatrix_copilot.kb_service.companion import publish_companion
+
+    rt, lifecycle = _retiring_runtime(tmp_path)
+    original_write = persistence.immutable_write_bytes
+    original_stage = rt.ledger.stage_intake
+
+    def fail_write(path, *args, **kwargs):
+        if path.parent.name == 'changesets' and '-companion-' in path.name:
+            raise OSError('companion artifact unavailable')
+        return original_write(path, *args, **kwargs)
+
+    def lose_reply(*args, **kwargs):
+        value = original_stage(*args, **kwargs)
+        if kwargs.get('expected_status'):
+            raise OSError('settlement reply lost')
+        return value
+
+    if failure_at == 'artifact':
+        monkeypatch.setattr(persistence, 'immutable_write_bytes', fail_write)
+    elif failure_at == 'transaction':
+        rt.ledger._conn.execute("CREATE TRIGGER fail_companion BEFORE INSERT ON changesets "
+                                "WHEN NEW.kind='companion' BEGIN SELECT RAISE(ABORT, 'companion insert failed'); END")
+    else:
+        monkeypatch.setattr(rt.ledger, 'stage_intake', lose_reply)
+    collect_events(rt, lifecycle)
+    with pytest.raises((OSError, sqlite3.IntegrityError)):
+        run_intake(rt, lifecycle)
+    parent, = rt.ledger.changesets_of_kind('demo', 'intake')
+    calls = list(rt.gateway.calls)
+    if failure_at != 'commit_reply':
+        assert parent['status'] == 'review_pending'
+        assert rt.ledger.changesets_of_kind('demo', 'companion') == []
+        assert rt.ledger._conn.execute('SELECT count(*) FROM verdicts').fetchone()[0] == 0
+    assert not _items(tmp_path, 'open_companion_pr')
+    monkeypatch.setattr(persistence, 'immutable_write_bytes', original_write)
+    monkeypatch.setattr(rt.ledger, 'stage_intake', original_stage)
+    rt.ledger._conn.execute('DROP TRIGGER IF EXISTS fail_companion')
+    rt.ledger.release_lease(rt.lease_owner)
+    args = ['--state-dir', str(rt.state_dir), 'reconcile-review', parent['id']]
+    assert main(args) == 0
+    assert main(args) == 0
+    parent = rt.ledger.changeset(parent['id'])
+    child, = rt.ledger.changesets_of_kind('demo', 'companion')
+    assert parent['status'] == 'companion_pending'
+    assert parent['detail']['companion'] == child['id']
+    assert child['status'] == 'companion_staged'
+    assert child['detail']['for_changeset'] == parent['id']
+    assert 'DEMO-1a' not in rt.load_changeset_files(child['id'])['files']['skills/x.md']
+    assert rt.gateway.calls == calls
+    assert not _items(tmp_path, 'open_companion_pr')
+    publish_companion(rt, lifecycle, child['id'])
+    publish_companion(rt, lifecycle, child['id'])
+    assert len(_items(tmp_path, 'open_companion_pr')) == 1

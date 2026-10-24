@@ -53,7 +53,7 @@ def source_identity(spec):
 
 def bootstrap_workspace(state_dir, row):
     """Bootstrap only reviewed infrastructure; model generated knowledge is not accepted here."""
-    from ..sdk._resources import knowledge_root
+    from ..resources import knowledge_root
 
     spec = RepoSpec.from_dict(row["spec"])
     root = Path(state_dir) / "init" / "workspaces" / spec.repo_id
@@ -154,20 +154,16 @@ def stage_receipt(state_dir, repo_id, stage, *, reviewer):
     record = InitRecord.load(Path(state_dir), repo_id, stage)
     if not record or record.status != "dry_run":
         raise InitError("local review requires a finished preview")
-    from .init_stages import _dry_run_files
-    files = _dry_run_files(record)
-    checked = {p: hashlib.sha256(t.encode()).hexdigest() for p, t in sorted(files.items())}
-    if checked != record.pr.get("checked_files_sha256"):
-        raise InitError("preview files changed after source and independent review checks")
-    if sorted(files) != sorted(record.files):
-        raise InitError("preview file set differs from the checked stage")
+    from .preview import read_preview, file_hashes
+    files = read_preview(record, require_checked=True)
+    checked = file_hashes(files)
     if record.discovery.get("report_sha256"):
         report_path = record.discovery["report_path"]
         if hashlib.sha256(files[report_path].encode()).hexdigest() != record.discovery["report_sha256"]:
             raise InitError("discovery preview changed after independent review")
     return {"schema_version": 1, "repo_id": repo_id, "stage": stage,
         "reviewer": reviewer, "inputs_digest": record.inputs_digest, "source_pin": record.pin,
-        "base_sha": record.kb_base_sha, "files": {p: hashlib.sha256(t.encode()).hexdigest() for p, t in sorted(files.items())}}
+        "base_sha": record.kb_base_sha, "files": checked}
 
 
 def accept_stage(state_dir, repo_id, stage, receipt):
@@ -181,8 +177,8 @@ def accept_stage(state_dir, repo_id, stage, receipt):
     record = InitRecord.load(Path(state_dir), repo_id, stage)
     if _git(root, "rev-parse", "HEAD") != record.kb_base_sha:
         raise InitError("local baseline changed; review the new stage input")
-    from .init_stages import _dry_run_files
-    files = _dry_run_files(record)
+    from .preview import read_preview
+    files = read_preview(record, require_checked=True)
     publisher = InitPublisher(root, "", allowed_paths=tuple(files))
     commit = publisher.build_commit(record.kb_base_sha, files, title=f"kb init({repo_id}): {stage}",
         author=(receipt["reviewer"], "kb-review@localhost"), when=record.started_at)
@@ -206,6 +202,7 @@ def check_local_acceptance(runtime, record):
         raise InitError("accepted local catalog is not in the current baseline")
     for path, expected in receipt.get("files", {}).items():
         text = runtime.knowledge.show(head, path)
-        if text is None or hashlib.sha256(text.encode()).hexdigest() != expected:
+        if (text is not None if expected is None else
+                text is None or hashlib.sha256(text.encode()).hexdigest() != expected):
             raise InitError("accepted local file hash differs")
     return head

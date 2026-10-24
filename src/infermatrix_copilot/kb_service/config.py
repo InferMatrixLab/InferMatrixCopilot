@@ -9,11 +9,20 @@ service itself because it has no adapter.
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..adapters import AdapterError, AdapterRegistry, RepoAdapter
+
+KNOWLEDGE_REPO_ENV = "KB_KNOWLEDGE_REPOSITORY"
+DEFAULT_KNOWLEDGE_REPOSITORY = "JiusiServe/InferMatrixCopilot"
+
+
+def knowledge_repository() -> str:
+    return os.environ.get(KNOWLEDGE_REPO_ENV, DEFAULT_KNOWLEDGE_REPOSITORY)
+
 
 MODES = ("shadow", "auto_merge")
 TRIGGERS = ("github_release", "tag_pattern", "branch_cut", "none")

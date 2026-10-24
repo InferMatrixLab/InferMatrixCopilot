@@ -8,7 +8,7 @@ import pytest
 from infermatrix_copilot.kb_service import init_knowledge_parallel as parallel
 from infermatrix_copilot.kb_service.init_knowledge import _Knowledge
 from infermatrix_copilot.kb_service.init_knowledge_inputs import (
-    SYSTEM_KNOWLEDGE, SYSTEM_KNOWLEDGE_V4, foundation_evidence, knowledge_prompt,
+    SYSTEM_KNOWLEDGE, SYSTEM_KNOWLEDGE_V4, foundation_evidence, knowledge_prompt, knowledge_system,
 )
 from infermatrix_copilot.kb_service.init_support import InitError, InitRecord
 from test_kb_foundation_parallel import _complete_native
@@ -130,7 +130,8 @@ def test_version4_native_generator_and_judge_bind_the_same_full_packet_and_resum
         for artifact in task["artifacts"]:
             generator, gen = _native_payload(traces, artifact, "generator")
             judge, judged = _native_payload(traces, artifact, "judge")
-            assert traces.blob(generator["inputs"]["system"]) == SYSTEM_KNOWLEDGE_V4
+            assert task["payload"]["foundation_generation_policy_version"] == 1
+            assert traces.blob(generator["inputs"]["system"]) == knowledge_system(task["payload"])
             assert [p["text"] for p in judged["evidence"]] == [p["text"] for p in gen["files"] + gen["docs"]]
             assert [p["path"] for p in judged["evidence"]] == [p["path"] for p in gen["files"] + gen["docs"]]
     parallel.validate_checkpoint(_audit_stage(rt, record), record, record.inputs_digest)
@@ -142,9 +143,12 @@ def test_real_historical_version3_native_receipts_remain_replayable_without_recl
     def legacy_worker(stage, job):
         job = copy.deepcopy(job)
         job["payload"].pop("foundation_prompt_version", None)
+        job["payload"].pop("foundation_generation_policy_version", None)
         return worker(stage, job)
     def legacy_options(stage):
-        return {**options(stage), "knowledge_prompt_version": 3}
+        legacy = {**options(stage), "knowledge_prompt_version": 3}
+        legacy.pop("foundation_generation_policy_version")
+        return legacy
     with monkeypatch.context() as old:
         old.setattr(parallel, "_worker", legacy_worker)
         old.setattr(_Knowledge, "_input_options", legacy_options)
@@ -195,7 +199,7 @@ def test_adjacent_chunk_citation_is_actually_reviewed_and_native_replayable(worl
         return worker(stage, job)
     def spanning_call(self, role, **kwargs):
         reply = call(self, role, **kwargs)
-        if kwargs["system"] == SYSTEM_KNOWLEDGE_V4:
+        if kwargs["system"] == knowledge_system({"foundation_prompt_version": 4, "foundation_generation_policy_version": 1}):
             payload = json.loads(kwargs["prompt"].split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
             first = payload["files"][0]
             end = max(f["end"] for f in payload["files"] if f["path"] == first["path"])

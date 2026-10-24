@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reviewed_head_sha",
+    "summary",
+    "findings",
+    "review_checks",
+    "subtraction_signal",
+    "subtraction",
+    "minimality_proof",
+    "existing_feedback_status",
+    "finding_dispositions",
+    "finding_rechecks"
+  ],
+  "properties": {
+    "reviewed_head_sha": {"type": "string", "minLength": 7},
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000,
+      "description": "Markdown containing, in order, a plain-language `### PR description` section and a `### Change flow` section with one fenced Mermaid flowchart. The flow must classify added, modified/renamed, removed, and unchanged-context nodes as NEW, CHANGED, REMOVED, and EXISTING with matching Mermaid classes."
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "body", "path", "line"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+          "title": {"type": "string", "minLength": 1, "maxLength": 160},
+          "body": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "path": {"type": "string", "minLength": 1, "maxLength": 500},
+          "line": {"type": ["integer", "null"], "minimum": 1}
+        }
+      }
+    },
+    "review_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_alignment",
+        "existing_reuse",
+        "code_placement",
+        "change_minimality",
+        "diff_size_budget",
+        "resource_budget",
+        "initialization_order",
+        "failure_propagation",
+        "concurrency_scheduling",
+        "native_api_contract",
+        "feature_enabled_path",
+        "test_evidence_ci_alignment",
+        "historical_comments"
+      ],
+      "properties": {
+        "scope_alignment": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "existing_reuse": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "code_placement": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "change_minimality": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "diff_size_budget": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "resource_budget": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "initialization_order": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "failure_propagation": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "concurrency_scheduling": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "native_api_contract": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "feature_enabled_path": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "test_evidence_ci_alignment": {"type": "string", "minLength": 12, "maxLength": 4000},
+        "historical_comments": {"type": "string", "minLength": 12, "maxLength": 4000}
+      }
+    },
+    "subtraction_signal": {"type": "string", "enum": ["none", "triggered"]},
+    "subtraction": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["anchor", "action", "risk"],
+        "properties": {
+          "anchor": {"type": "string"},
+          "action": {"type": "string"},
+          "risk": {"type": "string"}
+        }
+      }
+    },
+    "minimality_proof": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope_ledger", "abstraction_census", "why_no_safe_deletion"],
+          "properties": {
+            "scope_ledger": {"type": "string"},
+            "abstraction_census": {"type": "string"},
+            "why_no_safe_deletion": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "existing_feedback_status": {
+      "type": "string",
+      "enum": ["checked", "disabled", "unavailable", "not_applicable"]
+    },
+    "finding_dispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anchor",
+          "disposition",
+          "existing_thread",
+          "head_recheck"
+        ],
+        "properties": {
+          "anchor": {
+            "type": "string",
+            "pattern": "^.+:(?:[1-9][0-9]*|general)$"
+          },
+          "disposition": {
+            "type": "string",
+            "description": "Use new for a new concern; duplicate or extends_existing for a referenced prior thread; resolved_or_outdated only with a head recheck.",
+            "enum": [
+              "new",
+              "duplicate",
+              "extends_existing",
+              "resolved_or_outdated"
+            ]
+          },
+          "existing_thread": {
+            "type": "string",
+            "description": "Empty for new; otherwise copy a canonical thread_ref from the frozen review context.",
+            "maxLength": 512,
+            "pattern": "^(?:(?:issue_comment|inline_comment|review_summary):[1-9][0-9]*|https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:pull|issues)/[1-9][0-9]*#(?:discussion_r|issuecomment-|pullrequestreview-)[1-9][0-9]*)?$"
+          },
+          "head_recheck": {
+            "type": "string",
+            "description": "Use fixed or still_affected only for resolved_or_outdated; otherwise empty.",
+            "enum": ["", "fixed", "still_affected"]
+          }
+        }
+      }
+    },
+    "finding_rechecks": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "head_sha",
+          "outcome",
+          "evidence"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "head_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{40}$"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "still_affected",
+              "unverified"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

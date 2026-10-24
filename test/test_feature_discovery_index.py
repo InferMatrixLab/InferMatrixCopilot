@@ -105,6 +105,31 @@ def test_cache_reuse_hash_validation_and_scope_invalidation(tmp_path):
     assert other.production == [] and other.identity != first.identity
 
 
+@pytest.mark.parametrize('damage', ['corrupt', 'symlink'])
+def test_retained_index_lookup_shares_integrity_with_explicit_cache_tolerance(tmp_path, damage):
+    from infermatrix_copilot.kb_service.feature_discovery_index import load_index_snapshot
+    source, cache = tmp_path / 'repo', tmp_path / 'cache'
+    source.mkdir()
+    cache.mkdir()
+    _tree(source, {'src/api.py': 'def public(): pass\n'})
+    index = _index(source, cache_path=cache / 'valid.json')
+    bad = cache / '00-invalid.json'
+    if damage == 'corrupt':
+        bad.write_text('{}')
+    else:
+        bad.symlink_to(cache / 'valid.json')
+    with pytest.raises(ValueError):
+        load_index_snapshot(cache, sha256=index.sha256, pin=PIN)
+    # The publication cache gate historically skips unrelated broken entries;
+    # recovery and native consolidation retain their stricter default policy.
+    assert load_index_snapshot(cache, sha256=index.sha256, pin=PIN, skip_invalid=True) == index
+    with pytest.raises(ValueError, match='pin differs'):
+        load_index_snapshot(cache, sha256=index.sha256, pin='b' * 40, skip_invalid=True)
+    (cache / 'valid.json').unlink()
+    with pytest.raises(ValueError, match='unavailable'):
+        load_index_snapshot(cache, sha256=index.sha256, pin=PIN, skip_invalid=True)
+
+
 def test_explicit_scope_excludes_vendor_but_retains_nested_tests(tmp_path):
     _tree(tmp_path, {"src/api.py": "def public(): pass\n", "src/vendor/imported.py": "def thirdparty(): pass\n",
                      "src/tests/deep/test_public.py": "assert public()\n", "src/api.odd": "public entry\n"})

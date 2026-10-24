@@ -383,7 +383,8 @@ def test_harness_one_shot_and_session_are_captured(tmp_path, settings, monkeypat
         def run_session(self, request):
             return AgentOutcome(text="final answer", iterations=4, tool_calls=6, truncated=True,
                                 refusals=["write_file"], input_tokens=100, output_tokens=20,
-                                tools_used=["read_file", "grep"])
+                                tools_used=["read_file", "grep"],
+                                usage={"input_tokens": 100, "output_tokens": 20})
 
     transport = Transport()
     harness = HarnessLLM.__new__(HarnessLLM)
@@ -544,7 +545,7 @@ def test_incomplete_fingerprint_names_the_missing_cover(settings):
 def test_executor_binds_store_and_unit_context_per_step(tmp_path, settings):
     import asyncio
 
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.step import StepResult, StepSpec
     from infermatrix_copilot.playbooks.store import Playbook, PlaybookStep

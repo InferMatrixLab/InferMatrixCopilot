@@ -8,7 +8,7 @@ of each request and every read inside that request goes through it.
 
 Resolution:
 
-* ``KNOWLEDGE_ROOT`` unset -> the packaged tree (``sdk._resources``), exactly as
+* ``KNOWLEDGE_ROOT`` unset -> the packaged tree (``resources``), exactly as
   before. ``snapshot`` is ``"packaged"``.
 * ``KNOWLEDGE_ROOT`` set -> ``realpath`` of it, taken ONCE per view, so a swap
   mid-request cannot mix two trees. A directory holding ``MANIFEST.json`` is an
@@ -28,7 +28,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping
 
-from .sdk._resources import knowledge_root
+from .resources import knowledge_root
 
 KNOWLEDGE_ROOT_ENV = "KNOWLEDGE_ROOT"
 MANIFEST_NAME = "MANIFEST.json"
@@ -63,6 +63,23 @@ class KnowledgeView:
     root: Path
     snapshot: str
     files: Mapping[str, str] | None = field(default=None, compare=False)
+
+    @classmethod
+    def for_root(cls, root: str | Path) -> "KnowledgeView":
+        """Select the canonical pinned view for an explicitly supplied tree."""
+        root = Path(root).resolve()
+        configured = os.environ.get(KNOWLEDGE_ROOT_ENV, '').strip()
+        # A projected sandbox tree must not inherit an unrelated host path.
+        if not configured or Path(configured).expanduser().resolve() in (root, root.parent):
+            current = cls.current()
+            if current.root.resolve() == root:
+                return current
+        if (root.parent / "MANIFEST.json").is_file():
+            view = _load_view(str(root.parent))
+            if view.root.resolve() != root:
+                raise KnowledgeViewError("snapshot manifest belongs to a different knowledge root")
+            return view
+        return cls(root, f"unverified:{root}")
 
     @classmethod
     def current(cls) -> "KnowledgeView":

@@ -191,12 +191,12 @@ def load_decision_json(path: Path) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    m = re.search(r"\{[\s\S]*\}\s*$", raw)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
+    from ..structured_output import decode_json_object
+
+    try:
+        return decode_json_object(raw, policy="trailing_object")
+    except ValueError:
+        pass
     raise DecisionError(f"invalid JSON in {path}")
 
 
