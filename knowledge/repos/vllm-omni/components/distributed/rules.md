@@ -1,10 +1,10 @@
 ---
 title: "Distributed 传输规则"
 created: 2026-08-05
-updated: 2026-10-09
+updated: 2026-10-26
 type: rule
 tags: [vllm-omni, components, distributed]
-sources: ["PR #5744", "PR #5976", "PR #6001", "PR #6089", "PR #6834", vllm_omni/diffusion/distributed/parallel_state.py, tests/diffusion/distributed/test_expert_parallel_layout.py, vllm_omni/distributed/omni_connectors/adapter.py, vllm_omni/distributed/omni_connectors/kv_transfer_manager.py, vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py, vllm_omni/distributed/omni_connectors/transfer_adapter/base.py, vllm_omni/worker/omni_connector_model_runner_mixin.py, tests/distributed/omni_connectors/test_kv_recv_tp_consensus.py, tests/distributed/omni_connectors/test_chunk_transfer_adapter.py, tests/worker/test_omni_connector_mixin.py, "PR #5146", "PR #6021", "PR #6033", "PR #6360", "PR #6406", "PR #6626", "PR #6529", "PR #7136", "PR #6889", "PR #6093", "PR #7870", "PR #7166", "PR #8082", "PR #7733"]
+sources: ["PR #5744", "PR #5976", "PR #6001", "PR #6089", "PR #6834", vllm_omni/diffusion/distributed/parallel_state.py, tests/diffusion/distributed/test_expert_parallel_layout.py, vllm_omni/distributed/omni_connectors/adapter.py, vllm_omni/distributed/omni_connectors/kv_transfer_manager.py, vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py, vllm_omni/distributed/omni_connectors/transfer_adapter/base.py, vllm_omni/worker/omni_connector_model_runner_mixin.py, tests/distributed/omni_connectors/test_kv_recv_tp_consensus.py, tests/distributed/omni_connectors/test_chunk_transfer_adapter.py, tests/worker/test_omni_connector_mixin.py, "PR #5146", "PR #6021", "PR #6033", "PR #6360", "PR #6406", "PR #6626", "PR #6529", "PR #7136", "PR #6889", "PR #6093", "PR #7870", "PR #7166", "PR #8082", "PR #7733", "PR #9406"]
 confidence: high
 ---
 
@@ -177,3 +177,12 @@ confidence: high
 - 强制：`cleanup` 按调用方传入的完整 key 精确 unlink，不得按 request-id 做 `_` 前缀/后缀模糊匹配；即使 key 不在 `_pending_keys` 中仍会尝试 unlink，不能把该记账集合当成所有权拒绝门禁。receiver 读到 SHM 字节后即可标 consumed 并删 lock file，即使随后 deserialize 失败。producer 在 `put` 与空闲 save loop 上做有界 round-robin `reap_consumed`（丢弃对端已 unlink 的 key）。abort 后在 in-flight 排空再按 adapter 生成的精确 chunk key 入队清理；成功终态 payload 必须留给下游消费，且清理发生在 external-id 复用之前。receiver 用当前 registration identity 拒 stale work，不得堆积 cancellation tombstone。
 - 禁止：用 request-id 子串误删无关 SHM；把已跨进程消费的 key 永远留在 `_pending_keys`；deserialize 失败就留下 lock file；用 underscore-prefix 猜测所有权。
 - 验收：覆盖相似 request id、abort-during-put、external-id 复用、无效 payload 后 lock 消失、consumed-key 回收，以及取消后 `/dev/shm` 与 pending keys 归零。^[PR #8082]
+
+## VLLM-OMNI-PR9406-ASYNC-POLL-SLEEP — stage memory 生命周期测试的 _wait_until 轮询禁止 sleep(0) 忙等
+
+- 触发：改动 `tests/engine/test_stage_memory_lifecycle.py` 中 `_wait_until` 轮询助手——`while not predicate()` 循环内的休眠间隔或外层 `asyncio.wait_for` 的超时取值。
+- 强制：`_wait_until` 的轮询必须以真实让出事件循环的休眠代替零延迟忙等，随 PR #9406（修复 #9401）合入的取值为 `await asyncio.sleep(0.001)`。依据随修复落在树内的代码注释：谓词的满足依赖 `asyncio.to_thread` 中执行的 replica 注册，`asyncio.sleep(0)` 的循环连续可运行，会在 GIL 上饿死该工作线程，使替换快照在期限耗尽前无法发布（PR 记录的单 CPU 绑定 + 加大线程切换间隔的压复现：修复前 1 failed/141 passed，修复后 220 passed）。修该文件此类时序 flake 时保持 `timeout=2` 与全部生命周期断言不变（含防止已脱离 RPC 覆盖其替换者快照的断言），调整的是轮询让出方式而非期限或断言。
+- 禁止：把 `_wait_until` 循环内的休眠改回 `asyncio.sleep(0)` 忙等；以拉长 `asyncio.wait_for` 超时或删除/放宽该文件生命周期断言的方式"修复"此类时序 flake。
+- 验收：`_wait_until` 循环内为 `await asyncio.sleep(0.001)` 且 `timeout=2` 未变；`python -m pytest tests/engine/test_stage_memory_lifecycle.py tests/engine/test_membership_controller.py tests/engine/test_stage_pool_collective_rpc.py -q` 通过。^[PR #9406]
+
+<!-- kb:rule status=active since=v0.30.0 -->
