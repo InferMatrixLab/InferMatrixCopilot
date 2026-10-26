@@ -145,7 +145,20 @@ class PlanGate:
         self.plan_prefix = plan_prefix
         self.gated = tuple(gated)
         self.trace = trace
-        self.open = False
+        # A harness may restart its stdio MCP process while preserving the
+        # model session. The decision file is the durable gate state; starting
+        # every replacement bridge closed forces the agent to rewrite an
+        # already-reviewed decision before it can finish or emit its signal.
+        try:
+            restored = next(
+                (path for path in Path(plan_prefix).rglob("*.decision.md")
+                 if path.is_file()), None)
+        except OSError:
+            restored = None
+        self.open = restored is not None
+        if restored is not None and self.trace is not None:
+            self.trace.record("plan_gate_opened", decision=str(restored),
+                              restored=True)
 
     def refusal(self, name: str, args: dict) -> str | None:
         """The refusal text for a call that must not run yet, else None."""

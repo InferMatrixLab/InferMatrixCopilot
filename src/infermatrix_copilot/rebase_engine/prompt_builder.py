@@ -213,6 +213,8 @@ def build_module_prompt(
     adaptive_guidance: str = "",
     live: bool = False,
     baseline_ref: str = "origin/main",
+    target_branch: str = "",
+    upstream_commit: str = "",
     run_git: Callable[[list[str], str], str] | None = None,
 ) -> str:
     """Byte-parity render of the parent's `build_module_prompt`. `script_dir`
@@ -292,6 +294,23 @@ def build_module_prompt(
         "SCRIPT_DIR":        script_dir,
         "SESSION":           f"module-{module}",
     }
+    if live:
+        # Use the run's pin even when the checkout has drifted; displaying
+        # both lets the agent verify the environment before making a port.
+        # Legacy callers without run context use observed checkout facts,
+        # never the release or prior-alignment SHA from an earlier campaign.
+        vars_map.update({
+            "TARGET_BRANCH": (target_branch
+                              or git(["symbolic-ref", "--quiet", "--short", "HEAD"],
+                                     vllm_path)
+                              or "unspecified (detached checkout)"),
+            "UPSTREAM_COMMIT": (upstream_commit
+                                or git(["rev-parse", "HEAD"], vllm_path)
+                                or "unresolved (verify upstream checkout HEAD)"),
+            "LAST_REBASE_UPSTREAM_COMMIT": (last_rebase_vllm_commit
+                                            or "not supplied"),
+            "BASELINE_REF": baseline_ref,
+        })
     for key, value in vars_map.items():
         template = template.replace("{" + key + "}", value)
     return template

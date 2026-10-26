@@ -100,7 +100,8 @@ def main(argv: list[str] | None = None) -> int:
                              "doc/RUNBOOK-rebase.md); rfc: portable RFC "
                              "drafting and progress service")
     parser.add_argument("--repo", default="",
-                        help="with migrate-knowledge: the target repo name")
+                        help="with migrate-knowledge: target repo; "
+                             "with --resume: assert the saved repo name")
     parser.add_argument("--dry-run", action="store_true",
                         help="with migrate-knowledge: report only, write "
                              "nothing else")
@@ -115,16 +116,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="skip confirmation prompts (headless)")
     parser.add_argument("--plan-only", action="store_true",
                         help="resolve and print the plan without executing")
-    parser.add_argument("--resume", action="store_true",
-                        help="resume the most recent run at its first incomplete step")
+    parser.add_argument("--resume", nargs="?", const="", default=None,
+                        metavar="RUN_ID",
+                        help="resume RUN_ID, or the most recent run when omitted; "
+                             "repo/playbook/task params assert its saved identity")
     parser.add_argument("--playbook",
                         help="run a specific playbook by name "
-                             "(incl. planner-invisible candidates)")
+                             "(incl. planner-invisible candidates); "
+                             "with --resume: assert the saved playbook")
     parser.add_argument("--report-only", action="store_true",
                         help="with --playbook: read-only variant of the task")
     parser.add_argument("--task-param", action="append", default=[],
                         metavar="KEY=VALUE",
-                        help="with --playbook: task param (repeatable), "
+                        help="with --playbook: task param; with --resume: "
+                             "assert a saved task param (repeatable), "
                              "e.g. --task-param local_ci_only=true")
     parser.add_argument("--no-chat", action="store_true",
                         help="use the plain command REPL instead of the "
@@ -207,8 +212,10 @@ def main(argv: list[str] | None = None) -> int:
         return copilot.execute_reserved(args.execute_reserved)
     if args.execute_strict_reserved:
         return copilot.execute_strict_reserved(args.execute_strict_reserved)
-    if args.resume:
-        return copilot.resume_last()
+    if args.resume is not None:
+        return copilot.resume_last(args.resume, repo=args.repo,
+                                   playbook=args.playbook or "",
+                                   params=parse_task_params(args.task_param))
     if args.playbook:
         params = parse_task_params(args.task_param)
         return copilot.run_playbook(args.playbook, params=params,

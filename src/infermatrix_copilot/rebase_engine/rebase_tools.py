@@ -178,7 +178,7 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
                          timeout: int = 600, **_: Any) -> dict:
         cwd = workdir or paths.omni_path
         try:
-            proc = subprocess.run(["bash", "-c", command], capture_output=True,
+            proc = subprocess.run(["bash", "--norc", "-c", command], capture_output=True,
                                   text=True, errors="replace", timeout=timeout,
                                   cwd=cwd, env=dict(paths.env) or None)
             return {"exit_code": proc.returncode,

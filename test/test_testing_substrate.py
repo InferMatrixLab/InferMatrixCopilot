@@ -568,7 +568,7 @@ def test_dry_run_returns_exact_plan(runner):
     job = TestJob(key="k", command="pytest tests/x", timeout_sec=60,
                   min_gpus=2, env={"A": "1"}, index=3)
     out = runner.run(job, {}, dry_run=True)
-    assert out.plan.argv == ["bash", "-c", "set -e\npytest tests/x"]
+    assert out.plan.argv == ["bash", "--norc", "-c", "set -e\npytest tests/x"]
     assert out.plan.env_overlay == {"A": "1"}
     assert out.plan.timeout_sec == 60 and out.plan.needs_gpu_lock
     assert out.plan.log_file.endswith("03_k.log")
