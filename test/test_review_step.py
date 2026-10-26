@@ -88,6 +88,8 @@ def test_review_runtime_flow(settings, trace, tmp_path, git_repo):
     assert "MERGE STATE: DIRTY" in prompt and "OUTPUT CONTRACT" in prompt
     assert "PERMISSIONS" in prompt and "<untrusted_data>" in prompt
     assert "Breaking behavior" in prompt
+    from infermatrix_copilot.review.severity import SEVERITY_GUIDANCE
+    assert SEVERITY_GUIDANCE in prompt
     assert "Breaking behavior" not in first["system"]  # static-system invariant
     # knowledge tools offered alongside scoped read tools
     tool_names = {t["name"] for t in first["tools"]}
@@ -169,10 +171,10 @@ def test_review_blocked_without_diff(settings, trace, tmp_path):
 
 
 def test_pr_review_playbook_shape():
-    from infermatrix_copilot.config import _REPO_ROOT
+    from infermatrix_copilot.config import _resource_dir
     from infermatrix_copilot.playbooks.store import PlaybookStore
 
-    store = PlaybookStore(_REPO_ROOT / "playbooks", _registry())
+    store = PlaybookStore(_resource_dir("playbooks"), _registry())
     pb = store.get("pr-review")
     assert pb.version == 6  # v6 = declared review_depth param (adaptive depth)
     assert [s.step for s in pb.steps] == [

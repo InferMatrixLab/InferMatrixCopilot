@@ -185,6 +185,26 @@ def _runtime(world, gateway=None, **overrides) -> InitRuntime:
     return InitRuntime(**kwargs)
 
 
+def test_interrupted_advisory_judgment_blocks_resume_before_any_new_model_call(world):
+    invocations = []
+
+    class InterruptedGateway(FakeGateway):
+        def call_json(self, role, **kwargs):
+            invocations.append(role.name)
+            if kwargs["system"] == JUDGE_SYSTEM:
+                raise KeyboardInterrupt()
+            return super().call_json(role, **kwargs)
+
+    gateway = InterruptedGateway()
+    with pytest.raises(KeyboardInterrupt):
+        run_stage(_runtime(world, gateway), _lifecycle(), "skeleton", dry_run=True)
+    before = list(invocations)
+    resumed = run_stage(_runtime(world, gateway), _lifecycle(), "skeleton", dry_run=True)
+    assert resumed.status == "blocked"
+    assert any("reconcile original dispatch" in problem for problem in resumed.problems)
+    assert invocations == before
+
+
 def _lifecycle(**init) -> RepoLifecycle:
     config = InitConfig(**{"seeds": ("repos/other/rules.md", "general/tips.md"), "source_roots": ("pkg/",),
                            "budget_usd": 30.0, **init})

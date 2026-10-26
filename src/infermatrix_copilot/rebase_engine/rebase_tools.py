@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ..tools import ToolDef
+from ..process_execution import run_command
 
 Handler = Callable[..., dict]
 
@@ -156,9 +157,8 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
     nothing implements must fail at build time, not mid-run."""
     backends = backends or RebaseBackends()
 
-    def _run(cmd: list[str], timeout: int) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              errors="replace", timeout=timeout, check=False)
+    def _run(cmd: list[str], timeout: int, **kwargs) -> "subprocess.CompletedProcess[str]":
+        return run_command(cmd, errors="replace", timeout=timeout, **kwargs)
 
     def handle_grep(pattern: str, path: str = "", include: str = "*.py",
                     **_: Any) -> dict:
@@ -178,9 +178,8 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
                          timeout: int = 600, **_: Any) -> dict:
         cwd = workdir or paths.omni_path
         try:
-            proc = subprocess.run(["bash", "-c", command], capture_output=True,
-                                  text=True, errors="replace", timeout=timeout,
-                                  cwd=cwd, env=dict(paths.env) or None)
+            proc = _run(["bash", "-c", command], timeout=timeout,
+                        cwd=cwd, env=dict(paths.env) or None)
             return {"exit_code": proc.returncode,
                     "stdout": proc.stdout[-5000:],
                     "stderr": proc.stderr[-5000:]}
@@ -251,11 +250,8 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
 
     def handle_run_import_check(import_code: str, **_: Any) -> dict:
         try:
-            proc = subprocess.run(["python3", "-c", import_code],
-                                  capture_output=True, text=True,
-                                  errors="replace", timeout=120,
-                                  cwd=paths.omni_path,
-                                  env=dict(paths.env) or None)
+            proc = _run(["python3", "-c", import_code], timeout=120,
+                        cwd=paths.omni_path, env=dict(paths.env) or None)
             return {"exit_code": proc.returncode,
                     "stdout": proc.stdout[-5000:],
                     "stderr": proc.stderr[-5000:]}

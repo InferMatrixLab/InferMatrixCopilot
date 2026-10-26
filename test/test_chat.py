@@ -168,13 +168,13 @@ def test_repo_grep_is_literal_and_skips_vcs(copilot, git_repo):
 def test_repo_grep_error_is_not_no_matches(copilot, monkeypatch):
     """Pin the exit-code branch specifically. Accepting "refused OR grep failed"
     would let the read jail satisfy the assertion without the branch ever running."""
-    import subprocess
+    from infermatrix_copilot import tools
 
     class Failed:
         returncode, stdout = 2, ""
         stderr = "grep: permission denied"
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Failed())
+    monkeypatch.setattr(tools, "run_command", lambda *a, **k: Failed())
     session, _ = _session(copilot, [])
     out = session._dispatch_tool("repo_grep", {"pattern": "x"})
     assert "grep failed (exit 2)" in out

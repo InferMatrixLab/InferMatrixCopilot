@@ -311,11 +311,8 @@ def test_adapter_zero_declares_risk_tiers():
 # list can only shrink. A new repo-specific literal anywhere else fails.
 _KNOWN_LEAKS = {
     "__init__.py": 1,            # package docstring
-    "config.py": 2,              # default_repo + rebase_agent_root sibling name
-    "engine/steps/rebase_ext.py": 1,     # orchestrator-not-found hint (delegation)
-    "engine/steps/rebase_native.py": 6,  # parent-package delegation (by design)
+    "config.py": 1,              # default_repo
     "intent.py": 2,              # parse_* default_repo parameter defaults
-    "rebase/monitor.py": 1,      # locked-pipeline delegation (by design)
     "task_spec.py": 1,           # TaskSpec.repo default
     "thin_mcp_server.py": 4,
 }

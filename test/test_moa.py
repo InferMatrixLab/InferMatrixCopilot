@@ -1,5 +1,5 @@
 """MoA (design W6): member resolution, eligibility, the atomic budget ledger,
-budgeted-client fallbacks, ensemble member assignment, issue propose-aggregate
+dispatch budget bindings, ensemble member assignment, issue propose-aggregate
 fallbacks, and the no-secret-in-traces guarantee."""
 
 import json
@@ -8,7 +8,6 @@ import time
 import pytest
 
 from infermatrix_copilot.engine.agent_runtime.moa import (
-    BudgetedLLM,
     Member,
     MoaBudget,
     MoaBudgetExceeded,
@@ -85,11 +84,16 @@ def test_reservations_are_atomic_and_capped():
     assert b.reserve(0.6) is not None                  # freed headroom returns
 
 
-def test_settled_never_exceeds_reserved():
+def test_overrun_records_full_charge_and_stops_new_members():
     b = _budget(max_usd=1.0)
     rid = b.reserve(0.2)
-    b.settle(rid, 5.0)   # a lying provider cannot blow the cap
-    assert b.spent() == pytest.approx(0.2)
+    b.settle(rid, 5.0)
+    assert b.spent() == pytest.approx(5.0)
+    assert b.tripped and b.reserve(0.0) is None
+    b.settle(rid, 5.0)
+    assert b.spent() == pytest.approx(5.0)
+    with pytest.raises(MoaBudgetExceeded, match="different settlement"):
+        b.settle(rid, 0.2)
 
 
 def test_expired_deadline_refuses_reservation():
@@ -97,52 +101,52 @@ def test_expired_deadline_refuses_reservation():
     assert b.reserve(0.01) is None
 
 
-# ---- BudgetedLLM -----------------------------------------------------------
+# ---- bindings observe real dispatch facts ----------------------------------
 
-class FakeClient:
-    def __init__(self, settings, text='{"status": "success"}'):
-        self.settings = settings
-        self.available = True
-        self.calls = []
-
-    def create(self, **kw):
-        self.calls.append(kw)
-
-        class R:
-            text = '{"status": "success"}'
-            usage = {"input_tokens": 100, "output_tokens": 10}
-            blocks = []
-        return R()
-
-
-def test_budgeted_llm_strict_raises_when_capped(settings):
-    m = Member(model="deepseek-chat")
-    b = _budget(max_usd=0.0)          # nothing can reserve
-    wrapped = BudgetedLLM(m, FakeClient(settings), b)
-    with pytest.raises(MoaBudgetExceeded):
-        wrapped.create(system="s", messages=[{"role": "user", "content": "x"}])
+@pytest.mark.parametrize("usage", [None, {}, {"input_tokens": 1},
+                                  {"input_tokens": True, "output_tokens": 0}])
+@pytest.mark.parametrize("failure", [False, True])
+def test_unknown_paid_call_keeps_full_reservation(usage, failure):
+    from infermatrix_copilot.budgeting import call_budget
+    b = _budget()
+    with b.bind(Member("deepseek-chat")):
+        try:
+            with call_budget({"kind": "api", "model": "deepseek-chat", "system": "s",
+                              "messages": [], "max_tokens": 100}) as facts:
+                reserved = sum(b._reserved.values())
+                facts.update(sent=True, usage=usage)
+                if failure:
+                    raise OSError("provider disconnected after dispatch")
+        except OSError:
+            pass
+    assert b.spent() == pytest.approx(reserved) and not b._reserved
 
 
-def test_budgeted_llm_fallback_reroutes_to_tier(settings):
-    m = Member(model="deepseek-chat")
-    b = _budget(max_usd=0.0)
-    tier = FakeClient(settings)
-    wrapped = BudgetedLLM(m, FakeClient(settings), b,
-                          fallback=(tier, "tier-model"))
-    wrapped.create(system="s", messages=[{"role": "user", "content": "x"}])
-    assert tier.calls and tier.calls[0]["model"] == "tier-model"
+def test_binding_reserves_before_dispatch_and_settles_known_usage():
+    from infermatrix_copilot.budgeting import call_budget
+    member, b = Member("deepseek-chat"), _budget()
+    request = {"kind": "api", "model": member.model, "system": "s",
+               "messages": [], "max_tokens": 100}
+    with b.bind(member), b.bind(member):
+        with call_budget(request) as facts:
+            assert len(b._reserved) == 1
+            facts.update(sent=True, usage={"input_tokens": 1, "output_tokens": 0})
+    assert 0 < b.spent() < .001
+    assert len(b._receipts) == 1 and not b._reserved
+    with _budget(max_usd=0).bind(member), pytest.raises(MoaBudgetExceeded):
+        with call_budget(request):
+            pytest.fail("refused request dispatched")
 
 
-def test_budgeted_llm_settles_actual_usage(settings):
-    m = Member(model="deepseek-chat")
-    b = _budget(max_usd=1.0)
-    member_client = FakeClient(settings)
-    wrapped = BudgetedLLM(m, member_client, b)
-    wrapped.create(system="s", messages=[{"role": "user", "content": "x"}],
-                   max_tokens=50)
-    assert member_client.calls[0]["model"] == "deepseek-chat"
-    assert member_client.calls[0]["role"] == "moa_member"
-    assert 0 < b.spent() < 0.001      # 110 deepseek tokens ≈ micro-dollars
+def test_undispatched_call_releases_but_unknown_ticket_cannot_settle():
+    from infermatrix_copilot.budgeting import call_budget
+    b = _budget()
+    with b.bind(Member("deepseek-chat")):
+        with call_budget({"kind": "api", "model": "deepseek-chat", "max_tokens": 100}):
+            pass
+    assert b.spent() == 0 and not b._reserved
+    with pytest.raises(MoaBudgetExceeded, match="unknown"):
+        b.settle(999, 0)
 
 
 # ---- no secrets in traces ---------------------------------------------------

@@ -7,13 +7,11 @@ D4/D5, round-4 F4). `ensure_schema_v2()` is invoked from exactly the three
 sanctioned writable maintenance entry points: the knowledge-migration CLI,
 `rebase.v3_knowledge_prep`, and `rebase.v3_curate` — pinned by test.
 
-`rebase.v3_compare` realizes Rev 8's `compare_with_locked` slot for the v3
-pipeline natively (substate-driven; the v1 backend keeps its own untouched
-step) and computes the CLOSING knowledge attestation: parent read-compat
-layers must digest identically to the prelude's opening block — v3 never
-writes them, so drift means outside interference and stamps the §8
-comparison gate-ineligible (copilot-store changes are expected outputs and
-are excluded by construction).
+`rebase.v3_compare` computes the closing knowledge attestation from substate.
+Explicitly configured legacy import layers must digest identically to the
+prelude's opening block: Copilot never writes them, so drift makes the
+comparison gate-ineligible. Copilot-store changes are expected outputs and
+are excluded by construction. The shipped adapter requires no external layers.
 """
 
 from __future__ import annotations

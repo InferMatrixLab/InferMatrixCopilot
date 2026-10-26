@@ -72,14 +72,15 @@ def refine(rt, lifecycle, changeset: dict) -> str | None:
     None (sent to people). Needs the scheduler's lease."""
     from ..knowledge_service.lifecycle import LifecycleError
     from ..trace_store import accepted_key, trace_context
-    from .intake import MAX_OPS_PER_EVENT, draft_changes
+    from .intake import MAX_OPS_PER_EVENT, checkpoint_draft
     from .merge import _outcome, _request_close
     from .models import ModelUnavailable
-    from .runtime import gate_and_stage, publish
+    from .runtime import gate_and_stage, publish, require_settled_reviews
 
     owner = getattr(rt, "lease_owner", None)
     if not owner:
         return None
+    require_settled_reviews(rt, lifecycle.repo, kinds=('refine',), binding={'refine_of': changeset['id']})
     detail = changeset["detail"]
     reasons = reasons_of(changeset) or ["the quality gate rejected the change"]
     round_ = int(detail.get("refine_round") or 0) + 1
@@ -119,7 +120,10 @@ def refine(rt, lifecycle, changeset: dict) -> str | None:
                 # the whole change set is refined at once: as many operations as
                 # the events it combines may carry
                 limit = max(MAX_OPS_PER_EVENT * max(1, len(evidence)), len(detail.get("operations") or []))
-                draft = draft_changes(repo=lifecycle.repo, repo_dir=lifecycle.knowledge_dir, event_id=0,
+                draft, draft_trace = checkpoint_draft(rt.ledger, owner, unit_key='refine:' + changeset['id'],
+                                      base_sha=base_sha,
+                                      accepted_trace=lambda: accepted_key(key, holder),
+                                      repo=lifecycle.repo, repo_dir=lifecycle.knowledge_dir, event_id=0,
                                       evidence=prompt_evidence, files=base, gateway=rt.gateway,
                                       generator=rt.generator, release=release, today=today,
                                       max_operations=limit)
@@ -135,8 +139,8 @@ def refine(rt, lifecycle, changeset: dict) -> str | None:
         new_id = gate_and_stage(rt, lifecycle, owner, kind="refine", base=base, base_sha=base_sha,
                                 external=external, operations=draft.operations, result=draft.result,
                                 evidence=[*evidence, mark], event_ids=[], release=release,
-                                draft_keys=[accepted_key(key, holder)] if accepted_key(key, holder) else [],
-                                extra_detail={"refine_round": round_, "refine_history": history,
+                                draft_keys=[draft_trace] if draft_trace else [],
+                                extra_detail={"refine_of": changeset['id'], "refine_round": round_, "refine_history": history,
                                               "generator": draft.generator})
     open_pr = changeset.get("pr_number") is not None
     rt.ledger.update_changeset(changeset["id"], status="superseding" if open_pr else "refined",

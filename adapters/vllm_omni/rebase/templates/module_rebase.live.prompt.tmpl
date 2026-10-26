@@ -124,18 +124,17 @@ Typical fixes vs `{VLLM_PATH}`: `StageEngineCoreClient.shutdown` kwargs; `launch
 {DEBUG_MEMORY}
 
 ### Debug-memory workflow (mandatory)
-Cross-run lessons at `{DEBUG_MEMORY_FILE}` (pre-filtered for module=`{MODULE_NAME}`). When a verification step fails or a non-trivial decision is made:
+Use the registered debug-memory tools for module `{MODULE_NAME}`. When a verification step fails or a non-trivial decision is made:
 
-1. **Read** the block above first; apply any matching past fix. Extend search:
-   python3 '{DEBUG_MEMORY_CLI}' search --module={MODULE_NAME} --limit=5 "<keyword>"
-2. **Record** BEFORE writing `{SIGNAL_DIR}/module.{MODULE_KEY}.done` or `.fail`:
-   python3 '{DEBUG_MEMORY_CLI}' record \
-     --module={MODULE_NAME} \
-     --key="<short error signature — same style as existing keys>" \
-     --tags=<csv> --files=<csv> --run={RUN_ID} \
-     --body-file=/tmp/debug_memory_entry.md
-   Body: `### Symptom` / `### Root cause` / `### Fix` / `### Watch-outs`.
-   For `.fail`, add `tags: dead-end` with what you tried and why.
+1. Call `search_debug_memory` with a failure signature; apply any matching past fix:
+   ```json
+   {"module": "{MODULE_NAME}", "keyword": "<failure signature>", "max_results": 5}
+   ```
+2. Before writing `{SIGNAL_DIR}/module.{MODULE_KEY}.done` or `.fail`, call `record_debug_memory`:
+   ```json
+   {"module": "{MODULE_NAME}", "key": "<short error signature>", "symptom": "<failure>", "fix": "<applied fix or unresolved outcome>", "root_cause": "<cause>", "watch_outs": "<limits>", "tags": "<comma-separated tags>", "files": "<comma-separated changed paths>"}
+   ```
+   Record unresolved outcomes with `dead-end` tags, what was tried and why.
 
 {BROKEN_IMPORTS_SECTION}
 {MODULE_TEST_PLAN}
@@ -265,11 +264,11 @@ Infra (`rc=124`, GPU lock, OOM kill storms): one controlled retry with snapshot;
 
 Merge conflicts in your files: report paths, markers cleared, strategy—do not blame pytest until verification fails.
 
-## Killing hung tests
-Never `pgrep -f | kill` alone (broad pattern). Use:
-  bash {KILL_TEST_SCRIPT} "pytest.*<test_pattern>"
-or:
-  bash {KILL_TEST_SCRIPT} --pid <pid>
+## Hung tests
+Run tests through the registered `run_pytest` tool with `test_paths` and an explicit `timeout`:
+```json
+{"test_paths": "<test paths>", "timeout": 1200}
+``` The supervised runner owns deadlines, watchdog decisions and process-tree cleanup. Read the returned log and timeout result before deciding whether the one permitted infrastructure retry applies. Keep foreign processes outside the run's cleanup scope.
 
 ## Completion contract
 On success, write exactly:

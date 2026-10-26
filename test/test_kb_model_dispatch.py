@@ -142,7 +142,8 @@ def test_native_gateway_fallbacks_and_judges_use_same_slots_and_keep_recording(t
                 try:
                     time.sleep(.03)
                     if provider == "unavailable":
-                        raise RuntimeError("scripted primary unavailable")
+                        return SimpleNamespace(model=kwargs["model"], stop_reason="end_turn", usage={},
+                                               blocks=[SimpleNamespace(text="completed unusable response")])
                     return SimpleNamespace(model=kwargs["model"], stop_reason="end_turn", usage={},
                                            blocks=[SimpleNamespace(text='{"supported":true}')])
                 finally:

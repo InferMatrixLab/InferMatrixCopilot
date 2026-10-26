@@ -29,6 +29,8 @@ item's branch and opens the PR.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import fcntl
 import json
 import os
@@ -114,9 +116,7 @@ class LocalTransport:
     def write_ack(self, item_id: str, data: bytes) -> None:
         folder = self.root / "inbox" / "acks"
         folder.mkdir(parents=True, exist_ok=True)
-        tmp = folder / f".{item_id}.tmp"
-        tmp.write_bytes(data)
-        tmp.replace(folder / f"{item_id}.json")
+        atomic_write_bytes(folder / f"{item_id}.json", data)
 
     def write_containment(self, identity: str, data: bytes) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", identity):
@@ -349,16 +349,7 @@ class Publisher:
         """Atomically: a crash leaves either no record or a complete one."""
         path = self._done_path(item_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=f".{item_id}.", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(ack, ensure_ascii=False, sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        atomic_write_bytes(path, json.dumps(ack, ensure_ascii=False, sort_keys=True).encode("utf-8"), mode=0o600)
 
     def _intent_path(self, item_id: str) -> Path:
         return self.state_dir / "intents" / f"{item_id}.json"
@@ -760,9 +751,7 @@ class Publisher:
             self.github.gh("pr", "comment", str(number), "--repo", self.github.repository, "--body-file", "-",
                            input=comment)
         posted.parent.mkdir(parents=True, exist_ok=True)
-        tmp = posted.with_name(f".{posted.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"revision": revision, "item": item.id}), encoding="utf-8")
-        os.replace(tmp, posted)  # atomic: a crash leaves the old record or the new one
+        atomic_write_bytes(posted, json.dumps({"revision": revision, "item": item.id}).encode("utf-8"))
         return {"pr": number}
 
     def _do_close(self, item: OutboxItem) -> dict:

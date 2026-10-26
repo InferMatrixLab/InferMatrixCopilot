@@ -35,13 +35,13 @@ def register_step(spec: StepSpec) -> StepSpec:
     return spec
 
 
-def step(name: str, kind: str, risk: str, description: str = ""):
+def step(name: str, kind: str, risk: str, description: str = "", *, checkpoint: bool = True):
     """Decorator: bind a handler to its name + metadata in one place."""
 
     def deco(fn):
         """Register `fn` as the handler under the captured name/metadata, then
         return it unchanged so the decorated name still binds to the function."""
-        register_step(StepSpec(name, kind, risk, fn, description))
+        register_step(StepSpec(name, kind, risk, fn, description, checkpoint))
         return fn
 
     return deco

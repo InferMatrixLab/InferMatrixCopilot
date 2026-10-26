@@ -54,6 +54,29 @@ def registry():
     return register_builtin_steps(StepRegistry())
 
 
+def test_strict_frozen_discussion_and_ci_are_used_without_live_metadata_fetch(
+    registry, settings, trace, tmp_path, pr_repos, monkeypatch,
+):
+    from infermatrix_copilot.engine.steps.pr import fetch
+
+    _, work = pr_repos
+    head = _git(work, "rev-parse", "HEAD")
+    context = {"pull": {"number": 7, "head_sha": head, "title": "Frozen title", "state": "open"},
+        "pr_review_context": [{"body": "Frozen discussion concern", "thread_ref": "comment:1"}],
+        "ci_evidence": {"head_sha": head, "read_status": "partial", "checked_at": "dispatch-time"}}
+    state = {"repo_path": str(work), "task_spec": {"pr": 7, "expected_head_sha": head,
+        "params": {"business_context": context}}}
+    monkeypatch.setattr(fetch, "_fetch_at_one_head", lambda *_args: (
+        "diff --git a/core.py b/core.py\n", "", head, str(work), "frozen source"))
+    monkeypatch.setattr(fetch, "_gh", lambda *_args, **_kwargs: pytest.fail("live metadata replaced frozen input"))
+    ctx = _ctx(settings, trace, tmp_path, state)
+    assert asyncio.run(registry.get("pr.fetch_diff").handler(ctx)).ok
+    assert asyncio.run(registry.get("pr.gate_check").handler(ctx)).ok
+    assert "Frozen discussion concern" in state["pr_context"]
+    assert "dispatch-time" in state["gate_report"] and '"partial"' in state["gate_report"]
+    assert state["pr_state"] == "OPEN"
+
+
 def test_checkout_sets_branch_and_push_policy(registry, settings, trace, tmp_path, pr_repos):
     _, work = pr_repos
     state = {"repo_path": str(work), "task_spec": {"pr": 7},
@@ -476,7 +499,7 @@ def test_review_payload_validates_diff_lines_and_preserves_fallbacks():
     assert "missing.py:1" in payload["body"]
 
 
-def test_review_payload_downgrades_all_comments_when_head_changed():
+def test_review_payload_refuses_changed_head():
     from infermatrix_copilot.engine.steps.pr.publish import _review_payload
 
     state = {
@@ -486,12 +509,32 @@ def test_review_payload_downgrades_all_comments_when_head_changed():
         "pr_state": "OPEN",
         "pr_head_sha": "a" * 40,
     }
-    payload, downgraded = _review_payload(state, current_head="b" * 40)
+    with pytest.raises(ValueError, match="PR head changed after review"):
+        _review_payload(state, current_head="b" * 40)
 
-    assert payload["comments"] == []
-    assert payload["commit_id"] == "b" * 40
-    assert downgraded == 1
-    assert "PR head changed after review" in payload["body"]
+
+@pytest.mark.parametrize("reviewed_head", ["", "a" * 40])
+@pytest.mark.parametrize("findings", [[], [_finding("a.py", 10)]])
+def test_post_review_refuses_unbound_or_changed_head_without_any_write(
+        registry, settings, trace, tmp_path, monkeypatch, reviewed_head, findings):
+    from infermatrix_copilot.engine.steps.pr import publish
+
+    settings.allow_post = True
+    state = {"repo_path": str(tmp_path), "task_spec": {"pr": 7, "post": True},
+             "diff_text": _REVIEW_DIFF, "review_comments": findings,
+             "review_text": "Review complete.", "pr_head_sha": reviewed_head}
+    monkeypatch.setattr(publish, "_repo_full_name", lambda ctx, repo: "owner/repo")
+
+    def read_only_gh(args, cwd=None):
+        assert args[:2] == ["pr", "view"], "stale reviews must not write GitHub"
+        return 0, json.dumps({"headRefOid": "b" * 40})
+
+    monkeypatch.setattr(publish, "_gh", read_only_gh)
+    ctx = _ctx(settings, trace, tmp_path, state)
+    result = asyncio.run(registry.get("pr.post_review").handler(ctx))
+    assert not result.ok and result.failure is FailureKind.BLOCKED
+    assert result.outputs["stale"] is True
+    assert not (ctx.run_dir / "github_review_payload.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -599,6 +642,7 @@ def test_post_review_api_failure_escalates_with_payload(
         "review_summary": "summary\n\n**Verdict:** REQUEST CHANGES",
         "review_text": "full\n\n**Verdict:** REQUEST CHANGES",
         "pr_state": "OPEN",
+        "pr_head_sha": "c" * 40,
     }
     monkeypatch.setattr(
         publish, "_repo_full_name", lambda ctx, repo: "owner/repo")

@@ -70,7 +70,6 @@ async def _maybe_moa_draft(ctx, *, step_name: str, purpose: str, guidance: str,
 
     from ..agent_runtime import run_agent_step
     from ..agent_runtime.moa import (
-        BudgetedLLM,
         Member,
         MoaBudget,
         MoaBudgetExceeded,
@@ -93,15 +92,16 @@ async def _maybe_moa_draft(ctx, *, step_name: str, purpose: str, guidance: str,
 
     async def _propose(m):
         try:
-            return await run_agent_step(
-                ctx, step_name=f"{step_name}#moa/{m.model}", purpose=purpose,
-                guidance=guidance, evidence={"issue_text": material},
-                output_extension=extension,
-                extra_tools=_gh_read_tools(_repo_path(ctx)),
-                max_iters=ctx.settings.max_agent_iters,
-                llm_override=BudgetedLLM(m, ctx.llm.for_member(m), budget,
-                                         role="moa_member"),
-                model_override=m.model)
+            route = ({"harness_member": m} if m.provider else
+                     {"llm_override": ctx.llm.for_member(m)})
+            with budget.bind(m):
+                return await run_agent_step(
+                    ctx, step_name=f"{step_name}#moa/{m.model}", purpose=purpose,
+                    guidance=guidance, evidence={"issue_text": material},
+                    output_extension=extension,
+                    extra_tools=_gh_read_tools(_repo_path(ctx)),
+                    max_iters=ctx.settings.max_agent_iters,
+                    model_override=m.model, **route)
         except (MoaBudgetExceeded, Exception) as exc:
             ctx.trace.record("moa_member_dropped", member=m.label(),
                              error=f"{type(exc).__name__}: {exc}"[:200])
@@ -114,10 +114,7 @@ async def _maybe_moa_draft(ctx, *, step_name: str, purpose: str, guidance: str,
         return None  # exactly ONE legacy tier draft (the pre-MoA baseline)
     _tt = ctx.settings.tier_target(spec.get("mode", "eco"))
     tier_model = _tt.model
-    agg = BudgetedLLM(Member(model=tier_model),
-                      (ctx.llm.for_target(_tt)
-                       if hasattr(ctx.llm, "for_target") else ctx.llm),
-                      budget, role="moa_aggregator")
+    agg = ctx.llm.for_target(_tt) if hasattr(ctx.llm, "for_target") else ctx.llm
     contract_desc = _json.dumps({k: v for k, v in extension.items()},
                                 ensure_ascii=False)
     prompt = ("Synthesize ONE best answer from these independent proposals "
@@ -134,10 +131,12 @@ async def _maybe_moa_draft(ctx, *, step_name: str, purpose: str, guidance: str,
     try:
         from ...llm import parse_json_reply
 
-        reply = agg.create(system="You are the synthesis aggregator for a "
-                                  "mixture of independent issue-answer drafts.",
-                           messages=[{"role": "user", "content": prompt}],
-                           max_tokens=ctx.settings.llm_max_tokens)
+        with budget.bind(Member(model=tier_model)):
+            reply = agg.create(system="You are the synthesis aggregator for a "
+                                      "mixture of independent issue-answer drafts.",
+                               messages=[{"role": "user", "content": prompt}],
+                               model=tier_model, role="moa_aggregator",
+                               max_tokens=ctx.settings.llm_max_tokens)
         merged = parse_json_reply(reply.text or "")
     except (MoaBudgetExceeded, Exception):
         merged = None

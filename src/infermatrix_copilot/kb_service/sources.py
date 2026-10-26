@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..git_objects import checked_read, raw_changes, tree_entries, tree_texts
+
 KNOWLEDGE_SUFFIXES = (".md", ".yaml")
 EXTERNAL_REF_DIRS = ("skills/", "plugins/", "adapters/", "doc/", "playbooks/")
 MAX_BODY_CHARS = 3000
@@ -49,34 +51,7 @@ class KnowledgeRepo:
         return self._git("rev-parse", f"{self.remote}/{self.branch}").decode().strip()
 
     def _texts(self, rev: str, prefixes: tuple[str, ...], suffixes: tuple[str, ...] | None) -> dict[str, str]:
-        listing = self._git("ls-tree", "-r", "-z", "--full-tree", rev).split(b"\0")
-        wanted: list[tuple[str, str]] = []
-        for entry in listing:
-            if not entry:
-                continue
-            meta, _, path = entry.partition(b"\t")
-            mode, kind, oid = meta.decode().split()
-            name = path.decode("utf-8", "replace")
-            if kind != "blob" or mode != "100644":
-                continue
-            if not name.startswith(prefixes) or (suffixes and not name.endswith(suffixes)):
-                continue
-            wanted.append((name, oid))
-        if not wanted:
-            return {}
-        out = self._git("cat-file", "--batch", input="".join(f"{oid}\n" for _, oid in wanted).encode())
-        texts: dict[str, str] = {}
-        cursor = 0
-        for name, _oid in wanted:
-            header_end = out.index(b"\n", cursor)
-            size = int(out[cursor:header_end].split()[2])
-            body = out[header_end + 1: header_end + 1 + size]
-            cursor = header_end + 1 + size + 1
-            try:
-                texts[name] = body.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-        return texts
+        return checked_read(SourceError, tree_texts, self._git, rev, prefixes, suffixes or None)
 
     def fetch_pull(self, number: int) -> str:
         """Fetch a pull request's head as data (never checked out); its SHA."""
@@ -124,17 +99,8 @@ class KnowledgeRepo:
     def raw_manifest(self, old: str, new: str) -> list[dict]:
         """Every changed path as a verdict manifest entry (renames are D + A),
         the exact form the verifier recomputes."""
-        out = self._git("diff", "--raw", "-z", "--no-renames", "--no-abbrev", old, new).split(b"\0")
-        entries, zero = [], "0" * 40
-        for index in range(0, len(out) - 1, 2):
-            old_mode, new_mode, old_blob, new_blob, status = out[index].decode()[1:].split()
-            entries.append({
-                "path": out[index + 1].decode("utf-8", "replace"), "status": status[0],
-                "old_blob": "" if old_blob == zero else old_blob, "new_blob": "" if new_blob == zero else new_blob,
-                "old_mode": "" if old_mode == "000000" else old_mode,
-                "new_mode": "" if new_mode == "000000" else new_mode,
-            })
-        return entries
+        return checked_read(SourceError, lambda: raw_changes(
+            self._git("diff", "--raw", "-z", "--no-renames", "--no-abbrev", old, new)))
 
     def first_parent_commits(self, old: str, new: str) -> list[tuple[str, list[str], float, str]]:
         """(sha, parents, commit time, message) on new's first-parent chain
@@ -156,12 +122,8 @@ class KnowledgeRepo:
         the mode is part of the identity (an executable bit is a change)."""
         if not paths:
             return {}
-        out = self._git("ls-tree", "-z", "--full-tree", rev, "--", *paths).split(b"\0")
-        found = {}
-        for entry in out:
-            if entry:
-                meta, _, name = entry.partition(b"\t")
-                found[name.decode("utf-8", "replace")] = meta.decode()
+        found = {name.decode("utf-8", "replace"): f"{mode} {kind} {oid}"
+                 for mode, kind, oid, name in tree_entries(self._git("ls-tree", "-z", "--full-tree", rev, "--", *paths))}
         return {path: found.get(path, "") for path in paths}
 
     def changed_names(self, old: str, new: str) -> list[str]:
@@ -291,22 +253,14 @@ class GitHubReader:
     def pull_request(self, full_name: str, number: int) -> PullRequest:
         pr = self.get(f"/repos/{full_name}/pulls/{number}")
         files = self.get(f"/repos/{full_name}/pulls/{number}/files", per_page=100)
-        paths, excerpt, used = [], [], 0
-        for item in files:
-            paths.append(str(item.get("filename", "")))
-            patch = str(item.get("patch") or "")
-            if patch and used < MAX_DIFF_BYTES:
-                chunk = f"--- {item.get('filename')}\n{patch}\n"
-                room = MAX_DIFF_BYTES - used
-                chunk = chunk.encode("utf-8")[:room].decode("utf-8", "ignore")
-                excerpt.append(chunk)
-                used += len(chunk.encode("utf-8"))
+        paths = knowledge_changed_paths((item.get("filename", "") for item in files), limit=None)
+        excerpt = knowledge_diff_excerpt(files, max_bytes=MAX_DIFF_BYTES)
         return PullRequest(
             number=int(pr["number"]), title=str(pr.get("title") or ""),
             body=str(pr.get("body") or ""), merged_at=str(pr.get("merged_at") or ""),
             merge_commit_sha=str(pr.get("merge_commit_sha") or ""),
             author=str((pr.get("user") or {}).get("login") or ""),
-            changed_files=tuple(paths), diff_excerpt="".join(excerpt),
+            changed_files=tuple(paths), diff_excerpt=excerpt,
             base_ref=str((pr.get("base") or {}).get("ref") or ""),
             head_ref=str((pr.get("head") or {}).get("ref") or ""),
             head_sha=str((pr.get("head") or {}).get("sha") or ""),
@@ -421,16 +375,19 @@ def _glob_to_regex(pattern: str) -> str:
     return "".join(".*" if ch == "*" else re.escape(ch) for ch in pattern)
 
 
-BUGFIX_MARKERS = ("<!-- infermatrix-copilot:bugfix-record:v2 -->",
-                  "<!-- infermatrix-copilot:bugfix-record:v1 -->")
+from ..knowledge_service.evidence import (
+    BUGFIX_MARKERS, bugfix_record_identity, parse_bugfix_record,
+    knowledge_changed_paths, knowledge_diff_excerpt,
+)
 
 
 def bugfix_lesson(record) -> dict | None:
     """A verified pr_debug fix record (drop file or mailbox comment, v1/v2) as a
     lesson; None when malformed. ``repo_key`` is its repository identity."""
-    if not isinstance(record, dict):
+    identity = bugfix_record_identity(record)
+    if identity is None:
         return None
-    repo, run = str(record.get("repo") or ""), str(record.get("run_id") or "")
+    repo, run, event_id = identity
     groups = record.get("groups")
     if not repo or not run or not isinstance(groups, list) or not groups:
         return None
@@ -443,7 +400,6 @@ def bugfix_lesson(record) -> dict | None:
                   f"  fix: {str(group.get('fix_summary', ''))[:2000]}",
                   f"  verified by: {str(group.get('verification', ''))[:1000]}",
                   "  files: " + ", ".join(str(f)[:300] for f in (group.get("files") or [])[:20])]
-    event_id = str(record.get("event_id") or f"bugfix_run:{repo.casefold()}:{run}")[:200]
     return {"repo_key": repo, "event_id": event_id, "run_ref": run,
             "summary": "\n".join(lines)[:MAX_BODY_CHARS], "diff_excerpt": ""}
 
@@ -489,16 +445,12 @@ def mailbox_records(comments, authors: set[str]) -> list[tuple[int, dict]]:
     for comment in comments:
         login = str((comment.get("user") or {}).get("login") or "").lower()
         body = str(comment.get("body") or "")
-        marker = next((m for m in BUGFIX_MARKERS if m in body), None)
-        if marker is None or login not in authors:
+        if login not in authors:
             continue
-        rest = body.split(marker, 1)[1]
-        start = rest.find("```json")
-        if start < 0:
+        record = parse_bugfix_record(body)
+        if record is None:
             continue
-        rest = rest[start + len("```json"):].lstrip()
-        try:  # decode the object itself: a fence inside a string is not the end
-            record, _ = json.JSONDecoder().raw_decode(rest)
+        try:
             out.append((int(comment["id"]), record))
         except (KeyError, TypeError, ValueError):
             continue

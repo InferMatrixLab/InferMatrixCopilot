@@ -27,12 +27,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..agent_loop import AgentOutcome
-from ..llm import Block, Reply
+from ..llm import Reply
 from .base import (
     AgentSessionRequest,
     HarnessTransport,
     SessionUsage,
+    SessionEvent,
+    bridge_server,
     flatten_messages,
+    json_events,
+    run_cli,
     sanitized_env,
 )
 from .registry import PROVIDERS
@@ -110,84 +114,139 @@ def _no_guard():
 class CursorTransport(HarnessTransport):
     """cursor-agent CLI as a Strict backend."""
 
+    def readonly_usage(self, events: list[dict]) -> dict | None:
+        return dict(self._usage(events).reported_usage) or None
+
     spec = PROVIDERS["cursor"]
+    supports_native_events = True
+    supports_session_resume = True
+
+    @staticmethod
+    def readonly_json_command(command, *, model, output_format="stream-json", session_id=None, **_):
+        return [*command, "-p", *(["--resume", session_id] if session_id else []),
+                "--mode=ask", "--output-format", output_format,
+                "--model", model, "--trust"]
+
+    @staticmethod
+    def decode_event(event: dict) -> SessionEvent:
+        kind = event.get('type', 'result')
+        nested = event.get("session")
+        session = next((str(value).strip() for value in (
+            event.get("session_id"), event.get("sessionId"), event.get("conversation_id"),
+            event.get("conversationId"), nested.get("id") if isinstance(nested, dict) else None)
+            if str(value or "").strip()), None)
+        error = ((event.get("message") or event.get("error") or "transport reports failure")
+                 if kind in {"error", "turn.failed"} else None)
+        if event.get("is_error") or (kind == "result" and event.get("subtype") not in (None, "success")):
+            error = error or "transport result reports failure"
+        if kind == 'result' and (event.get('is_error') is not None and type(event['is_error']) is not bool
+                                or not isinstance(event.get('result'), str)):
+            error = error or 'transport result is malformed'
+        return SessionEvent(
+            text=event['result'].strip() if kind == 'result' and isinstance(event.get('result'), str) else None,
+            session_id=session, served_model=event['model'].strip() if isinstance(event.get('model'), str) and event['model'].strip() else None,
+            usage=event.get("usage") if isinstance(event.get("usage"), dict) else None,
+            error=str(error.get("message") or "transport reports failure") if isinstance(error, dict) else str(error) if error else None)
+
+    @staticmethod
+    def readonly_events(stdout: str, *, validate: bool = True) -> list[dict]:
+        envelope = json.loads(stdout)
+        if not isinstance(envelope, dict):
+            raise ValueError("transport envelope is not an object")
+        if validate:
+            error = CursorTransport.decode_event(envelope).error
+            if error:
+                raise ValueError(error)
+            if envelope.get('type', 'result') != 'result':
+                raise ValueError("transport envelope reports failure or malformed result")
+        return [envelope]
 
     def auth_gap(self) -> str | None:
         cli = self.cli_path()
         if not cli:
             return None  # the CLI-missing gap is reported separately
         try:
-            out = subprocess.run([cli, "status"], capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 timeout=15, check=False)
+            out = self.auth_probe([cli])
         except (OSError, subprocess.SubprocessError):
             return None
-        if "Logged in" not in f"{out.stdout}\n{out.stderr}":
+        return self.auth_status_issue(out.returncode, f"{out.stdout}\n{out.stderr}")
+
+    @staticmethod
+    def auth_status_issue(returncode: int, text: str) -> str | None:
+        if returncode or "Logged in" not in text or "Not logged in" in text:
             return "cursor-agent is not logged in — run: cursor-agent login"
         return None
 
     # -- process plumbing ----------------------------------------------------
     def _run(self, text: str, *, cwd: str, timeout_s: float,
-             model: str = "") -> tuple[list[dict], bool]:
+             model: str = "", tool_less: bool = False, native_event_sink=None) -> tuple[list[dict], bool]:
         """One CLI invocation → (parsed events, timed_out). A timeout kills
         the process but keeps the partial stream — a half-done investigation
         is salvage material, not garbage."""
         # --approve-mcps is load-bearing: headless runs do not auto-approve
         # configured MCP servers, and without it the tool bridge is silently
         # ignored (found in the live smoke — session ran on native tools only)
-        cmd = [self.require_cli(), "--print", "--force", "--approve-mcps",
-               "--output-format", "stream-json"]
+        cmd = [self.require_cli(), "--print", "--output-format", "stream-json"]
+        cmd += ["--mode", "ask", "--trust", "--workspace", cwd] if tool_less else ["--force", "--approve-mcps"]
         selected = model or self.settings.strict_backend_model
         if selected:
             cmd += ["--model", selected]
-        timed_out = False
-        try:
-            proc = subprocess.run(
-                cmd, input=text, cwd=cwd, env=sanitized_env(),
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=timeout_s, check=False)
-            stdout = proc.stdout or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            raw = exc.stdout or b""
-            stdout = raw.decode("utf-8", "replace") if isinstance(raw, bytes) \
-                else str(raw)
-        events: list[dict] = []
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        stdout, _, returncode, timed_out = run_cli(cmd, input=text, cwd=cwd,
+                                          env=sanitized_env(), timeout_s=timeout_s,
+                                          runner=getattr(self, "runner", None))
+        events = json_events(stdout)
+        if native_event_sink is not None:
+            for event in events:
+                native_event_sink({"type": "native.cursor.event", "payload": event})
+        # All callers interpret terminal envelopes through the same decoder.
+        # Emit captured events first so failed replies retain their known usage.
+        terminals = [event for event in events if event.get('type', 'result') in {'result', 'error', 'turn.failed'}]
+        if any(self.decode_event(event).error for event in terminals):
+            raise RuntimeError('cursor command errored or returned a malformed result')
+        if not timed_out and (returncode != 0 or not any(event.get('type', 'result') == 'result' for event in terminals)):
+            raise RuntimeError('cursor command exited without a successful terminal result')
         return events, timed_out
 
     @staticmethod
     def _final_text(events: list[dict]) -> str:
         for event in reversed(events):
-            if event.get("type") == "result":
-                return str(event.get("result") or "").strip()
+            decoded = CursorTransport.decode_event(event)
+            if decoded.text is not None:
+                return decoded.text
         return ""
 
     @staticmethod
     def _usage(events: list[dict]) -> SessionUsage:
         """Best-effort: cursor-agent's usage/model reporting varies by
-        version; absent fields stay 0/empty and cost stays None."""
+        version; absent billing counters remain unknown, not zero."""
         usage = SessionUsage()
         for event in events:
-            model = event.get("model")
-            if isinstance(model, str) and model:
-                usage.served_model = model
-            raw = event.get("usage")
-            if isinstance(raw, dict):
+            decoded = CursorTransport.decode_event(event)
+            if decoded.served_model:
+                usage.served_model = decoded.served_model
+            raw = decoded.usage
+            if isinstance(raw, dict) or event.get("type") == "result":
                 # live cursor-agent emits camelCase (inputTokens); accept
                 # snake_case too so a future rename does not zero the counts
-                usage.input_tokens += int(raw.get("inputTokens")
-                                          or raw.get("input_tokens") or 0)
-                usage.output_tokens += int(raw.get("outputTokens")
-                                           or raw.get("output_tokens") or 0)
+                raw = raw or {}
+                usage.add_token_usage({
+                    "input_tokens": raw.get("inputTokens", raw.get("input_tokens")),
+                    "output_tokens": raw.get("outputTokens", raw.get("output_tokens")),
+                    **{key: raw[key] for key in ("cache_read_input_tokens", "cache_creation_input_tokens")
+                       if key in raw},
+                })
+        if usage.reported_usage is None:
+            usage.reported_usage = {}
         return usage
+
+    @classmethod
+    def native_snapshot(cls, events: list[dict]) -> dict:
+        native = [event["payload"] for event in events
+                  if event.get("type") == "native.cursor.event"
+                  and isinstance(event.get("payload"), dict)]
+        usage = cls._usage(native)
+        return {"usage": dict(usage.reported_usage or {}),
+                "served_model": usage.served_model, "text": cls._final_text(native)}
 
     # -- MCP bridge wiring ---------------------------------------------------
     @staticmethod
@@ -208,8 +267,6 @@ class CursorTransport(HarnessTransport):
         tool bridge. Returns the paths WE created (and only those) so the
         session can restore the tree afterwards — the cwd is our detached
         PR-time worktree and must not accumulate config litter."""
-        import sys
-
         created: list[Path] = []
         cursor_dir = cwd / ".cursor"
         if not cursor_dir.exists():
@@ -224,18 +281,14 @@ class CursorTransport(HarnessTransport):
             # plan-gate prefix, and tool events appended to the old run's
             # bridge trace. Observed 2026-09-18, 27 minutes of a module run.
             return created
-        package_root = Path(__file__).resolve().parents[2]
-        config.write_text(json.dumps({"mcpServers": {"infermatrix-tools": {
-            "command": sys.executable,
-            "args": ["-m", "infermatrix_copilot.tool_bridge",
-                     "--spec", str(spec_path)],
-            "env": {"PYTHONPATH": str(package_root)},
-        }}}, indent=2), encoding="utf-8")
+        config.write_text(json.dumps({"mcpServers": {"infermatrix-tools": bridge_server(spec_path)}},
+                                     indent=2), encoding="utf-8")
         created.insert(0, config)
         return created
 
     # -- transport contract --------------------------------------------------
     def run_session(self, req: AgentSessionRequest) -> AgentOutcome:
+        self.validate_session(req)
         from .audit import audit_events
 
         cwd = Path(req.scope.root or req.run_dir)
@@ -258,7 +311,8 @@ class CursorTransport(HarnessTransport):
             try:
                 events, timed_out = self._run(
                     f"{req.system}\n\n{req.prompt}", cwd=str(cwd),
-                    timeout_s=req.timeout_s, model=req.model)
+                    timeout_s=req.timeout_s, model=req.model,
+                    **({"native_event_sink": req.native_event_sink} if req.native_event_sink is not None else {}))
             finally:
                 for path in created:
                     if path.is_dir():
@@ -276,37 +330,26 @@ class CursorTransport(HarnessTransport):
                 file_reads=audit.file_reads, writes=audit.writes,
                 other_tool_calls=audit.other_tool_calls, timed_out=timed_out,
                 served_model=usage.served_model)
-        return AgentOutcome(
-            text=self._final_text(events),
-            iterations=0,  # the harness does not expose its round count
-            tool_calls=audit.tool_calls,
-            truncated=timed_out,
-            refusals=[f"audit: {v}" for v in audit.violations],
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            tools_used=audit.tools_used[:40])
+        # Cursor does not expose its round count.
+        return usage.outcome(self._final_text(events), tool_calls=audit.tool_calls,
+                             tools_used=audit.tools_used, truncated=timed_out,
+                             refusals=[f"audit: {v}" for v in audit.violations])
 
     def complete(self, *, system: str, messages: list[dict],
                  model: str = "", max_tokens: int | None = None,
                  role: str = "", effort: str = "",
-                 max_budget_usd: float | None = None) -> Reply:
+                 max_budget_usd: float | None = None, native_event_sink=None) -> Reply:
         """Tool-less one-shot. Runs in an EMPTY scratch cwd so cursor-agent's
         native tools have nothing to read — the containment for calls that
         need no repo at all (intent, reducer, repair)."""
-        scratch = tempfile.mkdtemp(prefix="imc-cursor-oneshot-")
-        try:
+        with tempfile.TemporaryDirectory(prefix="imc-cursor-oneshot-", ignore_cleanup_errors=True) as scratch:
             events, timed_out = self._run(
                 flatten_messages(system, messages), cwd=scratch,
-                timeout_s=self.settings.strict_backend_timeout_s, model=model)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+                timeout_s=self.settings.strict_backend_timeout_s, model=model, tool_less=True,
+                **({"native_event_sink": native_event_sink} if native_event_sink is not None else {}))
+        from .audit import assert_tool_less
+
+        assert_tool_less(events)
         usage = self._usage(events)
-        text = self._final_text(events)
-        return Reply(
-            blocks=[Block(type="text", text=text)] if text else [],
-            stop_reason="max_tokens" if timed_out else "end_turn",
-            usage={"input_tokens": usage.input_tokens,
-                   "output_tokens": usage.output_tokens,
-                   "cache_read_input_tokens": 0,
-                   "cache_creation_input_tokens": 0},
-            model=usage.served_model)
+        return usage.reply(self._final_text(events),
+                           stop_reason="max_tokens" if timed_out else "end_turn")

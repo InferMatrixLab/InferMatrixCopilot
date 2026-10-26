@@ -47,7 +47,7 @@ from typing import Any
 from ...trace_store import TraceStore
 from ..judges import JudgeError, JudgeSpec, run_judge
 from ..reader import Unit
-from . import FindingLabel, Gold, GoldEntry, Match, Outcome
+from . import FindingLabel, Gold, GoldEntry, Match, Outcome, collect_gold_votes, gold_matches, record_gold_match
 
 GOLD_DIRNAME = "kb_intake"
 _GOLD_SYSTEM = """You judge whether ONE proposed knowledge change covers ONE gold review rule.
@@ -164,49 +164,17 @@ class KbIntakeAdapter:
             prompt = (f"Gold rule {entry.severity_hint} ({entry.path}), the complete contract:\n<untrusted_data>\n"
                       f"{entry.concern}\n</untrusted_data>\n\nThe proposed change under judgment:\n<untrusted_data>\n"
                       f"{proposal[:40_000]}\n</untrusted_data>")
-            votes: list[dict] = []
-            for _ in range(self.votes):
-                try:
-                    verdict = run_judge(self.judge, system=_GOLD_SYSTEM, prompt=prompt, llm=self.llm,
-                                        governor=self.governor, role="gold_match", runner=self.runner)
-                except JudgeError as exc:
-                    votes.append({"status": "error", "quote": "", "error": str(exc)[:200]})
-                    continue
-                status = str(verdict.get("status") or "").lower()
-                quote = str(verdict.get("quote") or "").strip()
-                if status == "hit" and (not quote or quote not in proposal):
-                    status, quote = "miss", quote and f"[quote not in proposal] {quote[:120]}"
-                votes.append({"status": status if status in ("hit", "miss") else "error", "quote": quote[:300]})
-            hits = sum(1 for v in votes if v["status"] == "hit")
-            misses = sum(1 for v in votes if v["status"] == "miss")
-            if hits * 2 > len(votes):
-                status = "hit"
-            elif misses * 2 > len(votes):
-                status = "miss"
-            else:
-                self.inconclusive.append({"unit_id": unit.unit_id, "gold_id": entry.gold_id, "votes": votes})
-                continue
-            quote = next((v["quote"] for v in votes if v["status"] == "hit"), "")
-            store.append("outcome", context={"unit_id": unit.unit_id, "item": unit.item, "of": unit.unit_id,
-                                             "workflow": unit.workflow},
-                         result={"type": "gold_match", "gold_id": entry.gold_id, "status": status, "quote": quote,
-                                 "votes": votes, "gold_version": gold.version, "judge": self.judge.model})
-            count += 1
+            votes = collect_gold_votes(self.votes,
+                lambda: run_judge(self.judge, system=_GOLD_SYSTEM, prompt=prompt, llm=self.llm,
+                                  governor=self.governor, role="gold_match", runner=self.runner),
+                text=proposal, quote_label="proposal")
+            count += record_gold_match(unit, entry, gold, store, votes=votes,
+                                       judge=self.judge.model, inconclusive=self.inconclusive)
         return count
 
     # -- the contract ----------------------------------------------------------------
     def match(self, unit: Unit, gold: Gold, outcome: Outcome) -> list[Match]:
-        latest: dict[str, dict] = {}
-        for r in outcome.of_type("gold_match"):
-            latest[str(r["result"].get("gold_id"))] = r
-        out = []
-        for entry in gold.entries:
-            r = latest.get(entry.gold_id)
-            if r is None:
-                out.append(Match(entry.gold_id, "unlabeled"))
-            else:
-                out.append(Match(entry.gold_id, str(r["result"].get("status") or "unlabeled"), evidence=(r["id"],)))
-        return out
+        return gold_matches(gold, outcome)
 
     @staticmethod
     def _current_judgings(outcome: Outcome) -> list[dict]:

@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from .init_stages import _fence
 from .knowledge_depth import _calls_next, python_definitions, python_module_index, resolve_python_module
 from .knowledge_coverage import SUFFIXES, _LEXICAL_NO_CODE, matches
+from .evidence_bundle import merge_ranges, selected_spans
 from ..knowledge_service.lifecycle import DEPTH_ABSENCE_DETECTOR, safe_source_path
 
 SYSTEM_DEPTH = """Explain ONE feature's implementation at the supplied immutable pin.
@@ -658,17 +659,7 @@ class DepthContext:
                     continue
                 selected.setdefault(path, {})[number] = line
                 used += size
-        out = []
-        for path, numbered in selected.items():
-            span = []
-            for number in sorted(numbered):
-                if span and number != span[-1] + 1:
-                    out.append({"path": path, "start": span[0], "end": span[-1], "text": [numbered[n] for n in span]})
-                    span = []
-                span.append(number)
-            if span:
-                out.append({"path": path, "start": span[0], "end": span[-1], "text": [numbered[n] for n in span]})
-        return out
+        return selected_spans(selected)
 
     def test_association(self, feature, docs=()):
         """Describe a complete tracked test search, with explicit uncertainty.
@@ -841,15 +832,9 @@ class DepthContext:
             is_doc = PurePosixPath(path).suffix.lower() in {".md", ".mdx", ".rst", ".txt", ".adoc"}
             if not is_doc and path not in allowed_code:
                 raise ValueError("repair evidence is outside production/test inventory: " + path)
-            merged = []
-            for start, end in sorted(spans):
-                if end > len(fact["lines"]):
-                    raise ValueError("repair evidence extends beyond indexed file: " + path)
-                if merged and start <= merged[-1][1] + 1:
-                    merged[-1] = merged[-1][0], max(end, merged[-1][1])
-                else:
-                    merged.append((start, end))
-            for start, end in merged:
+            if any(end > len(fact["lines"]) for _, end in spans):
+                raise ValueError("repair evidence extends beyond indexed file: " + path)
+            for start, end in merge_ranges(spans):
                 text = [str(line) if is_doc else f"{n}: {line}"
                         for n, line in enumerate(fact["lines"][start - 1:end], start)]
                 amount = sum(len(line.encode()) + 1 for line in text)
@@ -1079,18 +1064,8 @@ class DepthContext:
             if limit - used < 3:
                 break
             offer([(path, start, end)], complete=self.mode == "lightweight")
-        files = []
-        for path, numbered in selected.items():
-            span = []
-            for number in sorted(numbered):
-                if span and number != span[-1] + 1:
-                    files.append({"path": path, "start": span[0], "end": span[-1],
-                                  "total_lines": len(self._file(path)[0]), "text": [numbered[n] for n in span]})
-                    span = []
-                span.append(number)
-            if span:
-                files.append({"path": path, "start": span[0], "end": span[-1],
-                              "total_lines": len(self._file(path)[0]), "text": [numbered[n] for n in span]})
+        files = [{**span, "total_lines": len(self._file(span["path"])[0])}
+                 for span in selected_spans(selected)]
         definitions = [d for path in selected for d in self._definitions(path)
                        if any(f["path"] == path and f["start"] <= d["start"] <= f["end"] for f in files)]
         payload = {"files": files, "definitions": definitions, "retrieval_edges": edges,

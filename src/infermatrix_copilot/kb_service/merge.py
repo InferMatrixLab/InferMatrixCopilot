@@ -45,12 +45,7 @@ CONFIG_MERGE = ("must allow a direct merge",)
 # a refused local-gate merge that is about the moment, not the change: sign again
 TRANSIENT_MERGE = ("main kept moving", "not merging:", "head of PR", "head moved", "git ", "gh ",
                    "did not merge", "is not open", "verdict: ")
-KNOWLEDGE_REPO_ENV = "KB_KNOWLEDGE_REPOSITORY"
-DEFAULT_KNOWLEDGE_REPOSITORY = "JiusiServe/InferMatrixCopilot"
-
-
-def knowledge_repository() -> str:
-    return os.environ.get(KNOWLEDGE_REPO_ENV, DEFAULT_KNOWLEDGE_REPOSITORY)
+from .config import KNOWLEDGE_REPO_ENV, DEFAULT_KNOWLEDGE_REPOSITORY, knowledge_repository
 
 
 # the transition each outbox item kind drives: (state before, state after)
@@ -306,11 +301,12 @@ def rebuild(rt, lifecycle, changeset: dict, why: str) -> str | None:
         rt.ledger.update_changeset(changeset["id"], status="human", pending_item=None)
         rt.ledger.enqueue_human(lifecycle.repo, "maintenance correction requires fresh budgeted source review; automatic generic rebuild refused", changeset["id"])
         return None
-    from .runtime import gate_and_stage, publish
+    from .runtime import gate_and_stage, publish, require_settled_reviews
 
     owner = getattr(rt, "lease_owner", None)
     if not owner:
         return None
+    require_settled_reviews(rt, lifecycle.repo, kinds=('rebuild',), binding={'rebuild_of': changeset['id']})
 
     def to_people(reason: str) -> None:
         rt.ledger.update_changeset(changeset["id"], status="rebuild_failed")
@@ -340,8 +336,9 @@ def rebuild(rt, lifecycle, changeset: dict, why: str) -> str | None:
                                 draft_keys=[],
                                 # a rebuild continues the change's refine lineage: the
                                 # limit never resets because context moved meanwhile
-                                extra_detail={k: detail[k] for k in ("refine_round", "refine_history", "generator")
-                                              if k in detail})
+                                extra_detail={"rebuild_of": changeset['id'],
+                                              **{k: detail[k] for k in ("refine_round", "refine_history", "generator")
+                                                 if k in detail}})
     staged = rt.ledger.changeset(new_id)
     if staged["status"] not in ("gated", *IN_FLIGHT):
         # the rebuild itself did not pass the gate: nothing replaces the PR
@@ -497,14 +494,14 @@ def advance(rt, lifecycle) -> list[str]:
                 continue  # one merge in flight per repository
             maintenance = {}
             if changeset["kind"] == "correction":
-                from .maintenance import correction_publishable, _required_ci
+                from .maintenance_policy import correction_publishable, required_ci
                 from .containment import merge_authorization
                 try:
                     reason = correction_publishable(rt, changeset)
                     if reason:
                         events.append(f"correction_held {changeset['id']}: {reason}")
                         continue
-                    _required_ci(rt, changeset)
+                    required_ci(rt, changeset)
                     maintenance = {"maintenance_required": True, "maintenance": merge_authorization(rt, changeset)}
                 except (ValueError, RuntimeError, OSError) as exc:
                     events.append(f"correction_held {changeset['id']}: {exc}")

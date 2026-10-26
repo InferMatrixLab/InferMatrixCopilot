@@ -8,7 +8,17 @@ import pytest
 from infermatrix_copilot.kb_service.init_knowledge import (
     FACETS, MAX_DOC_BYTES, SYSTEM_KNOWLEDGE, _Knowledge, knowledge_prompt, validate_sections,
 )
-from infermatrix_copilot.kb_service.init_knowledge_inputs import SYSTEM_KNOWLEDGE_V4
+from infermatrix_copilot.kb_service.init_knowledge_inputs import (
+    SYSTEM_KNOWLEDGE_V4, SYSTEM_KNOWLEDGE_V5, knowledge_system,
+    FOUNDATION_GENERATION_POLICY_VERSION,
+)
+CURRENT_KNOWLEDGE_SYSTEM = knowledge_system({"foundation_generation_policy_version": FOUNDATION_GENERATION_POLICY_VERSION})
+CURRENT_KNOWLEDGE_SYSTEM_V4 = knowledge_system({"foundation_prompt_version": 4,
+    "foundation_generation_policy_version": FOUNDATION_GENERATION_POLICY_VERSION})
+CURRENT_KNOWLEDGE_SYSTEM_V5 = knowledge_system({"foundation_prompt_version": 5,
+    "foundation_generation_policy_version": FOUNDATION_GENERATION_POLICY_VERSION})
+FOUNDATION_SYSTEMS = {SYSTEM_KNOWLEDGE, SYSTEM_KNOWLEDGE_V4, SYSTEM_KNOWLEDGE_V5,
+                      CURRENT_KNOWLEDGE_SYSTEM, CURRENT_KNOWLEDGE_SYSTEM_V4, CURRENT_KNOWLEDGE_SYSTEM_V5}
 from infermatrix_copilot.kb_service.init_stages import run_stage
 from infermatrix_copilot.kb_service.init_support import InitRecord
 from infermatrix_copilot.knowledge_service.lifecycle import Page
@@ -127,7 +137,7 @@ class KnowledgeGateway(CardGateway):
         self.cost = cost
 
     def call_json(self, role, *, system, prompt, validate=None, max_budget_usd=None):
-        if system not in (SYSTEM_KNOWLEDGE, SYSTEM_KNOWLEDGE_V4):
+        if system not in FOUNDATION_SYSTEMS:
             return super().call_json(role, system=system, prompt=prompt, validate=validate,
                                      max_budget_usd=max_budget_usd)
         from infermatrix_copilot.kb_service.models import ModelReply
@@ -163,7 +173,7 @@ def test_knowledge_visits_every_owner_even_with_rules_and_low_rule_target(world)
     record = run_stage(_runtime(world, gateway), _modules_lifecycle(coverage_target=0.01),
                        "knowledge", dry_run=True)
     assert record.status == "dry_run", record.problems
-    calls = [c for c in gateway.calls if c["system"] == SYSTEM_KNOWLEDGE]
+    calls = [c for c in gateway.calls if c["system"] == CURRENT_KNOWLEDGE_SYSTEM]
     assert len(calls) == 2                 # both core and tooling, regardless of existing rules
     tree = _tree(record)
     assert "adapters/toy/manifest.yaml" not in tree  # knowledge does not flip service flags
@@ -212,7 +222,7 @@ def test_unusable_component_draft_preserves_checked_work_and_visits_remaining_ow
 
     class PartialGateway(KnowledgeGateway):
         def call_json(self, role, *, system, prompt, **kwargs):
-            if system == SYSTEM_KNOWLEDGE:
+            if system == CURRENT_KNOWLEDGE_SYSTEM:
                 payload = json.loads(prompt.split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
                 if payload["owner"] == failed_owner:
                     raise ModelUnavailable("reply is not a JSON object")
@@ -254,7 +264,7 @@ def test_existing_knowledge_is_preserved_and_only_missing_facets_are_requested(w
     repeat = run_stage(_runtime(world, gateway), _modules_lifecycle(), "knowledge", dry_run=True)
     assert repeat.status == "empty", repeat.problems
     assert not repeat.files
-    calls = [c for c in gateway.calls if c["system"] == SYSTEM_KNOWLEDGE]
+    calls = [c for c in gateway.calls if c["system"] == CURRENT_KNOWLEDGE_SYSTEM]
     assert len(calls) == 2
     for call in calls:
         payload = json.loads(call["prompt"].split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
@@ -315,7 +325,7 @@ def test_knowledge_generation_receives_pinned_source_and_repository_readme(world
     record = run_stage(_runtime(world, gateway), _modules_lifecycle(), "knowledge", dry_run=True)
     assert record.status == "dry_run", record.problems
     payloads = [json.loads(c["prompt"].split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
-                for c in gateway.calls if c["system"] == SYSTEM_KNOWLEDGE]
+                for c in gateway.calls if c["system"] == CURRENT_KNOWLEDGE_SYSTEM]
     assert payloads
     for payload in payloads:
         assert payload["files"] and payload["pin"] == record.pin
@@ -337,7 +347,7 @@ def test_existing_facet_markers_beyond_prompt_cap_prevent_duplicates(world):
     record = run_stage(_runtime(world, gateway), _modules_lifecycle(), "knowledge", dry_run=True)
     assert record.status == "dry_run", record.problems
     payloads = [json.loads(c["prompt"].split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
-                for c in gateway.calls if c["system"] == SYSTEM_KNOWLEDGE]
+                for c in gateway.calls if c["system"] == CURRENT_KNOWLEDGE_SYSTEM]
     tooling = next(p for p in payloads if p["owner"] == "tooling")
     assert "tradeoffs" not in tooling["facets"]
     assert sum(len("\n".join(t).encode("utf-8")) for t in tooling["existing_knowledge"].values()) <= MAX_DOC_BYTES
@@ -439,3 +449,83 @@ def test_invalid_knowledge_cannot_claim_facet_coverage(change):
     section.update(change)
     with pytest.raises(ValueError):
         validate_sections({"sections": [section]})
+
+
+@pytest.mark.parametrize("feature_mode", [False, True])
+def test_capped_foundation_offers_related_validation_without_claiming_execution(world, feature_mode):
+    gateway = KnowledgeGateway()
+    _chain(world, gateway)
+    pin = _commit(world["upstream"], {
+        "pkg/cache_api.py":"class CachedRevision:\n    def verify(self):\n        return 7\n",
+        "tests/test_cache_api.py":"from pkg.cache_api import CachedRevision\n\ndef test_revision():\n    assert CachedRevision().verify() == 7\n",
+    }, "pinned implementation and validation")
+    if feature_mode:
+        import yaml
+        from test_kb_init_knowledge_coverage import _policy_data
+        from infermatrix_copilot.kb_service.knowledge_coverage import policy_path
+        policy = _policy_data()
+        policy["core"]["roots"] = ["pkg/", "tools/"]
+        policy["features"][0].update(owner="core", source_globs=["pkg/cache_api.py"],
+            docs=["docs/guide.md"], page="repos/toy/components/core/feature-demo.md")
+        _commit(world["origin"], {policy_path("toy"):yaml.safe_dump(policy)}, "declare feature coverage")
+    gateway.calls.clear()
+    record = run_stage(_runtime(world, gateway), _modules_lifecycle(), "knowledge", dry_run=True, pin=pin)
+    assert record.status == "dry_run", record.problems
+    packets = [json.loads(call["prompt"].split("\n", 1)[1].rsplit("</untrusted_data>", 1)[0])
+               for call in gateway.calls if call["system"] == CURRENT_KNOWLEDGE_SYSTEM]
+    assert packets and all(packet["foundation_generation_policy_version"] == FOUNDATION_GENERATION_POLICY_VERSION for packet in packets)
+    related = [item for packet in packets for item in packet["files"]
+               if item["path"] == "tests/test_cache_api.py"]
+    assert related and any("assert CachedRevision().verify() == 7" in "\n".join(item["text"]) for item in related)
+    if feature_mode:
+        feature = next(packet for packet in packets if packet["owner"] == "feature-demo")
+        assert any(item["path"] == "tests/test_cache_api.py" for item in feature["files"])
+    assert all("source text only, no execution outcome evidence" in item["test_context"] for item in related)
+    for packet in packets:
+        assert sum(len("\n".join(item["text"]).encode()) for item in packet["files"]) <= 100000
+    # The scripted generator intentionally offers no validation section: test
+    # availability must not be promoted to accepted semantic coverage.
+    assert all(row["facets"]["validation"] == "missing"
+               for row in record.coverage["knowledge"]["owners"].values())
+
+
+@pytest.mark.parametrize("old_version", [None, 1])
+def test_changed_capped_evidence_policy_does_not_rebind_unknown_dispatch(world, monkeypatch, old_version):
+    from infermatrix_copilot.kb_service import init_knowledge_parallel as parallel
+    from infermatrix_copilot.kb_service.init_support import InitError
+    from infermatrix_copilot.kb_service.models import ModelUnavailable
+    gateway = KnowledgeGateway()
+    _chain(world, gateway)
+    rt = _runtime(world, gateway)
+    original = _Knowledge._input_options
+    dispatches = []
+    def legacy_options(stage):
+        options = original(stage)
+        assert options["foundation_test_evidence_version"] == 2
+        if old_version is None:
+            options.pop("foundation_test_evidence_version")
+        else:
+            options["foundation_test_evidence_version"] = old_version
+        return options
+    def lost_reply(stage, job):
+        dispatches.append(job["owner"].owner)
+        raise ModelUnavailable("simulated lost original worker response")
+    with monkeypatch.context() as patch:
+        patch.setattr(_Knowledge, "_input_options", legacy_options)
+        patch.setattr(parallel, "_worker", lost_reply)
+        run_stage(rt, _modules_lifecycle(), "knowledge", dry_run=True)
+    path = InitRecord.path(rt.state_dir, "toy", "knowledge")
+    saved = InitRecord.load(rt.state_dir, "toy", "knowledge")
+    assert saved.coverage["foundation_jobs"]["inflight"] and dispatches
+    before = path.read_bytes()
+    def forbidden(*args, **kwargs):
+        pytest.fail("changed evidence policy must not dispatch an old unknown job")
+    monkeypatch.setattr(parallel, "_worker", forbidden)
+    try:
+        result = run_stage(rt, _modules_lifecycle(), "knowledge", dry_run=True)
+    except InitError as exc:
+        assert "frozen input identity differs" in str(exc)
+    else:
+        assert result.status == "blocked"
+        assert any("frozen input identity differs" in problem for problem in result.problems)
+    assert path.read_bytes() == before

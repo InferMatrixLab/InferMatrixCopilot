@@ -32,7 +32,7 @@ def test_save_progress_crash_leaves_old_checkpoint(executor, monkeypatch):
     """A crash mid-write (before the rename) must leave the previous checkpoint
     intact — a torn progress.json would strand every resume path."""
     executor._save_progress({"completed": {"a": {}}})
-    import infermatrix_copilot.engine.executor as ex
+    import infermatrix_copilot.persistence as ex
 
     def boom(fd):
         raise OSError("simulated crash during write")

@@ -372,7 +372,7 @@ def test_publish_step_is_double_gated_and_hold_pauses_only_publication(tmp_path,
     out = asyncio.run(steps._publish(ctx(with_outbox.model_copy(update={"allow_post": True}), True)))
     assert out.ok and out.outputs["state_updates"]["improve_publish"]["held"] == {"pr-review.agent.review_diff": "maintainer: hold"}
     # rule 1: in a shadow run the executor refuses the push step before it runs
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.steps import register_builtin_steps
     from infermatrix_copilot.playbooks.store import PlaybookStore
@@ -514,7 +514,7 @@ def test_meta_case_run_and_adapter_score_agreement_with_human_labels(tmp_path):
         meta.stage_case(meta_dir, "case-9", tmp_path / "shadow2")
 
 
-def test_self_experiment_runs_without_a_judge_and_refuses_the_benchmark_as_an_arm(tmp_path, settings):
+def test_self_experiment_runs_without_a_judge_and_refuses_the_benchmark_as_an_arm(tmp_path, settings, monkeypatch):
     clock = Clock()
     store = _store(tmp_path, clock)
     meta_dir, gold, human = _meta_case(tmp_path, store, ["S2", "S1"])
@@ -572,15 +572,10 @@ def test_self_experiment_runs_without_a_judge_and_refuses_the_benchmark_as_an_ar
     def fake_run(argv, **kw):
         calls.append((argv, kw))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
-    import subprocess
-    orig = subprocess.run
-    subprocess.run = fake_run
-    try:
-        out = exps.meta_run_unit(side="arm", item="meta:case-1", replicate=1, env={"IMPROVE_UNIT_TAG": "t"},
-                                 snapshot_path=tmp_path / "s.json", shadow_dir=tmp_path / "sd", run_root=tmp_path / "rr",
-                                 playbook="workflow-improve", repo="meta", pr=0)
-    finally:
-        subprocess.run = orig
+    monkeypatch.setattr(exps, "run_command", fake_run)
+    out = exps.meta_run_unit(side="arm", item="meta:case-1", replicate=1, env={"IMPROVE_UNIT_TAG": "t"},
+                             snapshot_path=tmp_path / "s.json", shadow_dir=tmp_path / "sd", run_root=tmp_path / "rr",
+                             playbook="workflow-improve", repo="meta", pr=0)
     argv, kw = calls[0]
     assert argv[-6:] == ["--playbook", "workflow-improve", "--task-param", "repo=meta", "--task-param", "meta_case=case-1"]
     assert out["rc"] == 0 and kw["env"]["IMPROVE_META_DIR"] == str(tmp_path / "sd" / "meta") and kw["cwd"] == str(tmp_path / "sd")
@@ -618,7 +613,7 @@ def test_the_real_entry_accepts_the_shadow_childs_repo_alias(tmp_path):
 
 
 def test_meta_mode_runs_the_forensics_step_as_the_engines_own_unit(tmp_path, settings):
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.steps import register_builtin_steps
     from infermatrix_copilot.llm import Block, Reply

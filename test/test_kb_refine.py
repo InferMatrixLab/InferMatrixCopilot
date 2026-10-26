@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from infermatrix_copilot.kb_service import merge
 from infermatrix_copilot.kb_service.refine import MAX_REFINES
@@ -44,6 +45,74 @@ def _runtime(tmp_path, verdicts):
     rt.gateway = ScriptedGateway(judges)
     rt.lease_owner = rt.ledger.acquire_lease("scheduler")
     return rt, lifecycle, judges
+
+
+@pytest.mark.parametrize('fault', ['unknown', 'crash'])
+def test_refinement_generation_intent_survives_unknown_or_interrupted_call(tmp_path, fault):
+    from infermatrix_copilot.kb_service.models import ModelUnavailable
+    from infermatrix_copilot.kb_service.refine import refine
+    rt, lifecycle, judges = _runtime(tmp_path, ['no'])
+    collect_events(rt, lifecycle)
+    parent = rt.ledger.changeset(run_intake(rt, lifecycle))
+
+    def interrupted(role, prompt):
+        if fault == 'crash':
+            raise KeyboardInterrupt('worker interrupted during native call')
+        error = ModelUnavailable('native result unknown', allow_fallback=False)
+        error.native_call_sent, error.native_call_completed = True, False
+        raise error
+
+    rt.gateway.answer = interrupted
+    if fault == 'crash':
+        with pytest.raises(KeyboardInterrupt):
+            refine(rt, lifecycle, parent)
+    else:
+        assert refine(rt, lifecycle, parent) is None
+    state = json.loads(rt.ledger.get_cursor('demo', 'draft:refine:' + parent['id']))
+    assert state['draft_dispatched'] and 'draft_result' not in state
+    assert state['draft_binding']['base_sha'] == rt.knowledge.fetch()
+    assert state['draft_binding']['generator']['model'] == rt.generator.model
+    calls = list(rt.gateway.calls)
+    rt.gateway.answer = judges
+    assert refine(rt, lifecycle, parent) is None
+    assert rt.gateway.calls == calls
+    assert rt.ledger.changeset(parent['id']) == parent
+
+
+def test_refinement_reuses_completed_draft_when_interrupted_before_gate(tmp_path, monkeypatch):
+    from infermatrix_copilot.kb_service import runtime
+    from infermatrix_copilot.kb_service.refine import refine
+    rt, lifecycle, judges = _runtime(tmp_path, ['no', 'yes'])
+    collect_events(rt, lifecycle)
+    parent = rt.ledger.changeset(run_intake(rt, lifecycle))
+    judges.next_round()
+    gate = runtime.gate_and_stage
+
+    def interrupted(*args, **kwargs):
+        raise OSError('crash before gate reservation')
+
+    monkeypatch.setattr(runtime, 'gate_and_stage', interrupted)
+    with pytest.raises(OSError, match='before gate reservation'):
+        refine(rt, lifecycle, parent)
+    generated = len(judges.prompts)
+    saved = json.loads(rt.ledger.get_cursor('demo', 'draft:refine:' + parent['id']))
+    assert saved['draft_result']['draft']['operations']
+    from dataclasses import replace
+    generator = rt.generator
+    rt.generator = replace(generator, model=generator.model + '-changed')
+    assert refine(rt, lifecycle, parent) is None
+    assert len(judges.prompts) == generated
+    rt.generator = generator
+
+    def resumed_gate(*args, **kwargs):
+        trace_key = saved['draft_result']['trace_key']
+        assert trace_key and kwargs['draft_keys'] == [trace_key]
+        return gate(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, 'gate_and_stage', resumed_gate)
+    child = refine(rt, lifecycle, parent)
+    assert child and rt.ledger.changeset(child)['kind'] == 'refine'
+    assert len(judges.prompts) == generated
 
 
 def test_a_rejected_intake_is_refined_with_the_reasons_and_judged_again(tmp_path):

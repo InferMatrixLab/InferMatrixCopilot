@@ -21,14 +21,11 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
-import tarfile
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -99,6 +96,8 @@ class InitRecord:
     review: dict = field(default_factory=dict)            # aggregate review, bound to the exact base/head
     depth: dict = field(default_factory=dict)             # independent semantic-depth checkpoints
     discovery: dict = field(default_factory=dict)         # feature discovery checkpoints and frozen catalog
+    budget_calls: dict = field(default_factory=dict)      # original per-call accounting identities; legacy totals stay conservative
+    native_completion_profiles: dict = field(default_factory=dict)  # host policy, independent of stage coverage reports
 
     @staticmethod
     def path(state_dir: Path, repo: str, stage: str) -> Path:
@@ -106,11 +105,13 @@ class InitRecord:
 
     def save(self, state_dir: Path) -> Path:
         path = self.path(state_dir, self.repo, self.stage)
+        from ..persistence import atomic_write_bytes
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=1, sort_keys=True),
-                       encoding="utf-8")
-        os.replace(tmp, path)
+        data = asdict(self)
+        if not self.native_completion_profiles:
+            data.pop('native_completion_profiles')
+        atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=1,
+                                            sort_keys=True).encode("utf-8"))
         return path
 
     @classmethod
@@ -123,6 +124,19 @@ class InitRecord:
             return cls(**data)
         except (OSError, ValueError, TypeError) as exc:
             raise InitError(f"init record {path} is unreadable: {exc}") from exc
+
+
+def checkpoint_budget(limit: float | None, record: InitRecord, state_dir: Path) -> Budget:
+    """Use the init-record format for the shared budget's durable checkpoints."""
+    if not isinstance(record.budget_calls, dict):
+        raise ValueError("invalid init budget call journal")
+    def checkpoint(spent: float, reserved: float) -> None:
+        # A killed call's final cost is unknown; recovery charges its whole
+        # outstanding reservation, without introducing a new record format.
+        record.spent_usd = spent + reserved
+        record.save(state_dir)
+
+    return Budget(limit, spent_usd=record.spent_usd, checkpoint=checkpoint, calls=record.budget_calls)
 
 
 def inputs_digest(**parts: Any) -> str:
@@ -280,7 +294,7 @@ class InitRuntime:
 
     @classmethod
     def from_env(cls, settings, *, state_dir: Path) -> "InitRuntime":
-        from ..sdk._resources import adapters_root
+        from ..resources import adapters_root
         from ..trace_store import TraceStore
         from .config import load_registry
         from .models import roles_from_env
@@ -303,6 +317,40 @@ class InitRuntime:
             generator=generator, judge=judge,
             knowledge=KnowledgeRepo(clone), github=GitHubReader(),
         )
+
+
+def execution_snapshot(rt, init=None) -> dict:
+    """Portable original admission/model/accounting inputs, without credentials."""
+    value = {
+        "generator": asdict(rt.generator) if hasattr(rt, "generator") else None,
+        "judge": asdict(rt.judge) if hasattr(rt, "judge") else None,
+        "unlimited_subscription": rt.unlimited_subscription,
+        "subscription_generator": getattr(rt, "subscription_generator", False),
+        "prices": {name: asdict(price) for name, price in getattr(rt, "prices", {}).items()},
+        "init": asdict(init) if init is not None else None,
+        "zcode_reasoning_level": getattr(rt.gateway, "zcode_reasoning_level", None),
+        "native_completion_profiles": getattr(rt.gateway, "native_completion_profiles", {}),
+    }
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def restore_execution(rt, snapshot):
+    """Restore frozen settings on a detached runtime; never create a gateway."""
+    from copy import copy
+    from .config import InitConfig
+
+    required = {"generator", "judge", "prices", "init", "subscription_generator",
+                "unlimited_subscription", "zcode_reasoning_level"}
+    if not required.issubset(snapshot) or snapshot["init"] is None:
+        raise InitError("original init execution settings are unavailable")
+    def role(value):
+        return ModelRole(**{**value, "fallback": role(value["fallback"]) if value.get("fallback") else None})
+    restored = copy(rt)
+    restored.generator, restored.judge = role(snapshot["generator"]), role(snapshot["judge"])
+    restored.subscription_generator = snapshot["subscription_generator"]
+    restored.unlimited_subscription = snapshot["unlimited_subscription"]
+    restored.prices = {name: Price(**price) for name, price in snapshot["prices"].items()}
+    return restored, InitConfig(**snapshot["init"])
 
 
 def ensure_knowledge_clone(path: Path, *, repository: str | None = None) -> None:
@@ -349,22 +397,38 @@ def generate(rt: InitRuntime, budget: Budget, init, *, system: str, prompt: str,
 
 
 def judge(rt: InitRuntime, budget: Budget, init, block, *, base: Mapping[str, str],
-          head: Mapping[str, str], evidence: list[dict]):
+          head: Mapping[str, str], evidence: list[dict], record: InitRecord | None = None):
     """The advisory L2 verdict for one rule block (``gate.judge_block``), at a
     fixed accounted cost of ``judge_call_usd``. An unavailable judge comes back
     as verdict ``human`` with ``reasons["model"]`` set."""
-    from .gate import judge_block
+    from .gate import BlockVerdict, judge_block
 
-    if rt.unlimited_subscription:
-        if rt.judge.fallback is not None:
-            raise ModelUnavailable("unlimited subscription judgment must not configure a fallback", allow_fallback=False)
-        if not rt.gateway.subscription_billing(rt.judge):
-            raise ModelUnavailable("subscription judge needs an authenticated subscription backend", allow_fallback=False)
-    with budget.reserve(init.judge_call_usd) as reservation:
-        verdict = judge_block(block, base=dict(base), head=dict(head), evidence=evidence,
-                              gateway=rt.gateway, judge=rt.judge)
-        reservation.charge(init.judge_call_usd)
-    return verdict
+    from .quality_review import QualityPolicy, checkpoint_review
+
+    def run():
+        return judge_block(block, base=dict(base), head=dict(head), evidence=evidence,
+                           gateway=rt.gateway, judge=rt.judge, budget=budget, charge_usd=init.judge_call_usd,
+                           quality_policy=QualityPolicy("init-block", subscription=rt.unlimited_subscription,
+                                                        reject_fallback=rt.unlimited_subscription))
+
+    if record is None:
+        return run()  # Foundation's worker task owns its encompassing checkpoint.
+    identity = inputs_digest(block=block.to_dict(), base=base, head=head, evidence=evidence,
+                             judge=rt.judge.label(), policy="init-block-v1",
+                             subscription=rt.unlimited_subscription)
+    state = record.coverage.setdefault("quality_reviews", {}).setdefault(identity, {})
+    binding = {"input_sha256": identity, "block": block.to_dict(),
+               "requested": rt.judge.label(), "role": rt.judge.name}
+    cached = state.get("checked")
+    if isinstance(cached, dict) and cached.get("input_sha256") == identity and "requested" not in cached:
+        # Completed legacy judgments remain reusable under their original full
+        # input digest. Never invent a new dispatch identity for an old receipt.
+        # The shared checkpoint validator still checks any retained binding.
+        binding = {"input_sha256": identity}
+    result = checkpoint_review(state, lambda: run().to_dict(), budget.checkpoint_now,
+                               binding=binding)
+    return BlockVerdict(block, result["verdict"], result.get("dimensions", {}), result.get("reasons", {}),
+                        result.get("model", ""), result.get("quality_receipt", {}))
 
 
 def classify_verdict(verdict) -> str:
@@ -417,48 +481,10 @@ def run_knowledge_validators(knowledge, base_sha: str, files: Mapping[str, str |
     """``knowledge/tools/check_knowledge_tree.py`` and ``check_wiki_lint.py``
     (what CI runs) on the base tree with ``files`` (repository-relative path ->
     text, None = deleted) applied. Problems are the tools' error lines."""
-    with tempfile.TemporaryDirectory(prefix="kb-init-validate-") as scratch:
-        root = Path(scratch)
-        proc = _run(["git", "-C", str(knowledge.path), "archive", "--format=tar", base_sha,
-                     "knowledge", "doc/knowledge", "adapters"])
-        if proc.returncode != 0:
-            return [f"cannot export the knowledge tree at {base_sha[:12]}: "
-                    f"{proc.stderr.decode(errors='replace')[:300]}"]
-        with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as archive:
-            for member in archive.getmembers():
-                target = (root / member.name).resolve()
-                if not target.is_relative_to(root.resolve()) or member.issym() or member.islnk():
-                    continue
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source = archive.extractfile(member)
-                    target.write_bytes(source.read() if source is not None else b"")
-        for rel, text in files.items():
-            target = root / rel
-            if text is None:
-                target.unlink(missing_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
-        _run(["git", "init", "-q", str(root)])  # the tree check asks git about local/
-        problems = []
-        for tool in ("check_knowledge_tree.py", "check_wiki_lint.py"):
-            script = root / "knowledge" / "tools" / tool
-            if not script.is_file():
-                problems.append(f"{tool} is missing from the knowledge tree")
-                continue
-            try:
-                done = subprocess.run([sys.executable, str(script)], cwd=root, capture_output=True,
-                                      text=True, timeout=VALIDATOR_TIMEOUT_S, check=False)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                problems.append(f"{tool} did not run: {exc}")
-                continue
-            if done.returncode != 0:
-                lines = [ln for ln in (done.stdout + done.stderr).splitlines() if ln.startswith("错误")]
-                problems += [f"{tool}: {ln}" for ln in lines] or [f"{tool} failed: {done.stdout[-400:]}"]
-        return problems
+    from ..knowledge_service.validation import validate_snapshot
+
+    return validate_snapshot(knowledge.path, base_sha, files,
+                             timeout_seconds=VALIDATOR_TIMEOUT_S).problems()
 
 
 # -- publishing ---------------------------------------------------------------------
@@ -502,6 +528,8 @@ class InitPublisher:
     def dry_run(dest: Path, files: Mapping[str, str | None], *, title: str, body: str) -> Path:
         """Replace ``dest`` with exactly this change: files under ``tree/``
         (a deletion as ``<name>.DELETED``) and ``PR_BODY.md``."""
+        from .preview import file_hashes
+        file_hashes(files)  # Reject unsafe/colliding paths before replacing a prior preview.
         dest = Path(dest)
         if dest.exists():
             shutil.rmtree(dest)   # never let an earlier run's pages linger in this snapshot
@@ -618,11 +646,10 @@ def save_prepared(path: Path, **publication: Any) -> Path:
     if not set(PREPARED_KEYS).issubset(publication) or set(publication) - set(PREPARED_KEYS) - PREPARED_OPTIONAL:
         raise ValueError(f"a prepared publication needs exactly {PREPARED_KEYS}")
     path = Path(path)
+    from ..persistence import atomic_write_bytes
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({**publication, "author": list(publication["author"])}, ensure_ascii=False),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_bytes(path, json.dumps({**publication, "author": list(publication["author"])},
+                                       ensure_ascii=False).encode("utf-8"))
     return path
 
 

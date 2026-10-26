@@ -269,26 +269,76 @@ CACHE_READ_FACTOR = 0.1
 CACHE_CREATE_FACTOR = 1.25
 
 
-def cost_from_spans(trace_path: "Path", settings: "Settings | None" = None,
-                    ) -> dict | None:
-    """THE canonical cost calculator (design W7): one `llm` span per actual
-    provider request -> tokens (incl. cache fields) -> USD priced by EACH
-    span's own model (heterogeneous MoA runs price correctly; a member->tier
-    fallback mid-loop is priced per request). Returns None when the trace file
-    is absent/unreadable — callers then fall back to event sums, tagged
-    `source: events`, and never combine the two. `by_role` breaks the spend
-    down by the span's `role` attr (lens/reducer/planner/moa_member/…) for
-    the overhead sub-block."""
+def _cost_from_model_calls(records, settings=None):
+    """One usage/pricing projection for canonical facts and legacy span adapters.
+
+    Monetary values are reported costs or priced subtotals, never fabricated
+    prices for unknown models. Missing token facts remain explicit partials.
+    """
+    from .budgeting import usage_cost, usage_observation, normalized_cost, valid_token_counts
+    read_f = float(getattr(settings, "cache_read_price_factor", 0) or 0) or CACHE_READ_FACTOR
+    totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+              "cache_creation_tokens": 0, "usd": 0.0, "llm_calls": 0,
+              "unpriced_calls": 0, "not_sent_calls": 0, "usage_partial": False,
+              "usd_is_estimate": False}
+    actual = 0.0
+    actual_known = True
+    cache_inclusion = set()
+    by_role = {}
+    for rec in records:
+        result = rec.get("result") or {}
+        if result.get("native_call_sent") is False:
+            totals["not_sent_calls"] += 1
+            continue
+        identity = rec.get("model") or {}
+        model = str(identity.get("served_model") or identity.get("model") or "")
+        usage = usage_observation(rec.get("usage") or {})
+        cache_inclusion.add(usage.get("input_tokens_include_cache"))
+        if "cost_usd" not in usage and "cost_usd" in result:
+            usage["cost_usd"] = normalized_cost(result["cost_usd"])
+        tin, tout = usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
+        cread = usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens") or 0
+        ccreate = usage.get("cache_creation_input_tokens") or usage.get("cache_creation_tokens") or 0
+        totals["usage_partial"] |= (not valid_token_counts(usage.get("input_tokens"), usage.get("output_tokens"))
+                                    or result.get("native_outcome_pending") is True
+                                    or any(v is None for k, v in usage.items() if k.endswith("tokens")))
+        p_in, p_out = model_price(model, settings)
+        usd = usage_cost(usage, p_in, p_out, cache_read_factor=read_f, cache_create_factor=CACHE_CREATE_FACTOR) \
+            if "cost_usd" in usage or model_price_known(model, settings) else None
+        paid = normalized_cost(usage.get("cost_usd"))
+        actual_known &= paid is not None
+        actual += paid if paid is not None else 0.0
+        totals["input_tokens"] += tin
+        totals["output_tokens"] += tout
+        totals["cache_read_tokens"] += cread
+        totals["cache_creation_tokens"] += ccreate
+        totals["llm_calls"] += 1
+        if usd is None:
+            totals["unpriced_calls"] += 1
+            continue
+        totals["usd_is_estimate"] |= paid is None
+        totals["usd"] += usd
+        role = str(identity.get("role") or "agent")
+        r = by_role.setdefault(role, {"usd": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0})
+        r["usd"] += usd
+        r["input_tokens"] += tin
+        r["output_tokens"] += tout
+        r["calls"] += 1
+    totals["usd"] = round(totals["usd"], 6)
+    totals["actual_usd"] = round(actual, 6) if actual_known else None
+    totals["input_tokens_include_cache"] = next(iter(cache_inclusion)) if len(cache_inclusion) == 1 else None
+    totals["cost_partial"] = totals["unpriced_calls"] > 0 or totals["usage_partial"]
+    totals["by_role"] = {k: {**v, "usd": round(v["usd"], 6)} for k, v in by_role.items()}
+    return totals
+
+
+def cost_from_spans(trace_path: "Path", settings: "Settings | None" = None):
+    """Compatibility reader for runs with spans but no model_call records."""
     try:
         lines = Path(trace_path).read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
-    read_f = float(getattr(settings, "cache_read_price_factor", 0) or 0) \
-        or CACHE_READ_FACTOR
-    totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
-              "cache_creation_tokens": 0, "usd": 0.0, "llm_calls": 0,
-              "unpriced_calls": 0}
-    by_role: dict[str, dict] = {}
+    records = []
     for line in lines:
         try:
             rec = json.loads(line)
@@ -297,45 +347,78 @@ def cost_from_spans(trace_path: "Path", settings: "Settings | None" = None,
         if rec.get("name") != "llm":
             continue
         a = rec.get("attr") or {}
-        # price by the SERVED model when the span recorded one (plan v2) —
-        # the requested name is what we asked for, not what we were billed for
-        model = str(a.get("served_model") or a.get("model") or "")
-        if not model_price_known(model, settings):
-            # an unpriced call makes the total a lower bound, never a guess
-            totals["unpriced_calls"] += 1
-            totals["llm_calls"] += 1
-            totals["input_tokens"] += int(a.get("prompt_tokens") or 0)
-            totals["output_tokens"] += int(a.get("completion_tokens") or 0)
-            continue
-        p_in, p_out = model_price(model, settings)
-        tin = int(a.get("prompt_tokens") or 0)
-        tout = int(a.get("completion_tokens") or 0)
-        cread = int(a.get("cache_read_tokens") or 0)
-        ccreate = int(a.get("cache_creation_tokens") or 0)
-        usd = (tin / 1e6 * p_in + tout / 1e6 * p_out
-               + cread / 1e6 * p_in * read_f
-               + ccreate / 1e6 * p_in * CACHE_CREATE_FACTOR)
-        totals["input_tokens"] += tin
-        totals["output_tokens"] += tout
-        totals["cache_read_tokens"] += cread
-        totals["cache_creation_tokens"] += ccreate
-        totals["usd"] += usd
-        totals["llm_calls"] += 1
-        role = str(a.get("role") or "agent")
-        r = by_role.setdefault(role, {"usd": 0.0, "input_tokens": 0,
-                                      "output_tokens": 0, "calls": 0})
-        r["usd"] += usd
-        r["input_tokens"] += tin
-        r["output_tokens"] += tout
-        r["calls"] += 1
-    if not totals["llm_calls"]:
-        return None
-    totals["usd"] = round(totals["usd"], 6)
-    totals["cost_partial"] = totals["unpriced_calls"] > 0  # usd = lower bound
-    totals["by_role"] = {k: {**v, "usd": round(v["usd"], 6)}
-                         for k, v in by_role.items()}
-    totals["source"] = "spans"
-    return totals
+        usage = a["usage"] if "usage" in a else {
+            "input_tokens": a.get("prompt_tokens"), "output_tokens": a.get("completion_tokens"),
+            "cache_read_tokens": a.get("cache_read_tokens", 0),
+            "cache_creation_tokens": a.get("cache_creation_tokens", 0)}
+        records.append({"model": a, "usage": usage})
+    return {**_cost_from_model_calls(records, settings), "source": "spans"} if records else None
+
+
+def cost_from_records(run_dir: "Path", settings: "Settings | None" = None, *, events=None):
+    """Read canonical per-request records, including retained session stores.
+
+    Read the authoritative journals, not a capped or possibly stale index.
+    This is a pure projection: no call, settlement, receipt rewrite or repair.
+    """
+    from .execution_artifacts import model_call_trace_roots
+    from .trace_store import TraceStore
+    from .model_usage import model_usage_fact
+    records = {}
+    conflicts = set()
+    errors = []
+    run_dir = Path(run_dir)
+
+    def add(record):
+        if (record.get("context") or {}).get("run_id") != run_dir.name:
+            return
+        fact = model_usage_fact(record)
+        result = fact['result']
+        key = ("native", result["native_attempt_id"]) if result.get("native_attempt_id") else ("record", fact["id"])
+        comparable = {k: fact[k] for k in ("model", "usage", "result")}
+        if key in records and records[key] != comparable:
+            conflicts.add(key)
+        else:
+            records[key] = comparable
+
+    events = list(_trace_events(run_dir) if events is None else events)
+    starts = set()
+    ends = {}
+    emitted = {}
+    for event in events:
+        if event.get('kind') == 'model_call_usage':
+            try:
+                add(event['call'])
+                capture_id = event.get('capture_id')
+                emitted[capture_id] = emitted.get(capture_id, 0) + 1
+            except (ValueError, KeyError, TypeError):
+                errors.append({'error_type': 'invalid_usage_projection'})
+        elif event.get('kind') == 'model_usage_capture':
+            capture_id = event.get('capture_id')
+            if event.get('phase') == 'start':
+                starts.add(capture_id)
+            elif event.get('phase') == 'end':
+                ends[capture_id] = event
+    capture_incomplete = any(
+        key not in starts or key not in ends or ends[key].get('errors') or
+        ends[key].get('saved') != ends[key].get('observed') or
+        emitted.get(key, 0) != ends[key].get('saved')
+        for key in starts | emitted.keys() | ends.keys())
+    for root in model_call_trace_roots(run_dir, getattr(settings, "trace_store_root", None)):
+        try:
+            for record, _ in TraceStore(root).iter_records(kind="model_call"):
+                add(record)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            errors.append({"root": str(root), "error_type": type(exc).__name__})
+    if not records and not errors and not capture_incomplete:
+        return None  # a legacy run or a client without capture: explicit fallback
+    for key in conflicts:
+        records[key] = {"model": {}, "usage": {}, "result": {"cost_usd": None}}
+    totals = _cost_from_model_calls(records.values(), settings)
+    if conflicts or errors or capture_incomplete:
+        totals.update(cost_partial=True, usage_partial=True, actual_usd=None)
+    return {**totals, "source": "model_calls", "conflicting_calls": len(conflicts),
+            "record_read_errors": errors, "usage_capture_incomplete": bool(capture_incomplete)}
 
 
 def _phase_timings(events: Iterable[dict]) -> dict:
@@ -482,11 +565,18 @@ def collect_run_metrics(run_dir: Path, settings: "Settings",
                          "monitor_wall" if ci_minutes is not None
                          and durable["ci_builds"] else "none")
     ci_time_partial = bool(durable["ci_minutes_partial"])
-    # ONE canonical cost source (W7): per-request llm spans when the trace
-    # exists (each span priced by its own model + cache fields); the event
-    # sum is the tagged fallback ONLY when no trace — never both
-    span_cost = cost_from_spans(run_dir / "trace.jsonl", settings)
-    _, _, declared_tool_calls = usage_from_events(events)
+    # Per-request records are authoritative. Old spans/events only adapt runs
+    # without those records; never add overlapping views of the same calls.
+    span_cost = cost_from_records(run_dir, settings, events=events)
+    if span_cost is None:
+        span_cost = cost_from_spans(run_dir / "trace.jsonl", settings)
+    legacy_in, legacy_out, declared_tool_calls = usage_from_events(events)
+    if span_cost is not None and span_cost["source"] == "model_calls" and (
+            legacy_in > span_cost["input_tokens"] or legacy_out > span_cost["output_tokens"]):
+        # A capture gap or duplicate legacy aggregate cannot be resolved by
+        # guessing. Retain the canonical subtotal and make uncertainty visible.
+        span_cost.update(cost_partial=True, usage_partial=True, actual_usd=None,
+                         legacy_usage_exceeds_records=True)
     explicit_tool_calls = sum(1 for ev in events
                               if ev.get("kind") == "tool_call")
     tool_calls = max(declared_tool_calls, explicit_tool_calls)
@@ -495,7 +585,7 @@ def collect_run_metrics(run_dir: Path, settings: "Settings",
         tokens_out = span_cost["output_tokens"]
         usd = (span_cost["usd"]
                + (ci_minutes or 0.0) * settings.ci_rate_usd_per_min)
-        cost_source = "spans"
+        cost_source = span_cost["source"]
     else:
         tokens_in, tokens_out, _ = usage_from_events(events)
         usd = estimate_usd(tokens_in, tokens_out, ci_minutes or 0.0, settings)
@@ -551,6 +641,16 @@ def collect_run_metrics(run_dir: Path, settings: "Settings",
             "min_ref": min_ref,
             "cost_index": round(c, 4) if c is not None else None,
             "cost_partial": cost_partial,
+            "usage_partial": (span_cost or {}).get("usage_partial", usage_missing),
+            "actual_model_usd": (span_cost or {}).get("actual_usd"),
+            "actual_usd": ((span_cost or {}).get("actual_usd")
+                           if not ci_time_partial and not (ci_minutes or 0) else None),
+            "usd_is_estimate": (span_cost or {}).get("usd_is_estimate", True) or bool(ci_minutes),
+            "legacy_usage_exceeds_records": (span_cost or {}).get("legacy_usage_exceeds_records", False),
+            "record_read_error_count": len((span_cost or {}).get("record_read_errors", [])),
+            "conflicting_calls": (span_cost or {}).get("conflicting_calls", 0),
+            "usage_capture_incomplete": (span_cost or {}).get("usage_capture_incomplete", False),
+            "input_tokens_include_cache": (span_cost or {}).get("input_tokens_include_cache"),
             "unpriced_calls": (span_cost or {}).get("unpriced_calls", 0),
             "source": cost_source,
             "llm_calls": ((span_cost or {}).get("llm_calls")

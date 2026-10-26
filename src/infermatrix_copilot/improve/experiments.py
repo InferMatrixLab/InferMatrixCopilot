@@ -33,7 +33,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import uuid
@@ -42,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..trace_store import TraceStore, current_store, file_lock
+from ..process_execution import run_command
 from . import stats
 from .adapters import load_adapter, scores_from
 from .budget import BudgetRefused, Governor
@@ -288,7 +288,7 @@ def register(store: TraceStore, settings: Any, ledger_dir: str | Path, *, workfl
     n_required = stats.items_required(sd_item, min_effect)
     n_available = len(items)
     if cost_per_unit_usd is None:
-        cost_per_unit_usd = _median_unit_usd(ledger_dir, workflow) or 0.5
+        cost_per_unit_usd = _planning_unit_usd(ledger_dir, workflow)
     cost = round(n_available * replicates * 2 * float(cost_per_unit_usd), 4)
     reserved = False
     experiment_id = f"exp-{int(now)}-{uuid.uuid4().hex[:6]}"
@@ -343,8 +343,14 @@ def _median_unit_usd(ledger_dir: Path, workflow: str) -> float | None:
     from .ledger import Ledger
 
     wl = Ledger(ledger_dir).load(workflow)
-    samples = [float(x) for x in (wl.baseline.get("usd") or []) if x]
+    key = 'planning_usd' if 'planning_usd' in wl.baseline else 'usd'
+    samples = [float(x) for x in (wl.baseline.get(key) or []) if x is not None and (key != 'usd' or x)]
     return statistics.median(samples) if samples else None
+
+
+def _planning_unit_usd(ledger_dir: Path, workflow: str) -> float:
+    cost = _median_unit_usd(ledger_dir, workflow)
+    return .5 if cost is None else cost
 
 
 def _adapter_kwargs(settings: Any, decl: WorkflowDeclaration) -> dict:
@@ -366,6 +372,12 @@ def _meta_dir(settings: Any) -> Path:
 RunUnit = Callable[..., dict]
 
 
+def _run_shadow_unit(argv, *, shadow_dir, child_env, timeout):
+    proc = run_command(argv, cwd=str(shadow_dir), env=child_env, timeout=timeout)
+    return {"rc": proc.returncode, "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:],
+            "tag": child_env.get("IMPROVE_UNIT_TAG", "")}
+
+
 def default_run_unit(*, side: str, item: str, replicate: int, env: dict, snapshot_path: Path, shadow_dir: Path,
                      run_root: Path, playbook: str, repo: str, pr: int, timeout: int = 3600) -> dict:
     """Run one shadow unit: the copilot as a subprocess in the shadow
@@ -374,9 +386,7 @@ def default_run_unit(*, side: str, item: str, replicate: int, env: dict, snapsho
     argv = [sys.executable, "-m", "infermatrix_copilot", "--yes", "--playbook", playbook,
             "--task-param", f"repo={repo}", "--task-param", f"pr={pr}"]
     child_env = {**env, "PR_SNAPSHOT_FILE": str(snapshot_path), "RUN_ROOT": str(run_root)}
-    proc = subprocess.run(argv, cwd=str(shadow_dir), env=child_env, capture_output=True, text=True, timeout=timeout)
-    return {"rc": proc.returncode, "stdout": (proc.stdout or "")[-2000:], "stderr": (proc.stderr or "")[-2000:],
-            "tag": env.get("IMPROVE_UNIT_TAG", "")}
+    return _run_shadow_unit(argv, shadow_dir=shadow_dir, child_env=child_env, timeout=timeout)
 
 
 def run(store: TraceStore, settings: Any, ledger_dir: str | Path, experiment_id: str, *, run_unit: RunUnit | None = None,
@@ -445,9 +455,7 @@ def meta_run_unit(*, side: str, item: str, replicate: int, env: dict, snapshot_p
     reading only the staged copy through IMPROVE_META_DIR."""
     argv = meta_argv(playbook, repo, item[len("meta:"):])
     child_env = {**env, "IMPROVE_META_DIR": str(Path(shadow_dir) / "meta"), "RUN_ROOT": str(run_root)}
-    proc = subprocess.run(argv, cwd=str(shadow_dir), env=child_env, capture_output=True, text=True, timeout=timeout)
-    return {"rc": proc.returncode, "stdout": (proc.stdout or "")[-2000:], "stderr": (proc.stderr or "")[-2000:],
-            "tag": env.get("IMPROVE_UNIT_TAG", "")}
+    return _run_shadow_unit(argv, shadow_dir=shadow_dir, child_env=child_env, timeout=timeout)
 
 
 def _meta_stage(settings, item: str, *, shadow_root: Path, run_dir: Path) -> dict:
@@ -531,9 +539,11 @@ def _run_locked(store, settings, ledger_dir: Path, exp: Experiment, *, run_unit,
     units_by_key: dict[str, str] = {}
     produced: dict[str, dict[str, dict[int, Unit]]] = {}     # item -> side -> replicate -> unit
     input_limits = getattr(governor.settings, "improve_input_context_limits", {}) or {}
+    native_limits = getattr(governor.settings, 'improve_native_call_limits', {}) or {}
     budget_env = {"IMPROVE_LEDGER_DIR": str(governor.dir.parent), "IMPROVE_BUDGET_USD_WEEK": str(governor.usd_week),
                   "IMPROVE_BUDGET_JUDGE_CALLS_WEEK": str(governor.judge_calls_week),
-                  "IMPROVE_INPUT_CONTEXT_LIMITS": json.dumps(input_limits, sort_keys=True)}
+                  "IMPROVE_INPUT_CONTEXT_LIMITS": json.dumps(input_limits, sort_keys=True),
+                  'IMPROVE_NATIVE_CALL_LIMITS': json.dumps(native_limits, sort_keys=True)}
     for item, snap in staged.items():
         repo, pr = snap["repo"], int(snap["pr"])
         for side, overrides, expected_fp in (("arm", exp.arm_overrides, exp.arm_fingerprint),
@@ -541,7 +551,7 @@ def _run_locked(store, settings, ledger_dir: Path, exp: Experiment, *, run_unit,
             env = shadow_env(shadow_dir=snap["shadow_dir"], run_dir=run_root, trace_root=shadow_store.root,
                              executables_dir=exe_dir, repo_name=repo, ledger_dir=governor.dir.parent,
                              usd_week=governor.usd_week, judge_calls_week=governor.judge_calls_week,
-                             input_context_limits=input_limits)
+                             input_context_limits=input_limits, native_call_limits=native_limits)
             env.update({k: str(v) for k, v in overrides.items()})
             problems = assert_boundaries(env, expected=budget_env)
             if problems:

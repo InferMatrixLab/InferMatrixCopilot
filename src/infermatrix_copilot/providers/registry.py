@@ -10,7 +10,25 @@ report "not yet shipped" instead of a run failing mid-flight.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from .base import HarnessTransport, ProviderSpec
+
+_TRANSPORT_POLICY = ContextVar('transport_policy', default=None)
+
+
+@contextmanager
+def bind_transport_policy(prepare):
+    """Trusted application composition may bind context to canonical adapters.
+
+    No workflow, quota or vendor policy lives in this registry. Context-local
+    binding follows asyncio tasks/to_thread and restores nested compositions.
+    """
+    token = _TRANSPORT_POLICY.set(prepare)
+    try:
+        yield
+    finally:
+        _TRANSPORT_POLICY.reset(token)
 
 PROVIDERS: dict[str, ProviderSpec] = {
     p.id: p for p in (
@@ -21,11 +39,14 @@ PROVIDERS: dict[str, ProviderSpec] = {
             id="cursor", kind="harness",
             display="Cursor subscription via cursor-agent CLI",
             cli_names=("cursor-agent",),
+            execution_modes=("direct", "strict"),
+            readiness_args=("status",),
             capabilities=frozenset({"mcp_tools", "usage_reporting"})),
         ProviderSpec(
             id="claude-code", kind="harness",
             display="Claude subscription via claude CLI",
             cli_names=("claude",),
+            readiness_args=("auth", "status"),
             capabilities=frozenset({
                 "mcp_tools", "builtin_tools_off", "max_turns",
                 "system_prompt", "usage_reporting", "cost_reporting"})),
@@ -33,8 +54,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
             id="codex", kind="harness",
             display="ChatGPT subscription via codex CLI",
             cli_names=("codex",),
+            execution_modes=("direct", "strict"),
+            readiness_args=("login", "status"),
             capabilities=frozenset({
-                "mcp_tools", "sandbox_read_only", "usage_reporting"})),
+                "mcp_tools", "sandbox_read_only", "usage_reporting", "sandbox_completion", "sandbox_session", "session_schema", "native_credentials"})),
         # The one API-KEYED harness: dsh is driven through its Python SDK
         # (no PATH binary — the bundled runtime ships in the wheel) and needs
         # a DeepSeek credential, unlike the three subscription CLIs above.
@@ -42,13 +65,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         # ⇒ the vendor holds the credential" (see providers/deepseek.py).
         # NOTE: no `mcp_tools`. The bundled dsh runtime compiles in 122 plugins
         # and `@deepseek-ai/dsh-mcp-client` is not among them, so our tool
-        # bridge is unreachable and sessions run on the harness's native bash
-        # (providers/deepseek.py traces a `review.mcp_tool_bridge`
-        # capability_gap and reports mcp_bridged=False). Declaring the flag
-        # here claimed a capability the transport measurably does not have —
-        # and `base.ProviderSpec` defines these as "flags the integration can
-        # rely on". Nothing branches on it today, which is exactly why the
-        # false claim survived: it only ever misled readers.
+        # bridge is unreachable. Requests for that capability are rejected
+        # before dispatch; explicit native-tool sessions remain supported.
         # `default_model`: dsh has no built-in default — constructing it with
         # an empty model kills every turn with "has no provider/model", so an
         # unset STRICT_BACKEND_MODEL must resolve to something here rather
@@ -71,7 +89,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             display="Z.AI (GLM) subscription via zcode CLI",
             cli_names=("zcode",),
             capabilities=frozenset({
-                "mcp_tools", "builtin_tools_off", "usage_reporting"})),
+                "mcp_tools", "builtin_tools_off", "usage_reporting", "sandbox_completion", "completion_worker", "native_credentials"})),
     )
 }
 
@@ -100,14 +118,37 @@ def transport_for(settings) -> HarnessTransport:
     return transport_for_id(settings, resolve_provider(settings).id)
 
 
-def transport_for_id(settings, provider_id: str) -> HarnessTransport:
+def transport_for_id(settings, provider_id: str, *, completion_profile=None) -> HarnessTransport:
+    """Construct one canonical adapter and apply the bound host preparation."""
+    transport = _construct_transport(settings, provider_id, completion_profile=completion_profile)
+    prepare = _TRANSPORT_POLICY.get()
+    if prepare is None:
+        return transport
+    adapter_type = type(transport)
+    prepared = prepare(transport)
+    if type(prepared) is not adapter_type or prepared.spec is not PROVIDERS[provider_id]:
+        raise ValueError('application policy cannot replace the selected provider')
+    return prepared
+
+
+def _construct_transport(settings, provider_id: str, *, completion_profile=None) -> HarnessTransport:
     """The harness transport for an EXPLICIT provider id, independent of the
     run's `STRICT_BACKEND` selection — the seam MoA harness members use to
     ride a harness inside an api-backed run."""
+    if completion_profile is not None:
+        from ..sandbox import SandboxCompletionProfile
+
+        if (provider_id not in PROVIDERS or 'sandbox_completion' not in PROVIDERS[provider_id].capabilities
+                or not isinstance(completion_profile, SandboxCompletionProfile)):
+            raise ValueError('unsupported provider completion execution profile')
+        completion_profile.validate(for_dispatch=False)
     spec = PROVIDERS.get(provider_id)
     if spec is None:
         raise ValueError(f"unknown provider {provider_id!r} — one of: "
                          + ", ".join(sorted(PROVIDERS)))
+    if settings is not None:
+        from .provider_options import configured_settings
+        settings = configured_settings(settings, provider_id)
     if spec.kind != "harness":
         raise ValueError("provider 'api' is not a harness — resolution stays "
                          "with Settings.tier_target/llm.LLM")
@@ -131,7 +172,11 @@ def transport_for_id(settings, provider_id: str) -> HarnessTransport:
     if spec.id == "zcode":
         from .zcode import ZCodeTransport
 
-        return ZCodeTransport(settings)
+        transport = ZCodeTransport(settings)
+        transport.completion_profile = completion_profile
+        return transport
     from .codex import CodexTransport
 
-    return CodexTransport(settings)
+    transport = CodexTransport(settings)
+    transport.completion_profile = completion_profile
+    return transport

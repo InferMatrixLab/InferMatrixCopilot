@@ -13,7 +13,7 @@ from infermatrix_copilot.kb_service.models import ModelUnavailable
 from infermatrix_copilot.llm import Block, Reply
 
 from test_kb_feature_discovery import PIN, candidate, index, reply
-from test_kb_feature_discovery_stage import NativeScript, _setup, _run, _report, _policy
+from test_kb_feature_discovery_stage import NativeScript, _setup, _run, _report, _policy, _save_legacy_record
 from test_kb_init_skeleton import world  # noqa: F401
 
 
@@ -219,7 +219,7 @@ def test_legacy_unpublished_preview_reuses_all_scan_and_primary_records(world):
     path = Path(previous.pr['dry_run_dir']) / 'tree' / previous.discovery['report_path']
     path.write_text(text)
     previous.discovery.update(full_artifact=artifact, report_sha256=hashlib.sha256(text.encode()).hexdigest())
-    previous.save(rt.state_dir)
+    _save_legacy_record(rt, previous)
     current = _run(rt, lifecycle)
     assert current.status == 'dry_run', current.problems
     assert current.discovery['tasks'] == original_tasks and current.discovery['reviews'] == original_reviews

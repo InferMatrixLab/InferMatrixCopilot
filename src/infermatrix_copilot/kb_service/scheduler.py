@@ -180,10 +180,9 @@ class Scheduler:
             self._record("*", "hold_settlement_error", error=repr(exc))
 
         try:
-            from .maintenance import advance_corrections, tick
-            for event in advance_corrections(rt):
-                self._record("*", "correction", **event)
-            report = tick(rt)  # persisted Shanghai slot; independent of releases
+            from .maintenance import run_due
+            result = run_due(rt, on_correction=lambda event: self._record("*", "correction", **event))
+            report = result["maintenance"]  # persisted Shanghai slot; independent of releases
             if report is not None:
                 self._record("*", "maintenance", **report)
         except Exception as exc:

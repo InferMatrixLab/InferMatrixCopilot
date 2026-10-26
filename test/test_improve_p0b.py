@@ -17,6 +17,7 @@ import pytest
 
 from infermatrix_copilot import tools
 from infermatrix_copilot.improve import shadow
+from infermatrix_copilot.improve.execution import shadow_agent_policy
 from infermatrix_copilot.scopes import READ_TOOLS, read_only_scope, shadow_scope
 from infermatrix_copilot.tools import ToolDef
 
@@ -155,7 +156,7 @@ def test_shadow_env_is_an_allowlist_with_a_one_off_path(tmp_path, monkeypatch):
 # -- layer 2: the executor refuses non-read steps ------------------------------------
 
 def test_executor_refuses_non_read_steps_under_shadow(tmp_path, settings):
-    from infermatrix_copilot.engine.executor import Executor
+    from execution_helpers import application_executor as Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     from infermatrix_copilot.engine.step import StepResult, StepSpec
     from infermatrix_copilot.playbooks.store import Playbook, PlaybookStep
@@ -286,18 +287,13 @@ def test_shadow_repo_map_never_indexes_through_a_symlink_and_skill_usage_is_not_
     ctx = SimpleNamespace(settings=settings.model_copy(update={"improve_shadow": True}),
                           state={"repo_path": str(clone), "task_spec": {"repo": "demo"}},
                           run_dir=tmp_path / "run", trace=SimpleNamespace(record=lambda *a, **k: None))
+    ctx.agent_policy = shadow_agent_policy()
     tool = k._repo_map_tool(ctx, None)
     rendered = tool["repo_map"].handler(query="symbol")
     assert "inside_symbol" in rendered and "leaked_host_symbol" not in rendered and "leak.py" not in rendered
     cache = list((tmp_path / "run" / "repo_map").glob("index-*-fenced.json"))
     assert cache and "leak.py" not in cache[0].read_text()
 
-    # skill usage: touch() is skipped under shadow (the production metadata/journal never change)
-    touched: list[str] = []
-    store = SimpleNamespace(touch=lambda name: touched.append(name))
-    monkeypatch.setattr(r, "_retrieve_skills", lambda ctx, query: ([{"name": "s1"}, {"name": "s2"}], store))
-    src = Path(r.__file__).read_text()
-    assert "and not shadow_run" in src and 'shadow_run = bool(getattr(ctx.settings, "improve_shadow", False))' in src
 
 
 def test_shadow_scope_smoke_and_repo_map_cache_stays_out_of_knowledge(tmp_path, settings):
@@ -323,6 +319,7 @@ def test_shadow_scope_smoke_and_repo_map_cache_stays_out_of_knowledge(tmp_path, 
     ctx = SimpleNamespace(settings=settings.model_copy(update={"improve_shadow": True, "knowledge_dir": knowledge}),
                           state={"repo_path": str(dest), "task_spec": {"repo": "demo"}}, run_dir=run_dir,
                           trace=SimpleNamespace(record=lambda *a, **k: None))
+    ctx.agent_policy = shadow_agent_policy()
     tool = _repo_map_tool(ctx, adapter)
     if tool:
         tool["repo_map"].handler(query="a")

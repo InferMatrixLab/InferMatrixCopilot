@@ -9,6 +9,7 @@ their status, operations and decisions.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import time
@@ -52,7 +53,7 @@ class KbRuntime:
 
     @classmethod
     def from_env(cls, settings, *, state_dir: Path | None = None, sync_repos: bool = True) -> "KbRuntime":
-        from ..sdk._resources import adapters_root
+        from ..resources import adapters_root
         from .cli import DEFAULT_STATE_DIR
 
         state_dir = Path(state_dir or os.environ.get("KB_STATE_DIR") or DEFAULT_STATE_DIR).expanduser()
@@ -122,29 +123,8 @@ def trace_recorder(traces):
     """Every model call (inputs, outputs, usage, failure) as a trace/1
     ``model_call`` record, under the caller's bound trace context."""
 
-    def record(entry: dict) -> dict | None:
-        try:
-            return traces.append(
-                "model_call",
-                inputs={"system": entry["system"], "prompt": entry["prompt"]},
-                outputs={"reply": entry["reply"],
-                         **({"native_events": entry["native_events"]} if "native_events" in entry else {})},
-                model={**{k: entry.get(k, "") for k in ("role", "provider", "model", "effort", "served_model")},
-                       **({"native_reasoning_level": entry["native_reasoning_level"]} if "native_reasoning_level" in entry else {})},
-                usage=entry.get("usage") or {}, seconds=entry.get("seconds"),
-                # spend: the requested stop threshold and the reported cost
-                # (None when unset/unknown), on failures too
-                result={"stop_reason": entry.get("stop_reason", ""),
-                        "max_budget_usd": entry.get("max_budget_usd"),
-                        "cost_usd": entry.get("cost_usd"),
-                        **({k: entry[k] for k in ("native_attempt_id", "native_session_ids") if k in entry}),
-                        **({"fallback_from": entry["fallback_from"]} if entry.get("fallback_from") else {})},
-                error=entry.get("error", ""))
-        except Exception:  # noqa: BLE001 - tracing never breaks a model call
-            pass
-
-    record.begin_call = traces.begin_call
-    return record
+    from ..trace_store import NativeCompletionRecorder
+    return NativeCompletionRecorder(traces)
 
 
 # -- intake ------------------------------------------------------------------------
@@ -242,7 +222,16 @@ def _run_intake_locked(rt: KbRuntime, lifecycle: RepoLifecycle, *, max_events: i
     from ..trace_store import accepted_key, trace_context
 
     accepted: dict[int, str] = {}  # event -> the accepted generator call's key
+    draft_attempts = {}
     for event in events:
+        try:
+            previous = json.loads(event['detail'])
+        except (ValueError, TypeError):
+            previous = {}
+        attempt = previous.get('draft_attempt', 0) if isinstance(previous, dict) else 0
+        if type(attempt) is not int or attempt < 0:
+            raise ValueError('invalid intake draft attempt')
+        draft_attempts[event['id']] = attempt
         rt.ledger.heartbeat(owner)  # model calls are slow; keep the lease live
         try:
             # the change set does not exist yet: the draft key and the accepted
@@ -252,10 +241,19 @@ def _run_intake_locked(rt: KbRuntime, lifecycle: RepoLifecycle, *, max_events: i
             from ..config import Settings
             from ..improve.artifacts import runtime_settings
             draft_settings = runtime_settings(getattr(rt, "settings", None) or Settings(), "kb-intake.draft")
-            with trace_context(draft_key=key, _accepted=holder, step="draft"):
+            from .intake import checkpoint_draft
+            from ..improve import objectives
+            evolved = bool(objectives.enabled(draft_settings) and draft_settings.improve_enabled
+                           and draft_settings.improve_evolve_enabled and rt.traces is not None)
+            active_release = None
+            if evolved:
+                from ..improve.runtime import registry
+                registry_path = registry(draft_settings)
+                active_release = hashlib.sha256(registry_path.read_bytes()).hexdigest() if registry_path.exists() else None
+            def generate_event():
                 from ..improve import objectives
                 prediction = None
-                if objectives.enabled(draft_settings) and draft_settings.improve_enabled and draft_settings.improve_evolve_enabled and rt.traces is not None:
+                if evolved:
                     from ..improve.runtime import active, execute
                     payload = {"repo": lifecycle.repo, "repo_dir": lifecycle.knowledge_dir, "event_id": event["id"],
                                "evidence": event["payload"], "files": base, "release": release, "today": today,
@@ -280,32 +278,55 @@ def _run_intake_locked(rt: KbRuntime, lifecycle: RepoLifecycle, *, max_events: i
                         try:
                             prediction = execute(draft_settings, rt.traces, "kb-intake.draft", payload, LLM(draft_settings))
                         except Exception as exc:
-                            raise ModelUnavailable("autonomous draft rolled back: " + str(exc)) from exc
+                            error = ModelUnavailable("autonomous draft rolled back: " + str(exc), allow_fallback=False)
+                            # The execution boundary may fail after dispatch. Missing
+                            # native facts cannot prove that another call is safe.
+                            from ..budgeting import copy_native_outcome
+                            raise copy_native_outcome(error, exc, assume_sent=True) from exc
                 if prediction is not None:
                     from .intake import Draft
                     from ..knowledge_service.ops import KnowledgeOperation
-                    drafts.append(Draft(event_ids=[event["id"]], operations=[KnowledgeOperation.from_dict(o) for o in prediction["operations"]],
-                                        result=None, rationale=prediction.get("rationale", ""), rejected=prediction.get("rejected", False)))
+                    return Draft(event_ids=[event["id"]], operations=[KnowledgeOperation.from_dict(o) for o in prediction["operations"]],
+                                        result=None, rationale=prediction.get("rationale", ""), rejected=prediction.get("rejected", False))
                 else:
-                    drafts.append(draft_changes(
+                    return draft_changes(
                         repo=lifecycle.repo, repo_dir=lifecycle.knowledge_dir, event_id=event["id"],
                         evidence=event["payload"], files=base, gateway=rt.gateway,
                         generator=rt.generator, release=release, today=today,
-                        max_operations=max(1, min(6, draft_settings.kb_draft_max_operations))))
-            if accepted_key(key, holder):
-                accepted[event["id"]] = accepted_key(key, holder)
+                        max_operations=max(1, min(6, draft_settings.kb_draft_max_operations)))
+            with trace_context(draft_key=key, _accepted=holder, step="draft"):
+                draft, draft_trace = checkpoint_draft(rt.ledger, owner,
+                    unit_key=f"intake:{event['id']}:{attempt}", base_sha=base_sha,
+                    accepted_trace=lambda: accepted_key(key, holder), generate=generate_event,
+                    repo=lifecycle.repo, repo_dir=lifecycle.knowledge_dir, event_id=event['id'],
+                    evidence=event['payload'], files=base, external_texts=external,
+                    generator=rt.generator, release=release, today=today,
+                    max_operations=max(1, min(6, draft_settings.kb_draft_max_operations)),
+                    execution_binding={"settings_sha256": hashlib.sha256(draft_settings.model_dump_json().encode()).hexdigest(),
+                                       "evolved": evolved, "active_release": active_release})
+            drafts.append(draft)
+            if draft_trace:
+                accepted[event["id"]] = draft_trace
         except ModelUnavailable as exc:
+            from ..budgeting import native_outcome_unknown
+
             # fenced: if this worker lost its lease meanwhile, the new holder may
             # already have staged the event; an unfenced reset would undo that
-            rt.ledger.set_event_statuses(owner, [(event["id"], "pending", f"generator unavailable: {exc}")])
+            status = "draft_unknown" if native_outcome_unknown(exc) else "pending"
+            rt.ledger.set_event_statuses(owner, [(event["id"], status,
+                json.dumps({'draft_attempt': attempt, 'error': f"generator unavailable: {exc}"}))])
             return None  # no weaker fallback; wait for the pinned model
     operations, result, kept, conflicting = merge_drafts(base, drafts, release=release, today=today)
     kept_ids = {i for d in kept for i in d.event_ids}
     updates = []
     for draft in drafts:
         for event_id in draft.event_ids:
-            if event_id in kept_ids or draft in conflicting:
-                continue  # kept: staged below; conflicting: stays pending, redrafted later
+            if event_id in kept_ids:
+                continue  # staged below
+            if draft in conflicting:
+                updates.append((event_id, 'pending', json.dumps({
+                    'draft_attempt': draft_attempts[event_id] + 1, 'reason': 'completed draft conflicts with batch'})))
+                continue  # known conflict explicitly authorizes the next business attempt
             if draft.rejected:
                 updates.append((event_id, "rejected", json.dumps(draft.attempts, ensure_ascii=False)[:2000]))
             else:
@@ -332,6 +353,23 @@ def draft_key_for_event(repo: str, event_id) -> str:
     return f"event:{repo}:{event_id}:{uuid.uuid4().hex[:8]}"
 
 
+def require_settled_reviews(rt, repo: str, *, kinds, binding=None):
+    """Admission only: an unresolved gate cannot authorize replacement work.
+
+    Legacy intents missing a requested binding remain conservative blockers.
+    Only an explicit reconciliation of the existing row may clear this state.
+    """
+    for pending in rt.ledger.changesets(repo, ('review_pending',)):
+        if pending['kind'] not in kinds:
+            continue
+        detail = pending.get('detail') or {}
+        if any(key in detail and detail[key] != value for key, value in (binding or {}).items()):
+            continue
+        raise ModelUnavailable(
+            f"review {pending['id']} remains pending; reconcile original dispatch before replacement work",
+            allow_fallback=False)
+
+
 def gate_and_stage(rt: KbRuntime, lifecycle: RepoLifecycle, owner: str, *, kind: str, base: dict,
                    base_sha: str, external: dict, operations, result, evidence: list[dict],
                    event_ids: list[int], release: str, force_human: str = "",
@@ -347,6 +385,28 @@ def gate_and_stage(rt: KbRuntime, lifecycle: RepoLifecycle, owner: str, *, kind:
     changeset_id = rt.ledger.new_changeset_id(lifecycle.repo, kind)
     rule_ids = sorted({op.new_rule_id or op.rule_id for op in operations if (op.new_rule_id or op.rule_id)})
     observer = rt.upstream_facts(lifecycle)  # one mirror sync for facts and evidence
+    detail = {
+        "operations": operations_json(operations), "event_ids": event_ids,
+        **(extra_detail or {}), "base_sha": base_sha, "release": release,
+        "generator": (extra_detail or {}).get("generator") or rt.generator.label(),
+        "judge": rt.judge.label(),
+    }
+    rt.save_changeset_files(changeset_id, {"base_sha": base_sha, "files": result.files,
+                                         "deleted": [], "evidence": evidence})
+    # Consume the events and retain the exact draft before any gate dispatch.
+    # A crash or lost response keeps this intent; the poller cannot redraft it.
+    try:
+        rt.ledger.stage_intake(owner, lifecycle.repo, changeset_id, kind=kind,
+            status="review_pending", verdicts=[], human_reason="", drafted_events=event_ids,
+            detail=detail)
+    except Exception:
+        try:
+            rt.ledger.changeset(changeset_id)
+        except KeyError:
+            rt.changeset_path(changeset_id).unlink(missing_ok=True)
+        raise
+    intent = rt.ledger.changeset(changeset_id)
+    draft_sha256 = hashlib.sha256(rt.changeset_path(changeset_id).read_bytes()).hexdigest()
     with trace_context(changeset_id=changeset_id, rule_ids=rule_ids, step="gate"):
         decision = run_gate(
             base=base, head=head, changes=changes_between(base, head), external_texts=external,
@@ -363,23 +423,35 @@ def gate_and_stage(rt: KbRuntime, lifecycle: RepoLifecycle, owner: str, *, kind:
     verdicts = [{"layer": "L2", "verdict": b.verdict, "block_id": b.block.block_id,
                  "model": b.model, "detail": b.to_dict()} for b in decision.blocks]
     verdicts.append({"layer": "gate", "verdict": decision.status, "detail": {"reasons": decision.reasons}})
-    rt.save_changeset_files(changeset_id, {"base_sha": base_sha, "files": result.files,
-                                           "deleted": [], "evidence": evidence})
-    try:
-        rt.ledger.stage_intake(
-            owner, lifecycle.repo, changeset_id, kind=kind, status=status, verdicts=verdicts,
-            human_reason="; ".join(decision.reasons) if decision.status == "human" else "",
-            drafted_events=event_ids,
-            detail={
-                "operations": operations_json(operations), "event_ids": event_ids,
-                **(extra_detail or {}),
-                "base_sha": base_sha, "release": release, "decision": decision.to_dict(),
-                "generator": (extra_detail or {}).get("generator") or rt.generator.label(),
-                "judge": rt.judge.label(),
-            })
-    except Exception:
-        rt.changeset_path(changeset_id).unlink(missing_ok=True)
-        raise
+    settlement = dict(kind=kind, status=status, verdicts=verdicts,
+        human_reason="; ".join(decision.reasons) if decision.status == "human" else "",
+        drafted_events=event_ids, expected_status="review_pending",
+        detail={**detail, "decision": decision.to_dict()})
+    # Persist the completed result before attempting the ledger transaction.
+    # A failed transaction must not erase the only copy of paid review work.
+    # Keep the original intent pending on failure: workflow cursors and companion
+    # work must be reconciled before admitting another execution.
+    from ..persistence import fsync_directory, immutable_write_bytes
+    from .companion import needs_companion, prepare_companion, publish_companion
+    from .gate_receipts import settle_gate_result
+
+    companion_required = bool(needs_companion(decision) and kind not in {"correction", "maintenance_calibration"}
+                              and not hold and not force_human and operations)
+    companion = (prepare_companion(rt.ledger.new_changeset_id(lifecycle.repo, "companion"),
+                                  changeset_id, operations, decision, external, base_sha)
+                 if companion_required else None)
+
+    receipt = {"version": 1, "changeset_id": changeset_id,
+               "repo": lifecycle.repo, "kind": kind, "generation": intent["generation"],
+               "intent_detail": intent["detail"],
+               "draft_sha256": draft_sha256,
+               "settlement": settlement, "companion_required": companion_required, "companion": companion}
+    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    receipt_dir = rt.state_dir / "gate-results"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    fsync_directory(rt.state_dir)
+    immutable_write_bytes(receipt_dir / f"{changeset_id}.json", receipt_bytes)
+    settle_gate_result(rt.ledger, rt.state_dir, owner, changeset_id)
     rt.trace("decision", context={"changeset_id": changeset_id, "rule_ids": rule_ids, "step": "gate",
                                   "draft_keys": list(draft_keys)},
              model={"role": "judge", "model": rt.judge.label()},
@@ -389,12 +461,10 @@ def gate_and_stage(rt: KbRuntime, lifecycle: RepoLifecycle, owner: str, *, kind:
                      "consistency": [{"owner_dir": c["owner_dir"], "verdict": c["verdict"]}
                                      for c in decision.consistency],
                      "l1_issues": [i.to_dict() for i in decision.l1.issues]})
-    from .companion import needs_companion, stage_companion
-
-    if needs_companion(decision) and kind not in {"correction", "maintenance_calibration"} and not hold and not force_human and operations:
+    if companion:
         # the change is fine except for citations outside knowledge/: draft the
         # companion PR that updates them; this change waits for it
-        stage_companion(rt, lifecycle, owner, changeset_id, operations, decision, external, base_sha)
+        publish_companion(rt, lifecycle, companion["id"])
     return changeset_id
 
 
@@ -417,7 +487,7 @@ def publish(rt: KbRuntime, lifecycle: RepoLifecycle, changeset_id: str) -> str:
         rt.ledger.update_changeset(changeset_id, status="shadow_recorded")
         return "shadow_recorded"
     if changeset["kind"] == "correction":
-        from .maintenance import correction_publishable
+        from .maintenance_policy import correction_publishable
         reason = correction_publishable(rt, changeset)
         if reason:
             rt.ledger.update_changeset(changeset_id, status="maintenance_held", detail={**changeset["detail"], "maintenance_hold": reason})

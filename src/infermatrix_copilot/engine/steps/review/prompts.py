@@ -11,6 +11,8 @@ The repo-specific half of the checklist is appended at runtime from the profile
 
 from __future__ import annotations
 
+from ....review.severity import SEVERITY_GUIDANCE
+
 _REVIEW_SYSTEM = """You review pull requests like an engaged maintainer: grounded, \
 specific, and useful — real reviewers leave nits and doc asks, not just blockers.
 
@@ -197,14 +199,7 @@ a red gate by diff size, and never speculate a red check into a blocker — you 
 see whether main is also red, so attribution claims are guesses and read as \
 fabrication.
 
-Severity semantics (they drive the verdict, so assign them honestly):
-- blocker: merging as-is causes breakage or data loss.
-- major: a real defect IN THE CHANGED CODE, or a consumer/doc/test update this change \
-requires but the diff does not contain. "Consider adding X" improvements are never \
-major — a maintainer would not block on them.
-- minor: a concrete improvement that belongs in THIS PR (a simplification, a stale \
-docstring fix, a missing assert, a missing verification run).
-- nit: optional polish; does NOT block approval.
+""" + SEVERITY_GUIDANCE + """
 
 Then emit review_comments per the output contract:
 - Each comment: file, line, severity, WHAT to change and WHY (directive), and the \
@@ -229,11 +224,9 @@ stale), point file/line at that repo location and quote it.
 replacement lines for the cited region — the patch itself, no prose, no diff markers. \
 A maintainer applies a suggestion; they have to re-derive a description. Leave it \
 empty only when the ask is genuinely a question or a judgement call.
-- SEVERITY IS A DECISION, NOT A HEDGE. Before assigning one, answer: would a \
-maintainer BLOCK the merge on this? If yes it is blocker/major — say so. Marking \
-everything `minor` to stay safe reads as "nothing here matters" and buries the one \
-finding that did; a review of eight minors and no stated blocker is a review that \
-declined to have an opinion.
+- SEVERITY IS AN IMPACT DECISION. Apply the shared definitions to each finding's \
+demonstrated trigger and impact. Neither the number of findings nor a decision to \
+wait before merging justifies escalating an issue to blocker.
 - A verification ask is a first-class comment when it names the exact test/benchmark \
 command and the specific regression risk it guards; bare process asks ("run the tests") \
 are still banned.
@@ -507,10 +500,8 @@ _REVIEW_DOCS_PASS = {
              "docs PR, not polish."}
 
 _REVIEW_MERGE = (
-    "Severity semantics: blocker = breaks on merge; major = defect or "
-    "required update the diff lacks; minor = concrete change that belongs in "
-    "THIS PR; nit = optional polish. Severities above nit request changes — "
-    "demote to nit anything genuinely optional; a VERIFIED but optional "
+    SEVERITY_GUIDANCE + "\n\n"
+    "Use nit for anything genuinely optional; a VERIFIED but optional "
     "comment is demoted, not dropped. Drop comments whose evidence is "
     "UNVERIFIED unless a second lens corroborates them. Dropping a candidate "
     "that two or more lenses produced independently (see its consensus/"

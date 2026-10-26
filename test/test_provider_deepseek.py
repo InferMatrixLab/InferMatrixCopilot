@@ -61,10 +61,24 @@ def fake_sdk(monkeypatch):
     """Install a stub `deepseek_harness` module and reset the fake."""
     module = types.ModuleType("deepseek_harness")
     module.DeepSeekHarness = _FakeHarness
+    @dataclass
+    class Config:
+        cordis: str = ""
+        session_root: str = ""
+    module.DeepSeekHarnessConfig = Config
     monkeypatch.setitem(sys.modules, "deepseek_harness", module)
     _FakeHarness.captured = {}
     _FakeHarness.result = _FakeRunResult()
     _FakeHarness.raises = None
+    # Protocol-mapping tests run the same worker body with a fake vendor SDK.
+    # Real process/environment/deadline behavior is covered separately.
+    from infermatrix_copilot.providers.deepseek_worker import run_request
+
+    def invoke(self, *, options, env, prompt, timeout_s, step_cap=None, native_event_sink=None):
+        return types.SimpleNamespace(**run_request({"options": {**options, "env": env},
+                                                    "prompt": prompt, "step_cap": step_cap}))
+
+    monkeypatch.setattr(DeepSeekHarnessTransport, "_invoke", invoke)
     return _FakeHarness
 
 
@@ -76,7 +90,7 @@ def _settings(**kw):
     return Settings(_env_file=None, strict_backend="deepseek", **kw)
 
 
-def _request(tmp_path, *, bridge=True, read_only=True):
+def _request(tmp_path, *, bridge=False, read_only=True):
     (tmp_path / "worktree").mkdir(exist_ok=True)
     scope = replace(read_only_scope(), root=str(tmp_path / "worktree"),
                     read_only=read_only)
@@ -147,21 +161,71 @@ def test_absent_plugin_fails_immediately_rather_than_timing_out(monkeypatch):
     mod._assert_plugins_bundled("- id: x\n  name: '@deepseek-ai/dsh-mcp-client'\n")
 
 
-def test_unbridgeable_tools_are_traced_as_a_capability_gap(fake_sdk, tmp_path):
-    """An arm that ran on native bash must never be describable as having had
-    the tool bridge -- three arms in this campaign were already measured under
-    labels they did not match."""
-    class _Trace:
-        def __init__(self): self.records = []
-        def record(self, kind, **fields): self.records.append((kind, fields))
-    trace = _Trace()
+def test_unbridgeable_tools_fail_before_sdk_construction(fake_sdk, tmp_path):
+    req = _request(tmp_path, bridge=True)
+    with pytest.raises(ValueError, match="does not support.*MCP tool bridge"):
+        DeepSeekHarnessTransport(_settings()).run_session(req)
+    assert fake_sdk.captured == {}
+    assert not (req.run_dir / "dsh").exists()
+
+
+def test_incompatible_sdk_fails_before_construction(fake_sdk, tmp_path, monkeypatch):
+    @dataclass
+    class NewConfig:
+        profile: str = "sdk"
+
+    monkeypatch.setattr(sys.modules["deepseek_harness"], "DeepSeekHarnessConfig", NewConfig)
+    with pytest.raises(RuntimeError, match="lacks pinned composition support"):
+        DeepSeekHarnessTransport(_settings()).run_session(_request(tmp_path))
+    assert fake_sdk.captured == {}
+
+
+@pytest.mark.parametrize("mode", ["completion", "session"])
+def test_incompatible_sdk_is_not_accounted_as_dispatched(
+    fake_sdk, tmp_path, monkeypatch, mode,
+):
+    from infermatrix_copilot.budgeting import bind_call_budget
+    from infermatrix_copilot.providers import run_harness_session
+    from infermatrix_copilot.providers.completion import complete_native
+
+    @dataclass
+    class NewConfig:
+        profile: str = "sdk"
+
+    monkeypatch.setattr(sys.modules["deepseek_harness"], "DeepSeekHarnessConfig", NewConfig)
+    transport = DeepSeekHarnessTransport(_settings())
+    settlements = []
+    with bind_call_budget("test", lambda _: "ticket",
+                          lambda ticket, facts: settlements.append(dict(facts))):
+        with pytest.raises(RuntimeError, match="lacks pinned composition support") as raised:
+            if mode == "completion":
+                complete_native(lambda: transport,
+                                request={"system": "S", "messages": []})
+            else:
+                run_harness_session(transport, _request(tmp_path))
+    assert fake_sdk.captured == {}
+    assert len(settlements) == 1
+    assert settlements[0]["sent"] is False
+    assert settlements[0]["usage"] is None
+    if mode == "completion":
+        assert raised.value.native_call_sent is False
+
+
+def test_harness_step_records_unsupported_bridge_as_not_dispatched(fake_sdk, tmp_path):
+    from types import SimpleNamespace
+    from infermatrix_copilot.budgeting import bind_call_budget
+    from infermatrix_copilot.providers import run_harness_step
+
     req = _request(tmp_path)
-    req.trace = trace
-    DeepSeekHarnessTransport(_settings()).run_session(req)
-    gaps = [f for k, f in trace.records if k == "capability_gap"]
-    assert gaps and gaps[0]["capability"] == "review.mcp_tool_bridge"
-    sessions = [f for k, f in trace.records if k == "harness_session"]
-    assert sessions and sessions[0]["mcp_bridged"] is False
+    ctx = SimpleNamespace(settings=_settings(), state={}, run_dir=req.run_dir, trace=None)
+    settlements = []
+    with bind_call_budget("test", lambda _: "ticket",
+                          lambda ticket, facts: settlements.append(dict(facts))):
+        with pytest.raises(ValueError, match="does not support.*MCP tool bridge"):
+            run_harness_step(ctx, SimpleNamespace(model=req.model), step_name="review",
+                             system=req.system, prompt=req.prompt, scope=req.scope, max_iters=2)
+    assert fake_sdk.captured == {}
+    assert len(settlements) == 1 and settlements[0]["sent"] is False
 
 
 def test_env_never_leaks_model_endpoint_or_keys(tmp_path, monkeypatch):
@@ -242,19 +306,26 @@ def test_require_cli_names_the_pip_install(monkeypatch):
         t.require_cli()
 
 
-def test_runaway_session_is_stopped_by_the_step_cap(fake_sdk, tmp_path):
+@pytest.mark.parametrize("envelope", [False, True])
+def test_runaway_session_is_stopped_by_the_step_cap(fake_sdk, tmp_path, envelope):
     """dsh owns its own loop and its bundled runtime exposes no step cap, so
     max_iters cannot be handed to the harness. Measured on pr4816: two lenses
     finished in ~40 steps while a third ran 558 steps / 564 tool calls and was
     still going 50 minutes later. The cap is ours or there is none."""
     closed = {"n": 0}
 
+    @dataclass(slots=True)
+    class Notification:
+        method: str
+        payload: dict
+
     class _Runaway(_FakeHarness):
         def run(self, prompt, **kwargs):
             cb = kwargs.get("on_notification")
             for _ in range(10_000):          # a loop that never ends on its own
                 if cb:
-                    cb({"type": "step/end"})
+                    event = {"type": "step/end"}
+                    cb(Notification("session.event", {"event": event}) if envelope else event)
                 if closed["n"]:
                     raise RuntimeError("runtime closed")
             return _FakeRunResult()
@@ -318,6 +389,56 @@ def test_complete_never_constructs_an_empty_model(fake_sdk, tmp_path):
     DeepSeekHarnessTransport(_settings(strict_backend_model="")).complete(
         system="S", messages=[{"role": "user", "content": "hi"}])
     assert fake_sdk.captured["model"] == "deepseek-v4-pro"
+
+
+def test_completion_omits_tool_plugins_from_dispatched_composition(fake_sdk, monkeypatch):
+    transport = DeepSeekHarnessTransport(_settings())
+    invoke = transport._invoke
+    compositions = []
+
+    def inspect(**kwargs):
+        compositions.append(Path(kwargs["options"]["cordis"]).read_text())
+        return invoke(**kwargs)
+
+    monkeypatch.setattr(transport, "_invoke", inspect)
+    reply = transport.complete(system="S", messages=[{"role": "user", "content": "hi"}])
+    assert reply.text == "REVIEW"
+    assert len(compositions) == 1
+    assert "dsh-tool-bash-persistent" not in compositions[0]
+    assert "dsh-tool-str-replace-editor" not in compositions[0]
+    assert "toolBash: false" in compositions[0]
+    assert "toolJobs: false" in compositions[0]
+
+
+@pytest.mark.parametrize("event", [
+    {"kind": "tool-call", "data": {"name": "bash"}},
+    {"type": "tool-result", "data": {"name": "str_replace_editor"}},
+])
+def test_completion_rejects_unexpected_native_tool_events(fake_sdk, event):
+    fake_sdk.result = _FakeRunResult(events=[event])
+    with pytest.raises(RuntimeError, match="tool-less completion attempted"):
+        DeepSeekHarnessTransport(_settings()).complete(
+            system="S", messages=[{"role": "user", "content": "hi"}])
+
+
+def test_lost_completion_is_not_reported_as_a_completed_empty_reply(fake_sdk, monkeypatch):
+    from infermatrix_copilot.providers.completion import complete_native
+    from infermatrix_copilot.budgeting import bind_call_budget
+
+    def lost_response(self, *args, **kwargs):
+        raise OSError("SDK response lost")
+
+    monkeypatch.setattr(fake_sdk, "run", lost_response)
+    settlements = []
+    with bind_call_budget("test", lambda _: "ticket",
+                          lambda ticket, facts: settlements.append(dict(facts))):
+        with pytest.raises(OSError, match="SDK response lost") as raised:
+            complete_native(lambda: DeepSeekHarnessTransport(_settings()),
+                            request={"system": "S", "messages": [{"role": "user", "content": "hi"}]})
+    assert raised.value.native_call_sent is True
+    assert raised.value.native_call_completed is False
+    assert len(settlements) == 1
+    assert settlements[0]["sent"] is True and settlements[0]["usage"] is None
 
 
 def test_env_model_matches_the_constructed_model(fake_sdk, tmp_path):

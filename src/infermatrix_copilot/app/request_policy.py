@@ -30,7 +30,7 @@ from ..task_spec import FULL_SHA_RE, READ_ONLY_KINDS, TaskSpec
 # strictly value-validated below — a knob may modulate cost/depth, never widen
 # permissions.
 _ALLOWED_PARAMS: frozenset[str] = frozenset({
-    "review_depth", "deterministic_signals", "carried_findings",
+    "review_depth", "deterministic_signals", "carried_findings", "business_context",
 })
 _REVIEW_DEPTHS = ("auto", "light", "standard", "full")
 
@@ -160,8 +160,8 @@ def enforce_mcp_policy(raw: dict[str, Any], *, allowed_repos: list[str],
         if kind != "pr_review":
             params.pop("carried_findings")
         else:
-            from ..sdk.v1.rechecks import validate_carried
-            from ..sdk.v1.models import InvalidRequestError
+            from ..review.rechecks import validate_carried
+            from ..contracts.models import InvalidRequestError
             try:
                 validate_carried(params["carried_findings"])
             except InvalidRequestError as exc:
@@ -186,6 +186,17 @@ def enforce_mcp_policy(raw: dict[str, Any], *, allowed_repos: list[str],
             f"mode {mode!r} is invalid; allowed: ['eco', 'performance']")
 
     expected_head_sha = _full_sha_or_empty(raw.get("expected_head_sha"))
+    if "business_context" in params:
+        if kind != "pr_review":
+            params.pop("business_context")
+        else:
+            from ..review.frozen_context import validate_business_context
+            from ..contracts.models import InvalidRequestError
+
+            try:
+                validate_business_context(params["business_context"], expected_head_sha, pr)
+            except InvalidRequestError as exc:
+                raise PolicyError(str(exc)) from exc
     # Re-authorized here on BOTH passes by design: the boundary check binds the
     # request, and the child's check re-derives it from `request.json`, which is
     # untrusted — a same-user host could rewrite the path between reservation

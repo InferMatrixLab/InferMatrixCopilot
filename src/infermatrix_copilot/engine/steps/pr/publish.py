@@ -13,6 +13,7 @@ import re
 import subprocess
 
 from ....push import PushPolicy, guard_push
+from ....review.publication_policy import review_head_error, review_evidence_error
 from ...step import FailureKind, StepContext, StepResult, StepSpec
 from ..review.anchor import diff_index
 from ..review.anchor import normalize_path as _normalize_path
@@ -249,31 +250,20 @@ def _review_payload(state: dict, *, current_head: str = "") -> tuple[dict, int]:
     """Build the API payload and return it with the downgrade count."""
     raw_comments = state.get("review_comments")
     comments = list(raw_comments) if isinstance(raw_comments, list) else []
+    problem = review_evidence_error(mode="strict", comments=comments,
+                                   dispositions=state.get("review_finding_dispositions") or ())
+    if problem:
+        raise ValueError(problem)
     reviewed_head = str(state.get("pr_head_sha") or "").strip()
-    stale_reason = ""
-    if current_head and not reviewed_head and comments:
-        stale_reason = (
-            "These findings were reviewed without a recorded PR head SHA, so "
-            "they were not attached to possibly newer code."
-        )
-    elif current_head and reviewed_head != current_head and comments:
-        stale_reason = (
-            f"The PR head changed after review "
-            f"({reviewed_head[:12]} → {current_head[:12]}), so these findings "
-            "were not attached to stale line anchors."
-        )
-    if stale_reason:
-        inline, downgraded = [], [
-            dict(comment) if isinstance(comment, dict)
-            else {"comment": str(comment)}
-            for comment in comments
-        ]
-    else:
-        inline, downgraded = _partition_comments(
-            comments, str(state.get("diff_text") or ""))
+    if current_head:
+        problem = review_head_error(reviewed_head, current_head)
+        if problem:
+            raise ValueError(problem)
+    inline, downgraded = _partition_comments(
+        comments, str(state.get("diff_text") or ""))
     review_text = str(state.get("review_text") or "")
     body = str(state.get("review_summary") or review_text or "Review complete.")
-    fallback = _fallback_section(downgraded, stale_reason)
+    fallback = _fallback_section(downgraded)
     if fallback:
         body = f"{body.rstrip()}\n\n{fallback}"
     payload = {
@@ -282,7 +272,7 @@ def _review_payload(state: dict, *, current_head: str = "") -> tuple[dict, int]:
             comments, str(state.get("pr_state") or ""), review_text),
         "comments": inline,
     }
-    commit_id = current_head or reviewed_head
+    commit_id = reviewed_head
     if commit_id:
         payload["commit_id"] = commit_id
     return payload, len(downgraded)
@@ -309,7 +299,10 @@ async def _post_review(ctx: StepContext) -> StepResult:
         return StepResult(True, summary="not posting GitHub review "
                           "(post flag not set)")
 
-    payload, downgraded = _review_payload(ctx.state)
+    try:
+        payload, downgraded = _review_payload(ctx.state)
+    except ValueError as exc:
+        return StepResult(False, FailureKind.BLOCKED, str(exc))
     inline_count = len(payload["comments"])
     if not ctx.settings.allow_post:
         return StepResult(
@@ -338,8 +331,10 @@ async def _post_review(ctx: StepContext) -> StepResult:
         return StepResult(
             False, FailureKind.ESCALATE,
             f"could not verify current PR head before posting: {head_error}")
-    payload, downgraded = _review_payload(
-        ctx.state, current_head=current_head)
+    problem = review_head_error(str(ctx.state.get("pr_head_sha") or "").strip(), current_head)
+    if problem:
+        return StepResult(False, FailureKind.BLOCKED, problem, outputs={"stale": True})
+    payload, downgraded = _review_payload(ctx.state, current_head=current_head)
     inline_count = len(payload["comments"])
 
     ctx.run_dir.mkdir(parents=True, exist_ok=True)

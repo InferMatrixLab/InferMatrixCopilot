@@ -7,6 +7,7 @@ Labels and gold stay in the parent; only the pinned input is sent to a worker.
 from __future__ import annotations
 from dataclasses import asdict
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,11 +77,16 @@ class Gateway:
         self.llm, self.spec, self.governor = llm, spec, governor
 
     def call_json(self, role, *, system, prompt, validate=None, **kwargs):
+        from ..kb_service.models import ModelReply
         from .judges import run_judge
+        started = time.monotonic()
         data = run_judge(self.spec, system=system, prompt=prompt, llm=self.llm, governor=self.governor)
         if validate:
             validate(data)
-        return SimpleNamespace(data=data, served_model=self.spec.model, text=json.dumps(data))
+        # run_judge owns the governed call and its trace. It exposes only the
+        # decoded verdict here, so native usage and archive identity are unknown.
+        return ModelReply(role, data, json.dumps(data), self.spec.model, {},
+                          time.monotonic() - started)
 
 def make_unit(store, workflow, item, version, result, uid):
     from .reader import Unit
@@ -252,7 +258,10 @@ def worker_run(payload, settings, llm):
                     "playbooks_dir": Path("/candidate/playbooks"), "adapters_dir": Path("/candidate/adapters"), "memory_db": Path("/tmp/memory.db")})
         for path, content in data.get("knowledge_files", {}).items():
             p = Path("/tmp/knowledge") / safe_path(path); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
-        ctx = StepContext(settings, state, {}, Path("/tmp/run"), RunTrace(Path("/tmp/run.jsonl")), llm)
+        from .execution import shadow_agent_policy
+
+        ctx = StepContext(settings, state, {}, Path("/tmp/run"), RunTrace(Path("/tmp/run.jsonl")), llm,
+                          agent_policy=shadow_agent_policy())
         ctx.run_dir.mkdir()
         result = asyncio.run(_review_diff(ctx))
         if not result.ok: raise ArtifactError(result.summary)

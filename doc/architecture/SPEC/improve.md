@@ -62,9 +62,23 @@ Replay envelope 保留完整文件与引用，由 TraceStore 脱敏、压缩和�
 - 既有提案的外向写是 `improve.publish`，代码候选另由 `improve.evolve_publish` 经 post/push 双门写独立 outbox；引擎不持有 GitHub 令牌，issue 的开/改/关由 maintainer routine 执行并以 ack 回报。
 - 未通过 `lint_proposal` 的提案永不发布（记 `proposal_lint_failed`）；hold 只暂停发布，lint 与实验照常。
 - 元基准只读：任何触及 `eval/dataset/meta` 的指纹 diff 或 `IMPROVE_*` 覆盖在注册时被拒。
-- 实验子进程的周预算、账本目录和 `IMPROVE_INPUT_CONTEXT_LIMITS` 由父 governor 固定，不接受候选或运行臂自己的配置覆盖。修复估算后操作员可归档并清除已核对的预留故障，实际结算金额不回退。
+- 实验子进程的周预算、账本目录、`IMPROVE_INPUT_CONTEXT_LIMITS` 和 `IMPROVE_NATIVE_CALL_LIMITS` 由父 governor 固定，不接受候选或运行臂自己的配置覆盖。修复估算后操作员可归档并清除已核对的预留故障，实际结算金额不回退。
+- 原生调用不再仅因 harness 类型跳过美元准入。completion／session 使用共享一次性 prepare 边界；领域在 provider 预检后、模型前按事实选择原次数政策、已绑定订阅政策或受支持的美元预留。美元 completion 预留停止阈值与一请求超额余量，原 journal 结算；未发出退款，未知费用保留预留，超支先记录再中止。原生 session 没有该 completion 停止参数时必须明确订阅准入，否则拒绝美元执行。宿主必须自行验证声明的最大请求费用；固定 API fixture 不是厂商账单或真实账户证明。
 - 引擎自身的记录（`playbook=workflow-improve`）是下一周期的 Tier 1 单元（自登记）。
 - lint 只读 trace，不调模型；无证据形态的 lint 不猜。
 
 ## 测试
+
+原生美元预留与原 attempt 的模型、输入、上下文、环境及 trace root 在同一 journal 写入中绑定，原 settlement 保留该绑定。受保护的 native completion 先建立 durable archive，不能通过省略 payload 获得可恢复的美元派发。
+停止 writers 后可运行 `infermatrix-copilot improve budget --ledger-dir DIR --reconcile-native RESERVATION_ID --offline-confirmed`，只读取原 attempt／receipt 并结算原预留；命令没有模型调用或替代派发路径。未确认停写、缺失／重复记录、绑定漂移、缺失 blob、尚未完成的 archive 或 pending worker 结果均拒绝。旧未绑定预留不能猜配或重置。必要时先用原 native-attempt 恢复服务完成 archive，再结算账户；两者保留各自 authority。
+schema 拒绝后的已发生用量仍是账务事实。已知费用按原 journal 结算；未知费用保留原预留额度，真实超支先写入 breach 再拒绝。重复恢复使用同一 settlement，不能重复扣费。USD 路径的这些证明不代表判官次数账户、所有 backend／host 或完整崩溃矩阵已验收。
+
 `test_improve_p0.py`、`test_improve_p0b.py`、`test_improve_p1.py`、`test_improve_p2.py`、`test_improve_p3.py`、`test_improve_p4.py`、`test_improve_gateway_budget.py`、`test_improve_kb_intake_adapter.py`、`test_evolution.py`、`test_autonomous_evolution.py`。
+
+判官次数账户沿用 eager reserve 和旧 `judge_tokens` 字符串／匿名计数格式。
+模型前 prepare 将原 token 绑定到 canonical attempt；绑定前崩溃保留原未绑定预留，不猜配。
+停止 writers 后可运行 `infermatrix-copilot improve budget --ledger-dir DIR --reconcile-judge TOKEN --offline-confirmed`。
+该命令与美元恢复共用 schema、archive／blob／identity、pause／lock 校验，只结算原次数，不调用模型或修复索引。
+已知 terminal failure 仍计一次；pending worker 或未完成收据保留原预留。并发恢复遵循现有 nonblocking lock，拒绝者只能重试原恢复身份。
+`judge-calls/v1` 的兼容别名不是美元账单；原生 `cost_usd` 继续作为独立事实记录。
+这些确定性和真进程崩溃检查不代表完整厂商账户、所有 host／workflow 或真实模型质量验收。

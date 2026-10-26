@@ -119,7 +119,7 @@ def check(settings, store, workflow: str, *, repo: str = "", sandbox=None, mecha
         reasons.append("pinned-generator-model-does-not-match-broker")
     budget = governor_for(settings, ledger_dir_for(settings)).remaining()
     if budget["usd_remaining"] <= 0: reasons.append("budget-exhausted")
-    estimate = min(len(holdout), n_required) * 6 * float(decl.evolution.get("cost_per_unit_usd") or experiments._median_unit_usd(ledger_dir_for(settings), workflow) or .5)
+    estimate = min(len(holdout), n_required) * 6 * float(decl.evolution.get("cost_per_unit_usd") or experiments._planning_unit_usd(ledger_dir_for(settings), workflow))
     if tier2 and estimate > budget["usd_remaining"]:
         reasons.append(f"experiment-estimate-exceeds-budget: ${estimate:.2f}")
     result = {"workflow": workflow, "tier": 2 if tier2 else 1, "ready": not reasons, "reasons": reasons,

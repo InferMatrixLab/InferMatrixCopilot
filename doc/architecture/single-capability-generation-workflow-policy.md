@@ -1,0 +1,15 @@
+# generation工作流策略绑定
+
+当前1160完整整合在test_returning_to_an_old_execution_refuses_a_replaced_business_record复现失败：相同业务请求切换工作流策略后，共享generation缓存仍返回旧策略的完成结果，破坏既有执行provenance隔离。本修复属于框架后的必要边界补正，不把1160完整运行改写为通过。
+
+Copilot应用组合在生成execution fingerprint时只计算一次policy_digest并注入work；共享generation将其加入请求／意图／结果绑定。已完成调用在明确的新策略下重新计算；未决调用不能借策略变更换身份派发。私有阶段直接调用兼容层委托同一个policy_digest函数，不新增策略计算主体，也不把领域逻辑放入执行内核。
+
+旧未完成generation日志没有可信策略身份时，在preflight只读拒绝，要求恢复原环境；未知和已生成但验证中断两种形状均证明原检查点字节不变且零新增调用。已知派发前拒绝仍允许绑定当前策略重试。已终态记录保留既有读取路径，其他旧schema及逐PR History适配不被改写。原运行环境／release/profile仍需保留，深层恢复矩阵另验。
+
+当前修复源码原provenance用例及init／History／quality检查通过；正常安装的同一wheel覆盖策略绑定、unknown不重派、legacy留存、原始旧History提示、图策略、预算和任务恢复。无产品src注入，依赖复用。validation.json和原日志列精确范围；这些不是新全量／模型质量证明。
+
+生产增量为init_execution.py和init_generation.py，相对1160净+12行／+101 AST节点；详见production-delta.json，净减行不是门槛。没有新增vendor、repair或业务循环。
+
+1160／Bot3bbf冻结完整运行仍按原进程／目录结束，至少已复现这一处失败；Bot全套、评测工具全套、独立安装和namespace补验各保留原范围。新修复wheel不能继承1160全量结论，下一步核对其余原完整运行结果，再做最终精确整合。新四PR质量输入已准备但未准入，需冻结修复后的artifact并补控制。
+
+代码与验证目录 (host-local path: `/data/zhoutaichang/copilot/output/single-capability-completion-20261012/generation-workflow-policy-20261017`)提供changes.patch、wheel、重建和校验。增量patch仅应用一次到history-scope-policy-20261017交付的精确tree；不能叠加到已有本修复的工作树。框架能力归属保持，完整目标仍开放；无真实模型调用、commit、push、发布或部署。

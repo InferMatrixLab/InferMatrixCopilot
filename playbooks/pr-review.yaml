@@ -23,6 +23,7 @@ requires: [repo.path]
 params:
   review_depth: "optional light|standard|full|auto — pins the adaptive review
     depth for this run (see review/planner.py)"
+  business_context: "optional frozen host PR discussion and CI evidence"
 steps:
   - {id: fetch, step: pr.fetch_diff}
   - {id: gate, step: pr.gate_check}

@@ -9,7 +9,7 @@ RUN_REPORT always exists when the run terminates needs-human)."""
 
 from __future__ import annotations
 
-from dataclasses import asdict as _dc_asdict
+from dataclasses import asdict as _dc_asdict, replace
 
 import asyncio
 import shlex
@@ -928,10 +928,7 @@ async def _v3_guard(ctx: StepContext) -> StepResult:
     # the shared checkout flock we JUST took lives under <repo>/locks/ —
     # it must not read as dirt, and must never be discarded while held
     guard_cfg.setdefault("ignore_untracked_prefixes", ["locks/"])
-    inner = StepContext(settings=ctx.settings, state=ctx.state,
-                        params={**guard_cfg, **ctx.params},
-                        run_dir=ctx.run_dir, trace=ctx.trace,
-                        llm=ctx.llm, item=ctx.item)
+    inner = replace(ctx, params={**guard_cfg, **ctx.params})
     return await _guard_clean_rebase(inner)
 
 

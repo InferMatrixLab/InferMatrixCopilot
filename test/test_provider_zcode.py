@@ -429,12 +429,11 @@ def test_settings_reject_an_unknown_reasoning_level():
     ({"errorCode": "model_connection_error", "statusCode": 503}, "model_unavailable", True),
 ])
 def test_known_failure_events_have_typed_safe_recovery_without_raw_text(tmp_path, monkeypatch, payload, code, retryable):
-    from types import SimpleNamespace
     from infermatrix_copilot.providers.zcode import ZCodeFailure
     transport = _transport(tmp_path)
     payload.update(providerErrorMessage="PRIVATE_PROVIDER_MESSAGE", requestHeaders={"Authorization": "SECRET_TOKEN"})
-    monkeypatch.setattr(zcode_mod.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1,
-        stdout=json.dumps({"type": "session.updated", "payload": payload}), stderr="SECRET_STDERR"))
+    monkeypatch.setattr(zcode_mod, "run_cli", lambda *args, **kwargs: (
+        json.dumps({"type": "session.updated", "payload": payload}), "SECRET_STDERR", 1, False))
     with pytest.raises(ZCodeFailure) as exc:
         transport.complete(system="PRIVATE_SYSTEM_PROMPT", messages=[])
     assert exc.value.code == code and exc.value.retryable is retryable

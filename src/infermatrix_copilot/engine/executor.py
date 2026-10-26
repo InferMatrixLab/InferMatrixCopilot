@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .step import FailureKind, StepContext, StepResult
 from .registry import StepRegistry
+from ..persistence import atomic_write_bytes, fsync_directory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Settings
@@ -22,6 +22,16 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..notify import Notifier
     from ..playbooks.store import Playbook
     from ..run_trace import RunTrace
+
+
+def _checkpoint_directory(directory):
+    try:
+        fsync_directory(directory)
+    except OSError as exc:
+        import errno
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EACCES,
+                             errno.EPERM, errno.EISDIR, errno.EBADF):
+            raise
 
 
 @dataclass
@@ -49,6 +59,12 @@ class Executor:
         trace: "RunTrace",
         llm: Optional["LLM"] = None,
         notifier: Optional["Notifier"] = None,
+        runtime=None,
+        fingerprint: str = "",
+        validate_cached: Callable[[str, dict], None] | None = None,
+        context_for=None,
+        authorize=None,
+        on_handler_error: Callable[[Exception], None] | None = None,
     ):
         """Wire the executor to its `registry` (step lookups), `settings`
         (retry bounds, post gates), the `run_dir` where progress.json is
@@ -60,6 +76,12 @@ class Executor:
         self.trace = trace
         self.llm = llm
         self.notifier = notifier
+        self.runtime = runtime
+        self.fingerprint = fingerprint
+        self.validate_cached = validate_cached
+        self.context_for = context_for
+        self.authorize = authorize
+        self.on_handler_error = on_handler_error
         self.progress_file = self.run_dir / "progress.json"
 
     # -- checkpoint / resume ------------------------------------------------
@@ -67,8 +89,22 @@ class Executor:
         """Read the run's checkpoint (a `{"completed": {step_id: ...}}` map) from
         progress.json, or the empty checkpoint when this is a fresh run."""
         if self.progress_file.exists():
-            return json.loads(self.progress_file.read_text(encoding="utf-8"))
-        return {"completed": {}}
+            progress = json.loads(self.progress_file.read_text(encoding="utf-8"))
+            if self.fingerprint and progress.get("fingerprint") != self.fingerprint:
+                raise ValueError("checkpoint fingerprint differs from this execution")
+            if not isinstance(progress.get("completed"), dict):
+                raise ValueError("checkpoint has no completed-step map")
+            for cached in progress["completed"].values():
+                if not isinstance(cached, dict):
+                    raise ValueError("checkpoint contains an invalid step result")
+                outputs = cached.get("outputs")
+                if outputs is not None and not isinstance(outputs, dict):
+                    raise ValueError("checkpoint contains invalid outputs")
+                updates = (outputs or {}).get("state_updates")
+                if updates is not None and not isinstance(updates, dict):
+                    raise ValueError("checkpoint contains invalid state updates")
+            return progress
+        return {"completed": {}, **({"fingerprint": self.fingerprint} if self.fingerprint else {})}
 
     def _save_progress(self, progress: dict) -> None:
         """Persist the checkpoint to progress.json (creating run_dir), so a later
@@ -78,28 +114,7 @@ class Executor:
         survive a crash at any point during the write."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         data = json.dumps(progress, indent=2, default=str)
-        tmp = self.progress_file.with_name(self.progress_file.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.progress_file)
-        try:
-            # directory fsync makes the rename itself durable
-            dir_fd = os.open(self.run_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError as exc:
-            # opening/fsyncing a directory is unsupported on some platforms
-            # (Windows) and filesystems — those degrade to rename atomicity.
-            # Real storage failures (EIO) mean the durability guarantee is
-            # gone and MUST propagate rather than continue on a bad disk.
-            import errno
-            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EACCES,
-                                 errno.EPERM, errno.EISDIR, errno.EBADF):
-                raise
+        atomic_write_bytes(self.progress_file, data.encode("utf-8"), directory_fsync=_checkpoint_directory)
 
     # -- execution ------------------------------------------------------------
     async def run(self, playbook: "Playbook", state: dict) -> RunOutcome:
@@ -114,29 +129,29 @@ class Executor:
         With `settings.trace_store_root` set, the whole run binds that trace/1
         store so the choke points (`tools.dispatch`, `LLM.create`) capture every
         tool and model call under the unit context of the running step."""
+        from ..model_usage import bind_model_usage
+        with bind_model_usage(self.trace, self.run_dir.name):
+            return await self._run_with_trace_store(playbook, state)
+
+    async def _run_with_trace_store(self, playbook, state):
         root = str(getattr(self.settings, "trace_store_root", "") or "")
-        governed_run = bool(getattr(self.settings, "improve_governed", False))
-        if not root and not governed_run:
+        if not root:
             return await self._run_steps(playbook, state)
-        from contextlib import ExitStack
-
-        from ..trace_store import TraceStore, bind_store
-
-        with ExitStack() as stack:
-            if root:
-                stack.enter_context(bind_store(TraceStore(Path(root).expanduser())))
-            if governed_run:
-                # a shadow child of an experiment: every model call of this
-                # process is reserved against the week's envelope (design §10)
-                from ..improve.budget import governed
-                from ..improve.cycle import governor_for, ledger_dir_for
-
-                stack.enter_context(governed(governor_for(self.settings, ledger_dir_for(self.settings))))
+        from ..trace_store import TraceStore, bind_store, current_store
+        bound = current_store()
+        if bound is not None and bound.root.resolve() == Path(root).expanduser().resolve():
+            return await self._run_steps(playbook, state)
+        with bind_store(TraceStore(Path(root).expanduser())):
             return await self._run_steps(playbook, state)
 
     async def _run_steps(self, playbook: "Playbook", state: dict) -> RunOutcome:
-        progress = self._load_progress()
         outcome = RunOutcome(status="done")
+        try:
+            progress = self._load_progress()
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            outcome.status = "blocked"
+            outcome.blocked_reason = f"checkpoint refused: {exc}"
+            return outcome
         state.setdefault("playbook", playbook.name)
         # Run-scoped params (CLI `--task-param`, or intent-derived) reach every
         # step. Without this a step's `ctx.params.get(...)` only ever saw the
@@ -145,6 +160,7 @@ class Executor:
         task_params = (state.get("task_spec") or {}).get("params") or {}
 
         for pstep in playbook.steps:
+            spec = self.registry.get(pstep.step)
             if pstep.when:
                 try:
                     applies = _eval_when(pstep.when, state)
@@ -159,9 +175,23 @@ class Executor:
                     outcome.step_results[pstep.id] = StepResult(
                         True, summary=f"skipped (when: {pstep.when})")
                     continue
-            if pstep.id in progress["completed"]:
+            reason = self.authorize(spec, pstep.id, state) if self.authorize else ""
+            if reason:
+                self.trace.record("step_refused", step=pstep.id, spec=spec.name,
+                                  risk=spec.risk, reason=reason)
+                outcome.status = "blocked"
+                outcome.blocked_reason = reason
+                return outcome
+            if spec.checkpoint and pstep.id in progress["completed"]:
                 cached = progress["completed"][pstep.id]
                 cached_outputs = cached.get("outputs", {}) or {}
+                if self.validate_cached is not None:
+                    try:
+                        self.validate_cached(pstep.id, cached_outputs)
+                    except Exception as exc:
+                        outcome.status = "blocked"
+                        outcome.blocked_reason = f"step '{pstep.id}': cached result refused: {exc}"
+                        return outcome
                 # steps may publish JSON-simple state keys via outputs.state_updates
                 # so resumed runs recover them without re-running the step
                 state.update(cached_outputs.get("state_updates") or {})
@@ -172,19 +202,6 @@ class Executor:
                 )
                 continue
 
-            spec = self.registry.get(pstep.step)
-            if getattr(self.settings, "improve_shadow", False) and spec.risk not in ("read", "report"):
-                # a shadow (experiment) run may never reach a writing or
-                # posting step, whatever the playbook says: refused at the
-                # execution boundary, recorded, and the run stops as blocked
-                # so the experiment is marked invalid (design §8.2 layer 2)
-                self.trace.record("step_refused", step=pstep.id, spec=spec.name, risk=spec.risk,
-                                  reason="shadow run refuses non-read steps")
-                outcome.status = "blocked"
-                outcome.blocked_reason = (f"shadow run refused step '{pstep.id}' ({spec.name}, "
-                                          f"risk={spec.risk}): only read/report steps may run")
-                state["shadow_violation"] = outcome.blocked_reason
-                return outcome
             items = state.get(pstep.foreach, [None]) if pstep.foreach else [None]
             if pstep.foreach and not isinstance(items, list):
                 items = [items]
@@ -214,10 +231,11 @@ class Executor:
             )
 
             if result.ok:
-                progress["completed"][pstep.id] = {
-                    "summary": result.summary, "outputs": result.outputs,
-                }
-                self._save_progress(progress)
+                if spec.checkpoint and result.checkpoint:
+                    progress["completed"][pstep.id] = {
+                        "summary": result.summary, "outputs": result.outputs,
+                    }
+                    self._save_progress(progress)
                 state.update((result.outputs or {}).get("state_updates") or {})
                 state.setdefault("outputs", {})[pstep.id] = result.outputs
                 continue
@@ -254,18 +272,12 @@ class Executor:
         from .. import tracing
         from ..trace_store import trace_context
 
-        from ..improve.artifacts import runtime_settings
-        effective_settings = runtime_settings(self.settings, f"{state.get('playbook', '')}.{spec.name}")
-        step_llm = self.llm
-        if effective_settings is not self.settings and hasattr(self.llm, "settings"):
-            from copy import copy
-            step_llm = copy(self.llm)
-            step_llm.settings = effective_settings
         ctx = StepContext(
-            settings=effective_settings, state=state, params=params or {},
-            run_dir=self.run_dir, trace=self.trace, llm=step_llm, item=item,
+            settings=self.settings, state=state, params=params or {},
+            run_dir=self.run_dir, trace=self.trace, llm=self.llm, item=item,
+            runtime=self.runtime,
         )
-        attempts = 1 + max(0, self.settings.max_step_retries)
+        attempts = 1 + max(0, getattr(self.settings, "max_step_retries", 1))
         last: StepResult | None = None
         # `step` alone cannot identify the work: a playbook may run the same spec
         # twice (repo-rebase-v3 runs its module-rebase spec for both waves) and
@@ -278,14 +290,10 @@ class Executor:
             try:
                 with tracing.span("step", step=spec.name, attempt=attempt, **ident), \
                         trace_context(attempt=attempt, **unit):
-                    from ..improve import objectives
-                    last = None
-                    if spec.name == "agent.review_diff" and objectives.enabled(ctx.settings) and ctx.settings.improve_enabled and ctx.settings.improve_evolve_enabled:
-                        from ..improve.runtime import review_step
-                        last = await review_step(ctx)
-                    if last is None:
-                        last = await spec.handler(ctx)
+                    last = await spec.handler(ctx)
             except Exception as exc:  # handler bug != typed failure
+                if self.on_handler_error is not None:
+                    self.on_handler_error(exc)
                 last = StepResult(False, FailureKind.BLOCKED,
                                   f"unhandled error: {type(exc).__name__}: {exc}")
             if last.ok or last.failure is not FailureKind.RETRYABLE:
@@ -308,7 +316,7 @@ class Executor:
         if store is None or result is None:
             return
         outputs = result.outputs or {}
-        blobs: dict[str, str] = {}
+        blobs: dict[str, str] = dict(outputs.get("trace_outputs") or {})
         for key, name in (("review_text", "review"), ("answer_draft", "answer"), ("report_text", "report")):
             text = outputs.get(key)
             if isinstance(text, str) and text.strip():
@@ -321,7 +329,7 @@ class Executor:
                                  if k in f})
         try:
             with trace_context(attempt=attempt, **unit):
-                store.append("decision", outputs=blobs,
+                store.append("decision", inputs=unit.get("_trace_inputs"), outputs=blobs,
                              result={"type": "step_result", "step": spec.name, "status": "ok" if result.ok else "failed",
                                      "failure": result.failure.value if result.failure else "",
                                      "summary": str(result.summary or "")[:300],
@@ -331,46 +339,16 @@ class Executor:
 
 
     # -- trace/1 unit context ---------------------------------------------------
-    def _declarations(self) -> dict:
-        """Workflow declarations, loaded once per executor (a malformed file is a
-        loud configuration error, never a silent Tier 1 downgrade)."""
-        cached = getattr(self, "_decls", None)
-        if cached is None:
-            from ..improve.enroll import declarations_for
-
-            cached = declarations_for(self.settings)
-            self._decls = cached
-        return cached
-
     def _unit_context(self, step: str, step_id: str, state: dict, item) -> dict:
-        """The trace/1 context of one unit of work (design §3.1): run, playbook,
-        step, ``unit_id``; plus ``workflow``, ``item`` and the declared
-        ``fingerprint`` when the step is enrolled. An incomplete fingerprint is
-        recorded as ``fingerprint_missing`` (the unit stays Tier 1)."""
-        from ..improve.enroll import item_for, lookup
-
+        """Identify a unit; the application may add domain trace bindings."""
         run_id = self.run_dir.name
         playbook = str(state.get("playbook") or "")
         unit_id = f"{run_id}:{step_id or step}"
         if item is not None:
             unit_id += f":{_item_key(item)}"
         context: dict = {"run_id": run_id, "playbook": playbook, "step": step, "unit_id": unit_id}
-        tag = os.environ.get("IMPROVE_UNIT_TAG", "")
-        if tag:
-            context["unit_tag"] = tag        # an experiment's per-run identity (never reused)
-        decl = lookup(self._declarations(), playbook, step)
-        if decl is None:
-            return context
-        from ..improve.fingerprint import compute
-
-        context["workflow"] = decl.workflow
-        context["item"] = item_for(decl, state)
-        from ..improve.artifacts import runtime_settings
-        digest, manifest = compute(decl, runtime_settings(self.settings, decl.workflow), state=state)
-        if digest:
-            context["fingerprint"] = digest
-        else:
-            context["fingerprint_missing"] = list(manifest.get("missing") or [])
+        if self.context_for:
+            context.update(self.context_for(step, state, item))
         return context
 
 
@@ -429,4 +407,5 @@ def _merge(results: list[StepResult]) -> StepResult:
         return StepResult(False, worst.failure,
                           f"{len(failed)}/{len(results)} items failed: {worst.summary}",
                           merged_outputs, changed)
-    return StepResult(True, None, f"all {len(results)} items ok", merged_outputs, changed)
+    return StepResult(True, None, f"all {len(results)} items ok", merged_outputs, changed,
+                      checkpoint=all(r.checkpoint for r in results))

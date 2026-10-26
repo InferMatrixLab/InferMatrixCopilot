@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-_SEVERITY_ORDER = {"blocker": 0, "major": 1, "minor": 2, "nit": 3}
+from ....review.severity import STRICT_SEVERITY_ORDER as _SEVERITY_ORDER
 
 # Identifiers that name what a finding is ABOUT: snake_case symbols, file
 # paths, CamelCase types, commit shas. Bare English is excluded on purpose —
@@ -255,39 +255,23 @@ def _sweep_targets(diff: str, language: str = "python") -> str:
     The line-level extractors are language-keyed (from the repo profile);
     an unknown language degrades to the file-level sections only — recorded
     honestly instead of running Python heuristics on foreign syntax."""
-    import re
-
+    from .anchor import diff_index
     from ....profiles.languages import sweep_re
     rules = sweep_re(language)
-    current: str | None = None
-    new_line = 0
     subs: list[str] = []
     branches: list[str] = []
-    files: set[str] = set()
-    test_files: set[str] = set()
-    regions: dict[str, list[int]] = {}
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            current = line[6:]
-            files.add(current)
-            if current.startswith("tests/") or "/tests/" in current:
-                test_files.add(current)
-        elif line.startswith("@@"):
-            m = re.search(r"\+(\d+)", line)
-            new_line = int(m.group(1)) if m else 0
-            if current and m:
-                regions.setdefault(current, []).append(new_line)
-        elif current and line.startswith("+") and not line.startswith("+++"):
-            code = line[1:]
+    index = diff_index(diff)
+    files = set(index)
+    test_files = {path for path in files if path.startswith("tests/") or "/tests/" in path}
+    regions = {path: entry.starts for path, entry in index.items() if entry.starts}
+    for current, entry in index.items():
+        for new_line, code in entry.added:
             stripped = code.strip()
             if rules is not None:
                 if rules[0].search(code):
                     subs.append(f"{current}:{new_line} `{stripped[:90]}`")
                 if rules[1].match(stripped):
                     branches.append(f"{current}:{new_line} `{stripped[:90]}`")
-            new_line += 1
-        elif current and not line.startswith("-"):
-            new_line += 1
     non_test = sorted(f for f in files if f not in test_files)
     out: list[str] = []
     if subs:
@@ -334,15 +318,20 @@ def _changed_symbols(diff: str) -> list[str]:
             seen.add(name)
             names.append(name)
 
-    for line in diff.splitlines():
-        m = re.match(r"^[+-]\s*(?:async\s+)?def\s+(\w+)|^[+-]\s*class\s+(\w+)",
-                     line)
-        if m:
-            add(m.group(1) or m.group(2))
-            continue
-        m = re.match(r"^@@[^@]*@@.*?\bdef\s+(\w+)", line)
-        if m:
-            add(m.group(1))
+    from ....review.diff import parse_diff
+
+    for item in parse_diff(diff):
+        lines = ([line for hunk in item.hunks for line in
+                  [hunk.header, *(change.kind + change.text for change in hunk.lines)]]
+                 if item.hunks else [change.kind + change.text for change in item.changes])
+        for line in lines:
+            m = re.match(r"^[+-]\s*(?:async\s+)?def\s+(\w+)|^[+-]\s*class\s+(\w+)", line)
+            if m:
+                add(m.group(1) or m.group(2))
+                continue
+            m = re.match(r"^@@[^@]*@@.*?\bdef\s+(\w+)", line)
+            if m:
+                add(m.group(1))
     return names
 
 
@@ -485,12 +474,7 @@ def _review_summary_parts(output: dict) -> list[str]:
 # posted with a severity (JiusiServe/InferMatrixCopilot#141). Selection is
 # data now: every output form renders from the set this function returns.
 PUBLISH_DISPOSITION = "publish"
-WITHHOLDING_DISPOSITIONS = frozenset({
-    "excluded",    # the review decided against raising it
-    "duplicate",   # consolidated into another finding in this same review
-    "resolved",    # the change already answers it; nothing is being asked
-    "no_issue",    # checked and found correct — a negative check, not a defect
-})
+from ....review.rechecks import WITHHELD_DISPOSITIONS as WITHHOLDING_DISPOSITIONS
 
 
 def _disposition_of(comment: dict) -> str:

@@ -240,7 +240,7 @@ def build_mcp(
     from mcp.types import ToolAnnotations
 
     core = core or CopilotMCP(settings)
-    from .sdk.v1.direct import DirectClient
+    from .review.direct import DirectClient
     context_client = DirectClient(knowledge_context_path=core.settings.run_root / "knowledge-context.sqlite",
                                  allowed_knowledge_repositories=core.settings.allowed_knowledge_repositories)
 
@@ -347,7 +347,7 @@ def build_mcp(
                 raise ValueError("mode must be 'direct' or 'strict'")
             if selected_mode == "direct":
                 if knowledge_profile == "adaptive":
-                    from .sdk.v1.models import ChangedPath, DirectReviewRequest, RepositoryRef
+                    from .contracts.models import ChangedPath, DirectReviewRequest, RepositoryRef
                     request = DirectReviewRequest(idempotency_key or f"direct:{target}", RepositoryRef(repo),
                                                   0, expected_head_sha, title, body,
                                                   tuple(ChangedPath(path) for path in changed_files or ()), diff=diff)
@@ -537,7 +537,7 @@ def build_mcp(
         return _guard(run)
 
     def rfc_call(action: str, payload: dict | None = None) -> dict:
-        from .sdk.v1.rfc import RFCClient, RFCClientError
+        from .rfc_service.client import RFCClient, RFCClientError
 
         try:
             return RFCClient.from_env().dispatch(action, payload)
@@ -589,7 +589,7 @@ def build_mcp(
                                source_reserve_tokens: int = 32000,
                                output_reserve_tokens: int = 8192) -> dict:
         """Open an explicit adaptive 24k/64k session; supplied model capacity is configuration, not detected usage."""
-        from .sdk.v1.models import DirectReviewRequest, RepositoryRef
+        from .contracts.models import DirectReviewRequest, RepositoryRef
         from .knowledge_context import ContextBudget
         def run():
             request = DirectReviewRequest(review_id, RepositoryRef(repo), 0, source_pin, "", "", ())

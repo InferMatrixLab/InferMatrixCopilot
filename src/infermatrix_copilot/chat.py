@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .run_trace import RunTrace
 from .task_spec import TaskSpec
-from .tools import GREP_EXCLUDE_DIRS, bounded
+from .tools import GREP_EXCLUDE_DIRS, bounded, search_files
 from .ui import make_ui
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -327,26 +327,16 @@ class ChatSession:
             err = self._check_read(root or "/nonexistent")
             if err:
                 return err
-            import subprocess
             # literal by default and no regex opt-in: this is the human-facing REPL,
             # where the smaller surface beats the flexibility. Same reasoning as
             # tools._grep — a bracketed expression must not silently become a
             # character class. Exit codes are the contract there too: a failed
             # search must not be reported as an empty one.
-            out = subprocess.run(
-                ["grep", "-rn", "-F",
-                 *(f"--exclude-dir={d}" for d in GREP_EXCLUDE_DIRS),
-                 "-e", args["pattern"], root],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=60)
-            if out.returncode not in (0, 1):
-                return (f"grep failed (exit {out.returncode}): "
-                        + (bounded(out.stderr.strip(), 500, "grep stderr")
-                           or "no stderr"))
-            if out.returncode == 1:
-                return "(no matches)"
-            return bounded(out.stdout, _REPO_GREP_CHARS, "repo_grep",
-                           hint="narrow the pattern or search a subdirectory")
+            try:
+                return search_files(args["pattern"], root,
+                                    max_chars=_REPO_GREP_CHARS, label="repo_grep")
+            except RuntimeError as exc:
+                return str(exc)
         return f"unknown tool: {name}"
 
     def _run_outcome(self, code: int) -> str:

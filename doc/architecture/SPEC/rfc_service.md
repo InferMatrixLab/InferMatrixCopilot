@@ -29,6 +29,7 @@
 | `model_status` | 不含模型原始事件的额度、限流、认证及可用性状态 |
 | `providers` | GitHub、AtomGit v5、允许根目录内的 Markdown/Git 访问与发布恢复 |
 | `http` | 固定资源列表、会话、同源 HTTP 传输及受保护的旧 roadmap 路由 |
+| `client` | CLI、MCP 与公开 SDK 共同使用的延迟加载本地／HTTP 客户端；SDK 仅重导出 |
 | `cli` | 独立服务命令、用户请求、文件交换、前台 worker 与显式迁移入口 |
 | `migration` | 旧 Personal-Agent 跟踪状态的只读比较、备份和幂等 sidecar 导入 |
 | `chat` | 私有会话、独立任务租约、受限模型工具、完整候选提案与校验 |

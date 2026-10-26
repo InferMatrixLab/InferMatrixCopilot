@@ -26,7 +26,7 @@ def test_genuine_old_native_pass_is_locally_declined_without_mutating_proof(worl
     with monkeypatch.context() as old:
         old.setattr(KnowledgeGateway, "call_json", historical)
         old.setattr(parallel, "local_privacy_reason", lambda text: "")
-        old.setattr("infermatrix_copilot.kb_service.init_stages.run_knowledge_validators", lambda *a: [])
+        old.setattr("infermatrix_copilot.kb_service.init_execution.run_knowledge_validators", lambda *a: [])
         rt, record, offline, traces = _complete_native(world)
     before = copy.deepcopy(record.coverage["foundation_jobs"])
     native_bytes = {p: p.read_bytes() for p in (rt.state_dir / "init" / "traces" / "records").glob("*.jsonl")}

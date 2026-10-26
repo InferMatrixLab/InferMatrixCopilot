@@ -50,7 +50,7 @@ import yaml
 from ..knowledge_service.facts import FactsError
 from ..knowledge_service.l1 import check_changeset
 from ..knowledge_service.lifecycle import LifecycleError, Page
-from ..knowledge_service.pinned_claims import Evidence
+from ..knowledge_service.pinned_claims import Evidence, evidence_text
 from .gate import changes_between
 from .init_stages import MAX_EXCERPT_BYTES, _Candidate, _Stage, adapter_missing
 from .init_support import STAGES, InitError, InitRecord
@@ -59,7 +59,6 @@ CALIBRATION_DIR = "kb-calibration"
 MIN_TRUSTED_BAD = 5
 RULE_STAGES = tuple(s for s in STAGES if s not in ("feature-discovery", "knowledge", "harvest-calibration"))
 MUTATIONS = ("broken_path", "shifted_range", "negated", "sibling_evidence")
-_HEADER = re.compile(r"^knowledge_lifecycle:\s*(?:#.*)?$")
 _CALIBRATION_LINE = re.compile(r"^(?P<indent>[ \t]+)calibration_set:(?P<space>[ \t]*)(?P<value>[^#\n]*?)"
                                r"(?P<comment>[ \t]+#[^\n]*)?(?P<eol>\r?\n|)$")
 _CASE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -98,18 +97,8 @@ def set_calibration_set(text: str, value: str = CALIBRATION_DIR) -> str:
     edited in place: one line changes or is appended to the block; every
     other line is kept byte for byte. Raises ``InitError`` when the manifest
     names another calibration set (init only writes ``kb-calibration``)."""
-    lines = text.splitlines(keepends=True)
-    header = next((i for i, line in enumerate(lines) if _HEADER.match(line.rstrip("\r\n"))), None)
-    if header is None:
-        raise InitError("the adapter manifest has no top-level knowledge_lifecycle block")
-    end = header + 1
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() and not line[:1].isspace() and not line.lstrip().startswith("#"):
-            break
-        end += 1
-    indent = next((m.group(1) for line in lines[header + 1:end]
-                   for m in [re.match(r"^([ \t]+)\S", line)] if m and not line.lstrip().startswith("#")), "  ")
+    from .init_deepen import _lifecycle_block
+    lines, header, end, indent = _lifecycle_block(text)
     for i in range(header + 1, end):
         match = _CALIBRATION_LINE.match(lines[i])
         if not match or match.group("indent") != indent:
@@ -146,6 +135,9 @@ class _Judged:
 
 @dataclass
 class _Harvest(_Stage):
+
+    # Calibration has checkpointed judgments, no generation calls.
+    GENERATION_TASK_JOURNALED = True
     STAGE = "harvest-calibration"
 
     def _precheck(self) -> list[str]:
@@ -199,13 +191,12 @@ class _Harvest(_Stage):
         return observer
 
     def _excerpt(self, pin: str, entry: Evidence) -> dict | None:
-        text = self._observer(pin).file_text(pin, entry.path)
+        # Harvest intentionally inspects changed source against older evidence;
+        # it shares range materialization without asserting the old content hash.
+        text = evidence_text(self._observer(pin), entry, verify_hash=False)
         if text is None:
             return None
-        lines = text.splitlines()
-        if not 1 <= entry.start <= entry.end <= len(lines):
-            return None
-        excerpt = "\n".join(lines[entry.start - 1:entry.end]).encode("utf-8")[:MAX_EXCERPT_BYTES]
+        excerpt = text.encode("utf-8")[:MAX_EXCERPT_BYTES]
         return {"source_reference": f"{self.lifecycle.full_name}@{pin[:12]}:{entry.path}:"
                                     f"L{entry.start}-L{entry.end}",
                 "kind": "upstream_text", "text": excerpt.decode("utf-8", "ignore")}
@@ -294,7 +285,7 @@ class _Harvest(_Stage):
             cases.append(mutated)
             counts["bad_synthetic"] += 1
         trusted = counts["bad_owner"] + counts["bad_synthetic"]
-        self.record.coverage = {}
+        self._replace_coverage({})
         self.record.notes.append(
             "calibration cases: {good} good; bad {bad_owner} from the owner, {bad_judge} from the judge, "
             "{bad_synthetic} synthetic; {skipped} rule(s) not labelled".format(**counts))

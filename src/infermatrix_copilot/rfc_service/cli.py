@@ -115,7 +115,7 @@ def _run_cycle(service, limit: int) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    from ..sdk.v1.rfc import RFCClient, RFCClientError
+    from .client import RFCClient, RFCClientError
 
     service_url = "" if args.local else args.service_url
     state = Path(args.state_dir).expanduser() if args.state_dir else Path.home() / ".infermatrix-copilot" / "rfc"

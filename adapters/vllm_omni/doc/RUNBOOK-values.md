@@ -1,5 +1,15 @@
 # RUNBOOK values — adapter zero (vllm-omni)
 
+Current boundary (2026-10-14): the user retired the external rebase agent.
+Copilot's shipped adapter runs its internal engine and uses its own knowledge
+stores; no external checkout, EXT1 pin, parent data layer or external rollback
+run is required. `REBASE_AGENT_ROOT` is deprecated and unset by default; an
+existing explicit value is only available to custom legacy data imports.
+The deployment comparisons and machine paths below are historical evidence,
+not current preconditions. Keep internal checkout exclusion and bundled prompt
+goldens. Never replay historical paid runs or alter their original ledgers to
+satisfy a current gate.
+
 The repo-specific companion to the neutral `doc/RUNBOOK-rebase.md`
 template: placeholder resolutions, evidence log, owner decisions, and
 run-day fill-in tables for THIS adapter's cutover. Machine-readable

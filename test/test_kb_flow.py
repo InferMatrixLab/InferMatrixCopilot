@@ -344,6 +344,112 @@ def test_sweep_retires_an_invalidated_rule_through_the_gate(tmp_path):
     assert rt.ledger.get_cursor("demo", "sweep_baseline") == v2
 
 
+@pytest.mark.parametrize('fault', ['unknown', 'crash'])
+def test_sweep_generation_retains_dispatch_identity_across_interruption(tmp_path, fault):
+    from infermatrix_copilot.kb_service.models import ModelUnavailable
+    rt, lifecycle = _flow_runtime(tmp_path)
+    upstream, v1, v2 = _upstream(tmp_path)
+    owner = rt.ledger.acquire_lease('sweeper')
+    sweep = {'tag': 'v2', 'from_sha': v1, 'to_sha': v2, 'reason': 'release'}
+
+    def interrupted(role, prompt):
+        if fault == 'crash':
+            raise KeyboardInterrupt('worker interrupted')
+        error = ModelUnavailable('native outcome unknown', allow_fallback=False)
+        error.native_call_sent, error.native_call_completed = True, False
+        raise error
+
+    rt.gateway = ScriptedGateway(interrupted)
+    with pytest.raises(KeyboardInterrupt if fault == 'crash' else ModelUnavailable):
+        run_sweep(rt, lifecycle, owner, sweep, upstream)
+    calls = list(rt.gateway.calls)
+    assert len(calls) == 1
+    states = rt.ledger.cursors_with_prefix('demo', 'draft:sweep:')
+    state, = [json.loads(value) for value in states.values()]
+    assert state['draft_dispatched'] and 'draft_result' not in state
+    with pytest.raises(ModelUnavailable, match='reconcile original dispatch'):
+        run_sweep(rt, lifecycle, owner, sweep, upstream)
+    assert rt.gateway.calls == calls
+    assert rt.ledger.changesets_of_kind('demo', 'sweep') == []
+
+
+def test_sweep_reuses_completed_generation_before_gate_reservation(tmp_path, monkeypatch):
+    from infermatrix_copilot.kb_service import runtime
+    rt, lifecycle = _flow_runtime(tmp_path)
+    upstream, v1, v2 = _upstream(tmp_path)
+    owner = rt.ledger.acquire_lease('sweeper')
+    sweep = {'tag': 'v2', 'from_sha': v1, 'to_sha': v2, 'reason': 'release'}
+
+    def answer(role, prompt):
+        if role.name == 'generator':
+            return {'operations': [{'kind': 'retire', 'page': PAGE, 'rule_id': 'DEMO-1a',
+                                    'reason': 'upstream-removed', 'evidence': 'release v2'}]}
+        return _judge_all('yes')(role, prompt)
+
+    rt.gateway = ScriptedGateway(answer)
+    original_gate = runtime.gate_and_stage
+
+    def interrupted(*args, **kwargs):
+        raise OSError('interrupted before gate reservation')
+
+    monkeypatch.setattr(runtime, 'gate_and_stage', interrupted)
+    with pytest.raises(OSError, match='before gate reservation'):
+        run_sweep(rt, lifecycle, owner, sweep, upstream)
+    generator_calls = [c for c in rt.gateway.calls if c[0] == 'generator']
+    assert len(generator_calls) == 1
+    assert rt.ledger.changesets_of_kind('demo', 'sweep') == []
+    monkeypatch.setattr(runtime, 'gate_and_stage', original_gate)
+    report = run_sweep(rt, lifecycle, owner, sweep, upstream)
+    assert report['complete'] and len(report['changesets']) == 1
+    assert [c for c in rt.gateway.calls if c[0] == 'generator'] == generator_calls
+
+
+@pytest.mark.parametrize('failure_at', ['gate_return', 'release', 'settlement'])
+def test_sweep_resume_reuses_settled_gate_before_progress_write(tmp_path, monkeypatch, failure_at):
+    from infermatrix_copilot.kb_service import runtime, sweep as sweep_module
+
+    def answer(role, prompt):
+        if role.name == 'generator':
+            return {'operations': [{'kind': 'retire', 'page': PAGE, 'rule_id': 'DEMO-1a',
+                                    'reason': 'upstream-removed', 'evidence': 'release v2'}]}
+        return _judge_all('yes')(role, prompt)
+
+    rt, lifecycle = _flow_runtime(tmp_path)
+    rt.gateway = ScriptedGateway(answer)
+    upstream, v1, v2 = _upstream(tmp_path)
+    owner = rt.ledger.acquire_lease('sweeper')
+    sweep = {'tag': 'v2', 'from_sha': v1, 'to_sha': v2, 'reason': 'release'}
+    module, name = ((runtime, 'gate_and_stage') if failure_at == 'gate_return'
+                    else (sweep_module, '_release_held'))
+    if failure_at == 'settlement':
+        module, name = rt.ledger, 'stage_intake'
+    original = getattr(module, name)
+
+    def interrupt(*args, **kwargs):
+        if failure_at == 'settlement':
+            if kwargs.get('expected_status'):
+                raise OSError('response lost before progress checkpoint')
+            return original(*args, **kwargs)
+        original(*args, **kwargs)
+        raise OSError('response lost before progress checkpoint')
+
+    monkeypatch.setattr(module, name, interrupt)
+    with pytest.raises(OSError, match='response lost'):
+        run_sweep(rt, lifecycle, owner, sweep, upstream)
+    row, = rt.ledger.changesets_of_kind('demo', 'sweep')
+    calls = list(rt.gateway.calls)
+    monkeypatch.setattr(module, name, original)
+    if failure_at == 'settlement':
+        from infermatrix_copilot.kb_service.gate_receipts import settle_gate_result
+        assert row['status'] == 'review_pending'
+        settle_gate_result(rt.ledger, rt.state_dir, owner, row['id'])
+    report = run_sweep(rt, lifecycle, owner, sweep, upstream)
+    assert rt.gateway.calls == calls
+    assert report['changesets'] == [row['id']]
+    assert report['complete']
+    assert len(rt.ledger.changesets_of_kind('demo', 'sweep')) == 1
+
+
 def test_sweep_circuit_breaker_routes_everything_to_people(tmp_path):
     def answer(role, prompt):
         if role.name == "generator":

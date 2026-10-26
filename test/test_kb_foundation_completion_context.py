@@ -83,11 +83,6 @@ def test_version5_retains_native_generator_and_independent_judge_binding(world, 
         rt.environ = {**rt.environ, "KB_KNOWLEDGE_CONTEXT_VERSION": "5"}
         return rt
     monkeypatch.setattr(fixtures, "_runtime", runtime)
-    original_call = fixtures.KnowledgeGateway.call_json
-    def scripted_reply(self, role, *, system, **kwargs):
-        return original_call(self, role, system=SYSTEM_KNOWLEDGE_V4 if system == SYSTEM_KNOWLEDGE_V5 else system,
-                             **kwargs)
-    monkeypatch.setattr(fixtures.KnowledgeGateway, "call_json", scripted_reply)
     rt, record, _, traces = fixtures._complete_native(world)
     stage = _audit_stage(rt, record)
     stage.record = record
@@ -97,4 +92,5 @@ def test_version5_retains_native_generator_and_independent_judge_binding(world, 
         assert result["payload"]["foundation_prompt_version"] == 5
         for artifact in result["artifacts"]:
             call = traces.get(artifact["generator_receipt"]["native_trace_id"])
-            assert traces.blob(call["inputs"]["system"]) == SYSTEM_KNOWLEDGE_V5
+            assert result["payload"]["foundation_generation_policy_version"] == 1
+            assert traces.blob(call["inputs"]["system"]) == knowledge_system(result["payload"])

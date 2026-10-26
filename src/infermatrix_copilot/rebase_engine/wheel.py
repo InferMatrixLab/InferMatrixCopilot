@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 
-from ..testing.process_tree import _pgrep, kill_tree
+from ..process_tree import _pgrep, kill_tree
+from ..process_execution import run_command
 
 
 def _log(msg: str) -> None:
@@ -102,9 +103,9 @@ def _run(cmd: list[str], *, cwd: Path | None = None,
          env: Mapping[str, str] | None = None,
          timeout: float = 600.0) -> tuple[int, str, str]:
     try:
-        p = subprocess.run(cmd, cwd=str(cwd) if cwd else None,
+        p = run_command(cmd, cwd=str(cwd) if cwd else None,
                            env=dict(env) if env is not None else None,
-                           capture_output=True, text=True, errors="replace",
+                           errors="replace",
                            timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, "", str(e)

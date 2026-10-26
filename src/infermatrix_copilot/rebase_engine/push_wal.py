@@ -17,9 +17,10 @@ were ABSENT before the run.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes, fsync_directory
+
 import errno
 import json
-import os
 import re
 import subprocess
 import time
@@ -74,18 +75,13 @@ _DIR_FSYNC_TOLERATED = {errno.EINVAL, errno.ENOTSUP if hasattr(errno, "ENOTSUP")
 
 def _durable_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=1, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    atomic_write_bytes(path, json.dumps(payload, indent=1, sort_keys=True).encode("utf-8"),
+                       directory_fsync=_sync_directory)
+
+
+def _sync_directory(directory):
     try:
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        fsync_directory(directory)
     except OSError as e:
         if e.errno not in _DIR_FSYNC_TOLERATED:
             raise PushWalError(

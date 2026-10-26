@@ -1,0 +1,17 @@
+name: kb-init-stage
+version: 2
+status: candidate
+provenance:
+  created_by: human
+  source: knowledge lifecycle reuse design
+# Bound by kb init after immutable input resolution and the business batch lock.
+# knowledge.init and kb-init remain compatibility entries for general workflows.
+task_kinds: []
+repos: []
+steps:
+  - {id: prepare, step: knowledge.init.prepare, params: {phase: prepare}}
+  - {id: draft, step: knowledge.init.draft, params: {phase: draft}, when: init_draft}
+  - {id: validate, step: knowledge.init.validate, params: {phase: validate}, when: init_draft}
+  - {id: prepare_publication, step: knowledge.init.prepare_publication, params: {phase: prepare_publication}, when: init_draft}
+  - {id: publish, step: knowledge.init.publish, params: {phase: publish}}
+success: validated candidate artifacts have completed the original idempotent publication protocol

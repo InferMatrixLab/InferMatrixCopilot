@@ -21,6 +21,8 @@ Restoring is extracting the archives in name order into an empty trace root
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import hashlib
 import io
 import json
@@ -72,13 +74,9 @@ def make_archive(rt) -> Path | None:
             tar.addfile(info, io.BytesIO(data))
     blob = buffer.getvalue()
     manifest = f"{_sha(blob)}  {name}\n" + "".join(f"{_sha(data)}  {rel}\n" for rel, data in members)
-    tmp = out_dir / f".{name}.tmp"
-    tmp.write_bytes(blob)
-    tmp.replace(out_dir / name)
+    atomic_write_bytes(out_dir / name, blob)
     (out_dir / f"{name}.sha256").write_text(manifest, encoding="utf-8")  # written last: marks it complete
-    tmp_index = out_dir / f".{INDEX}.tmp"
-    tmp_index.write_text(json.dumps(archived, sort_keys=True), encoding="utf-8")
-    tmp_index.replace(index_path)  # only after the archive is complete
+    atomic_write_bytes(index_path, json.dumps(archived, sort_keys=True).encode("utf-8"))  # after the complete archive
     return out_dir / name
 
 

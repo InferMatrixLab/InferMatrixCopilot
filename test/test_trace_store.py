@@ -20,6 +20,24 @@ JUDGE = ModelRole("judge", "codex", "gpt-6-sol", "medium")
 CHEAP = ModelRole("judge", "codex", "gpt-6-mini", "low")
 
 
+def test_authoritative_record_selection_keeps_controls_without_rebuilding_index(tmp_path):
+    store = TraceStore(tmp_path/'traces', environ={})
+    model = store.append('model_call', inputs={'prompt': 'original'})
+    control = store.append('auth_probe', context=model['context'], result={'model_calls': 0})
+    store.index_path.unlink()
+    assert [row for row, _ in store.iter_records()] == [model, control]
+    assert [row for row, _ in store.iter_records(kind='model_call')] == [model]
+    assert [row for row, _ in store.iter_records(kind='auth_probe')] == [control]
+    assert not store.index_path.exists()
+    with pytest.raises(ValueError, match='unknown record kind'):
+        list(store.iter_records(kind='model_calls'))
+    path, = (store.root/'records').glob('*.jsonl')
+    with path.open('a') as handle:
+        handle.write('{unreadable-control\n')
+    with pytest.raises(json.JSONDecodeError):
+        list(store.iter_records(kind='model_call'))
+
+
 class Transport:
     """A harness transport answering with scripted text (or raising)."""
 

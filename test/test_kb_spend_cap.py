@@ -68,6 +68,7 @@ def test_claude_reports_a_call_stopped_at_its_cap(tmp_path):
     reply = transport.complete(system="S", messages=MESSAGES, max_budget_usd=0.01)
     assert reply.stop_reason == "max_budget"
     assert reply.text == ""  # a budget-truncated answer is never usable
+    assert reply.usage["cost_usd"] == pytest.approx(0.07)
 
 
 def test_claude_rejects_a_non_positive_cap(tmp_path):

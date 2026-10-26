@@ -28,7 +28,7 @@ import yaml
 from .adapters import AdapterError, AdapterRegistry, RepoAdapter
 from .knowledge_view import KnowledgeView
 from .knowledge_docs import KnowledgeDocs
-from .sdk._resources import adapters_root
+from .resources import adapters_root
 from .ut_coverage import UTCoverageRules, analyze as _ut_analyze
 from .ut_coverage import REVIEWER_INSTRUCTIONS as _UT_INSTRUCTIONS
 
@@ -185,17 +185,9 @@ DIRECT_PROGRESS_UPDATE = {
 }
 
 
-_SUBTRACTION_ACTIONS = {"DELETE", "DEFER", "INLINE", "MERGE", "MOVE"}
 _SUBTRACTION_SIGNALS = {"none", "triggered"}
 _FEEDBACK_STATUSES = {"checked", "disabled", "unavailable", "not_applicable"}
-_RESOLVED_HEAD_RECHECKS = {"fixed", "still_affected"}
-_FINDING_DISPOSITIONS = {
-    "new",
-    "duplicate",
-    "extends_existing",
-    "resolved_or_outdated",
-}
-_EVIDENCE_HEAD_SHA = re.compile(r"[0-9a-f]{7,40}")
+_EVIDENCE_HEAD_SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def _normalize_repo(repo: str, view: KnowledgeView | None = None) -> str:
@@ -826,29 +818,12 @@ def _direct_completion_result(
             "'unavailable', or 'not_applicable'"
         )
 
-    malformed_dispositions: list[int] = []
+    from .review.review_result import disposition, has_minimality_proof, valid_subtraction
+    malformed_dispositions = []
     for index, item in enumerate(finding_dispositions):
-        if not isinstance(item, dict):
-            malformed_dispositions.append(index)
-            continue
-        anchor = str(item.get("anchor", "")).strip()
-        disposition = str(item.get("disposition", "")).strip().casefold()
-        existing_thread = str(item.get("existing_thread", "")).strip()
-        head_recheck = str(item.get("head_recheck", "")).strip().casefold()
-        needs_thread = disposition in {
-            "duplicate",
-            "extends_existing",
-            "resolved_or_outdated",
-        }
-        if (
-            ":" not in anchor
-            or disposition not in _FINDING_DISPOSITIONS
-            or (needs_thread and not existing_thread)
-            or (
-                disposition == "resolved_or_outdated"
-                and head_recheck not in _RESOLVED_HEAD_RECHECKS
-            )
-        ):
+        try:
+            disposition(item)
+        except ValueError:
             malformed_dispositions.append(index)
     if malformed_dispositions:
         missing.append(
@@ -863,21 +838,7 @@ def _direct_completion_result(
             "finding_dispositions require existing_feedback_status='checked'"
         )
 
-    malformed_subtractions: list[int] = []
-    for index, item in enumerate(subtraction):
-        if not isinstance(item, dict):
-            malformed_subtractions.append(index)
-            continue
-        anchor = str(item.get("anchor", "")).strip()
-        action = str(item.get("action", "")).strip()
-        risk = str(item.get("risk", "")).strip()
-        action_kind = action.split(maxsplit=1)[0].upper() if action else ""
-        if (
-            ":" not in anchor
-            or action_kind not in _SUBTRACTION_ACTIONS
-            or not risk
-        ):
-            malformed_subtractions.append(index)
+    malformed_subtractions = [index for index, item in enumerate(subtraction) if not valid_subtraction(item)]
     if malformed_subtractions:
         missing.append(
             "each subtraction item needs a path:line anchor, a "
@@ -886,15 +847,7 @@ def _direct_completion_result(
         )
 
     has_subtraction = bool(subtraction) and not malformed_subtractions
-    proof_fields = (
-        "scope_ledger",
-        "abstraction_census",
-        "why_no_safe_deletion",
-    )
-    has_minimality_proof = all(
-        len(str(minimality_proof.get(field, "")).strip()) >= 12
-        for field in proof_fields
-    )
+    has_minimality_proof = has_minimality_proof(minimality_proof)
     if (
         subtraction_signal == "none"
         and (subtraction or minimality_proof)
@@ -926,29 +879,14 @@ def _direct_completion_result(
         "existing_feedback_status": existing_feedback_status,
         "finding_dispositions": len(finding_dispositions),
         "duplicate_findings_suppressed": sum(
-            1
-            for item in finding_dispositions
-            if isinstance(item, dict)
-            and (
-                str(item.get("disposition", "")).strip().casefold()
-                == "duplicate"
-                or (
-                    str(item.get("disposition", "")).strip().casefold()
-                    == "resolved_or_outdated"
-                    and str(item.get("head_recheck", "")).strip().casefold()
-                    == "fixed"
-                )
-            )
-        ),
+            str(item.get("disposition", "")).strip().casefold() == "duplicate" or (
+                str(item.get("disposition", "")).strip().casefold() == "resolved_or_outdated"
+                and str(item.get("head_recheck", "")).strip().casefold() == "fixed")
+            for item in finding_dispositions if isinstance(item, dict)),
         "resolved_or_outdated_still_affected": sum(
-            1
-            for item in finding_dispositions
-            if isinstance(item, dict)
-            and str(item.get("disposition", "")).strip().casefold()
-            == "resolved_or_outdated"
-            and str(item.get("head_recheck", "")).strip().casefold()
-            == "still_affected"
-        ),
+            str(item.get("disposition", "")).strip().casefold() == "resolved_or_outdated"
+            and str(item.get("head_recheck", "")).strip().casefold() == "still_affected"
+            for item in finding_dispositions if isinstance(item, dict)),
         "missing": missing,
         "next_action": (
             "Return the single consolidated review comment with duplicate findings suppressed."

@@ -23,7 +23,6 @@ import fcntl
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
@@ -53,21 +52,9 @@ class OutboxError(RuntimeError):
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
+    from ..persistence import atomic_write_bytes
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(canonical_json(data))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write_bytes(path, canonical_json(data), mode=0o644)
 
 
 @dataclass(frozen=True)

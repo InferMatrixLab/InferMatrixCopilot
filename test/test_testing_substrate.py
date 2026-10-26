@@ -927,17 +927,33 @@ def test_reconcile_unclaimed_status_spared_for_lock_loser(tmp_path):
     assert out["state"] == rs.INTERRUPTED
 
 
-def test_final_scan_kill_works_after_leader_reaped(runner, tmp_path):
+def test_final_scan_kill_works_after_leader_reaped(runner, tmp_path, monkeypatch):
     """Short command logs a critical line, backgrounds a child, exits: the
     final scan fires after proc.wait(), and the kill must still reach the
     group via the pre-captured pgid."""
     pidfile = tmp_path / "bg.pid"
     log = tmp_path / "tests" / "20_fastbg.log"
+    # Exercise the final scan deterministically, without a periodic scan racing
+    # the child startup or killing the leader before proc.wait() reaps it.
+    monkeypatch.setattr(LogWatchdog, "start", lambda self: self)
+    check_once = LogWatchdog.check_once
+    reaped = []
+
+    def check_after_reap(watchdog):
+        with pytest.raises(ChildProcessError):
+            os.waitpid(watchdog.pid, os.WNOHANG)
+        reaped.append(watchdog.pid)
+        return check_once(watchdog)
+
+    monkeypatch.setattr(LogWatchdog, "check_once", check_after_reap)
     job = TestJob(
         key="fastbg", timeout_sec=30, min_gpus=0, index=20,
         command=(f"bash -c 'echo $$ > {pidfile}; exec sleep 60' &\n"
+                 f'for attempt in {{1..500}}; do test -s "{pidfile}" && break; sleep .01; done\n'
+                 f'test -s "{pidfile}"\n'
                  f"echo 'CUDA out of memory' >> {log}; true"))
     out = runner.run(job, dict(os.environ))
+    assert len(reaped) == 1
     assert out.watchdog_triggered and out.rc != 0
     child = int(pidfile.read_text().strip())
     deadline = time.monotonic() + 10
@@ -1160,7 +1176,7 @@ def test_dir_fsync_swallow_is_scoped_to_unsupported(settings, trace, tmp_path,
     from infermatrix_copilot.engine.executor import Executor
     from infermatrix_copilot.engine.registry import StepRegistry
     ex = Executor(StepRegistry(), settings, run_dir=tmp_path / "r", trace=trace)
-    import infermatrix_copilot.engine.executor as exmod
+    import infermatrix_copilot.persistence as exmod
     real_open = exmod.os.open
 
     def raising_open(path, flags, *a, **k):

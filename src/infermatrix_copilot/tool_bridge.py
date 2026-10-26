@@ -39,15 +39,19 @@ from pathlib import Path
 
 from .run_trace import RunTrace
 from . import trace_store
-from .scopes import PathScope, ToolScope
+from .scopes import PathScope, ToolScope, READ_TOOLS
 from .tools import _PATH_ARGS, TOOLS, dispatch
 
 _SPEC_VERSION = 2
+READ_ONLY_BRIDGE_TOOLS = READ_TOOLS | frozenset({
+    'doc_search', 'doc_read', 'repo_map', 'diff_stat', 'file_at_base',
+    'show_commit', 'search_history', 'calc'})
 
 
 # -- spec serialization ------------------------------------------------------
 def write_bridge_spec(*, run_dir: Path, step_name: str, scope: ToolScope,
-                      repo: str, rebase: dict | None = None) -> Path:
+                      repo: str, rebase: dict | None = None,
+                      knowledge_dir: str | Path | None = None) -> Path:
     """Serialize one step's tool surface under ``<run_dir>/bridge/``. The
     filename is sanitized from the step name (ensemble steps carry ``#``)."""
     bridge_dir = Path(run_dir) / "bridge"
@@ -81,6 +85,10 @@ def write_bridge_spec(*, run_dir: Path, step_name: str, scope: ToolScope,
         "trace_store_root": str(trace_store.current_store().root)
         if trace_store.current_store() is not None else "",
         "trace_context": trace_store.current_context(),
+        # Application composition supplies the run's selected tree. Native
+        # CLIs filter the host environment, so the bridge cannot inherit it.
+        **({"knowledge_dir": str(Path(knowledge_dir).resolve())}
+           if knowledge_dir is not None else {}),
         # Optional rebase surface (see `_rebase_extra`). Carries PATHS and
         # model identity only: no api_key and no child env, so nothing
         # secret lands in this file — the bridge process reads credentials
@@ -345,7 +353,7 @@ def build_server(spec_path: Path):
 
     scope, spec = load_bridge_spec(spec_path)
     trace = RunTrace(Path(spec["trace_path"]))
-    roots = tuple(r for r in (scope.root, spec.get("run_dir", "")) if r)
+    roots = tuple(r for r in (scope.root, spec.get("run_dir", ""), spec.get("input_run_dir", "")) if r)
 
     rebase_extra: dict = {}
     rebase_defs: list[dict] = []
@@ -459,8 +467,11 @@ def _bridge_ctx(spec: dict, scope: ToolScope, trace: RunTrace):
 
     from .config import Settings
 
+    settings = Settings()
+    if spec.get('knowledge_dir'):
+        settings = settings.model_copy(update={'knowledge_dir': Path(spec['knowledge_dir'])})
     return SimpleNamespace(
-        settings=Settings(),
+        settings=settings,
         state={"task_spec": {"repo": spec.get("repo", "")},
                "repo_path": scope.root},
         run_dir=Path(spec["run_dir"]),
@@ -481,6 +492,7 @@ def _register_knowledge_tools(mcp, spec: dict, scope: ToolScope,
             _resolve_adapter,
         )
         from .knowledge_docs import KnowledgeDocs
+        from .knowledge_view import KnowledgeView
 
         ctx = _bridge_ctx(spec, scope, trace)
         adapter = _resolve_adapter(ctx)
@@ -490,7 +502,8 @@ def _register_knowledge_tools(mcp, spec: dict, scope: ToolScope,
                            or {}).get("repo_subdir")
         if not repo_subdir and spec.get("repo"):
             repo_subdir = f"repos/{spec['repo']}"
-        docs = KnowledgeDocs(ctx.settings.knowledge_dir, repo_subdir)
+        view = KnowledgeView.for_root(ctx.settings.knowledge_dir)
+        docs = KnowledgeDocs(view.root, repo_subdir, verify=view.path)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the bridge
         trace.record("capability_gap", capability="bridge.knowledge_docs",
                      effect=f"doc tools unavailable: {type(exc).__name__}: {exc}")
@@ -541,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="infermatrix_copilot.tool_bridge",
         description="Scoped-tool MCP bridge for harness backends (stdio).")
     parser.add_argument("--spec", required=True, help="bridge spec JSON path")
+    parser.add_argument('--check', action='store_true', help='check bridge dependencies without starting a model')
     args = parser.parse_args(argv)
     try:
         server = build_server(Path(args.spec))
@@ -550,6 +564,18 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("the tool bridge needs the MCP SDK — "
                          "pip install 'infermatrix-copilot[mcp]'\n")
         return 1
+    if args.check:
+        import asyncio
+        import shutil
+        scope, _ = load_bridge_spec(Path(args.spec))
+        if scope.root and (Path(scope.root) / '.git').exists() and not shutil.which('git'):
+            raise RuntimeError('the source investigation bridge requires Git')
+        tools = sorted(tool.name for tool in asyncio.run(server.list_tools()))
+        required = set(scope.allowed_tools) | {'doc_read', 'doc_search'}
+        if not required <= set(tools):
+            raise RuntimeError('required bridge tools are unavailable')
+        print(json.dumps({'schema': 'bridge-readiness/1', 'tools': tools}))
+        return 0
     server.run()  # stdio transport by default
     return 0
 

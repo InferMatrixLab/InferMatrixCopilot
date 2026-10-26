@@ -358,6 +358,28 @@ def test_coordinator_resume_keeps_completed_paid_stages(bench, monkeypatch):
     assert coordinator.run(disabled, store)["state"] == "disabled"
 
 
+def test_coordinator_shared_execution_does_not_replay_unknown_paid_phase(bench, monkeypatch):
+    import asyncio
+    st, store, _, _ = bench()
+    from infermatrix_copilot.improve import coordinator, cycle
+    from infermatrix_copilot.engine.steps import improve
+    monkeypatch.setattr(cycle, "run_cycle", lambda *a, **k: {"units": 0})
+    sent = []
+
+    async def interrupted(ctx):
+        sent.append(True)
+        raise RuntimeError("dispatched without a result")
+
+    monkeypatch.setattr(improve, "_forensics", interrupted)
+    with pytest.raises(RuntimeError, match="dispatched without a result"):
+        coordinator.run(st, store)
+    checkpoint = json.loads((Path(st.improve_ledger_dir) / "coordinator.json").read_text())
+    assert checkpoint["stages"]["forensics"]["ok"] is False
+    monkeypatch.setattr(evolution, "run", lambda *a, **k: {"state": "deferred"})
+    result = asyncio.run(coordinator.run_async(st, store))
+    assert result["state"] == "complete" and sent == [True]
+
+
 def test_human_annotation_tools_freeze_real_unit_and_require_explicit_labels(tmp_path):
     from infermatrix_copilot.improve.annotations import operate
     store = TraceStore(tmp_path / "traces")
@@ -446,17 +468,20 @@ def test_kb_driver_uses_production_gate_and_only_valid_rule_coverage(bench, monk
 def test_adopted_configuration_reaches_model_client_without_mutating_other_steps(bench, tmp_path):
     st, _, _, _ = bench()
     import asyncio
-    from infermatrix_copilot.engine.executor import Executor
-    from infermatrix_copilot.engine.step import StepResult
-    from infermatrix_copilot.run_trace import RunTrace
+    from infermatrix_copilot.app.workflow_execution import WorkflowExecution
+    from infermatrix_copilot.engine.registry import StepRegistry
+    from infermatrix_copilot.engine.step import StepResult, StepSpec
+    from infermatrix_copilot.playbooks.store import Playbook, PlaybookStep
     artifacts.atomic_json(st.playbooks_dir / "evolution-overrides.json", {"workflow-improve.improve.forensics": {"LLM_MAX_TOKENS": "700"}})
     llm = SimpleNamespace(settings=st)
-    executor = Executor(registry=None, settings=st, run_dir=tmp_path / "run", trace=RunTrace(tmp_path / "trace.jsonl"), llm=llm)
     async def handler(ctx):
         assert ctx.llm.settings.llm_max_tokens == ctx.settings.llm_max_tokens == 700
         return StepResult(True)
-    result = asyncio.run(executor._run_step(SimpleNamespace(name="improve.forensics", handler=handler), {}, {"playbook": "workflow-improve"}, None))
-    assert result.ok and llm.settings.llm_max_tokens == 1000
+    registry = StepRegistry()
+    registry.register(StepSpec("improve.forensics", "agent", "read", handler))
+    plan = Playbook("workflow-improve", 1, "active", [], [], [PlaybookStep("forensics", "improve.forensics")])
+    result = asyncio.run(WorkflowExecution(st, registry).execute(plan, run_dir=tmp_path / "run", state={}, llm=llm))
+    assert result.status == "done" and llm.settings.llm_max_tokens == 1000
 
 
 def test_existing_baseline_refuses_new_revision_before_paid_generation(bench, tmp_path):
@@ -495,6 +520,13 @@ def test_coordinator_scopes_forensics_and_resumes_each_paid_scope(bench, monkeyp
     for workflow in ("pr-review.agent.review_diff", "pr-review.agent.review_diff", "kb-intake.draft"):
         assert coordinator.run(st, store, workflow=workflow, repo="demo")["state"] == "complete"
     assert seen == [{"workflow": "pr-review.agent.review_diff", "repo": "demo"}, {"workflow": "kb-intake.draft", "repo": "demo"}]
+
+    records = store.query(workflow="workflow-improve.improve.forensics")
+    unit_ids = {record["context"]["unit_id"] for record in records
+                if record.get("result", {}).get("type") == "step_result"}
+    assert len(unit_ids) == 2
+    assert any("forensics:pr-review.agent.review_diff:demo" in unit for unit in unit_ids)
+    assert any("forensics:kb-intake.draft:demo" in unit for unit in unit_ids)
 
 
 def test_unconfigured_model_tier_is_a_readiness_reason(bench):

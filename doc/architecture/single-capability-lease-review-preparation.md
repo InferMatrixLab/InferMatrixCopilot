@@ -1,0 +1,11 @@
+# Direct／Strict 独立 lease-store 案例准备
+
+新增源码PR与旧reservation／未决Strict完全不同，不重编号重跑旧样本。PR修复zero-duration校验，同时删掉release的当前token比较；旧持有者因而能删除后来的replacement。新carried finding只要求核对旧zero-duration问题，冻结讨论指向同一修复关系。私有标签要求新增ownership缺陷与fixed recheck，禁止虚构外部CI、计时expiry、分布式协调或发布结果。
+
+源repo有独立base/head、bundle、full diff、source manifest。公开测试在base、head、修复控制均通过；独立宿主ownership反例在base通过、head失败、补回比较条件后通过。head的zero-duration路径在写入token／entry前拒绝。宿主反例和标签不属于模型source／knowledge／schema输入。
+
+宿主patch／diff-size／CI结构复用当前Bot canonical serializer；明确Git重建证据而非GitHub API实读，CI unavailable且无伪造绿色结论。两套安装包均通过原public输入loader、typed PullRequest／DirectReviewRequest和不派发模型的SDK plan，均路由到core知识页。知识树validator／wiki lint通过。
+
+准备稿起初未初始化知识fixture的Git仓，validator拒绝Git状态检查；随后SDK正确拒绝从旧fixture继承的过时snapshot manifest。仅在未派发模型的准备阶段，用canonical build_manifest为新树生成lease-review-20261017身份，旧草稿保留，未绕过snapshot检查或改产品代码。MANIFEST按原fixture.gitignore是生成资源，独立哈希绑定；Git记录知识源页。
+
+目录：`output/single-capability-completion-20261012/lease-review-preparation-20261017`。本交付只证明案例及确定性输入接线，未运行新Direct／Strict模型调用，也未新增额度。下一步仍需冻结完整工作流调用上限／deadline、Strict授权MCP/source范围与执行协议，并验证实际sandbox请求能在首个付费步骤前准入。完整质量及原unknown对账继续开放。

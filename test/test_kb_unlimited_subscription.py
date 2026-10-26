@@ -9,7 +9,7 @@ import pytest
 
 from infermatrix_copilot.kb_service import cli, runner
 from infermatrix_copilot.kb_service.init_budget import Budget, BudgetExhausted
-from infermatrix_copilot.kb_service.init_history import _CheckpointBudget
+from infermatrix_copilot.kb_service.init_history import _checkpoint_budget
 from infermatrix_copilot.kb_service.init_stages import run_stage
 from infermatrix_copilot.kb_service.init_support import InitError, InitRecord, generate
 from infermatrix_copilot.kb_service.models import ModelGateway, ModelRole, ModelUnavailable
@@ -23,19 +23,19 @@ from infermatrix_copilot.kb_service.knowledge_coverage import policy_path
 
 def test_uncapped_checkpoint_keeps_prior_spend_and_crash_reservation(tmp_path):
     record = InitRecord(stage="knowledge-deepen", repo="toy", spent_usd=60.0)
-    capped = _CheckpointBudget(60.0, record, tmp_path)
+    capped = _checkpoint_budget(60.0, record, tmp_path)
     assert not capped.can_reserve(0.5)
     with pytest.raises(BudgetExhausted):
         with capped.reserve(0.5):
             pytest.fail("exhausted capped budget dispatched a call")
-    uncapped = _CheckpointBudget(None, record, tmp_path)
+    uncapped = _checkpoint_budget(None, record, tmp_path)
     assert uncapped.limit_usd is None and uncapped.remaining_usd is None
     with pytest.raises(RuntimeError, match="interrupted"):
         with uncapped.reserve(0.5):
             checkpoint = InitRecord.load(tmp_path, "toy", "knowledge-deepen")
             assert checkpoint.spent_usd == 60.5
             raise RuntimeError("interrupted")
-    resumed = _CheckpointBudget(None, InitRecord.load(tmp_path, "toy", "knowledge-deepen"), tmp_path)
+    resumed = _checkpoint_budget(None, InitRecord.load(tmp_path, "toy", "knowledge-deepen"), tmp_path)
     with resumed.reserve(0.5) as reservation:
         reservation.charge(0.5)
     assert resumed.spent_usd == 61.0

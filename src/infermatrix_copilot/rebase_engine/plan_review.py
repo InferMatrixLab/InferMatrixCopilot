@@ -11,9 +11,10 @@ prompt's soft-fallback lets it proceed, parent parity)."""
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
+
+from ..structured_output import decode_json_object
 
 _REVIEW_PROMPT = """You are a strict senior reviewer for an automated \
 repository-rebase agent. Review the plan below for correctness, missing \
@@ -34,12 +35,9 @@ kind: {kind}
 
 
 def _parse_review(text: str) -> dict | None:
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
     try:
-        data = json.loads(m.group(0))
-    except (json.JSONDecodeError, ValueError):
+        data = decode_json_object(text, policy="greedy_object")
+    except ValueError:
         return None
     if data.get("verdict") not in ("approve", "revise"):
         return None

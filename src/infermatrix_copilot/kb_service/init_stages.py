@@ -21,6 +21,8 @@ record and the PR body.
 
 from __future__ import annotations
 
+from .init_role_policy import knowledge_init_role_error
+
 import hashlib
 import json
 import os
@@ -38,12 +40,15 @@ from ..knowledge_service.facts import FactsError
 from ..knowledge_service.l1 import Block
 from ..knowledge_service.lifecycle import LifecycleError, Page
 from ..knowledge_service.ops import (
-    INDEX_NAME, KnowledgeOperation, all_rule_ids, all_tombstoned_ids, apply_operations, index_line,
-    page_over_capacity,
+    INDEX_NAME, KnowledgeOperation, all_rule_ids, all_tombstoned_ids, index_line,
 )
 from ..knowledge_service.pinned_claims import Evidence, check_rules, evidence_for
 from .init_budget import Budget, BudgetExhausted, PriceError
-from .init_coverage import Owner, most_specific, owner_table, routes_file
+from .init_content import (
+    apply_rules, page_frontmatter as _page_frontmatter, place_rule,
+)
+from .init_coverage import Owner, most_specific, owner_for_paths, owner_table, routes_file
+from .init_quick_maps import with_rule_sources
 from .init_support import (
     AUTHOR_ENV, INDEPENDENT_STAGES, KNOWLEDGE_PREFIX, STAGES, InitError, InitPublisher, InitRecord, InitRuntime, claim_problems, classify_verdict,
     collect_docs, generate, inputs_digest, judge, knowledge_changes, load_prepared, other_path_problems,
@@ -144,18 +149,20 @@ def _init_branch_suffix(rt: InitRuntime) -> str:
     return suffix
 
 
-def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str | None = None,
-              pr_count: int | None = None, budget_usd: float | None = None,
-              from_existing: bool = False, subscription_generator: bool = False,
-              retry_unfinished: bool = False, unlimited_subscription: bool = False,
-              feature_ids: tuple[str, ...] = (), acceptance_mode: str = "strict",
-              depth_index_path: Path | None = None, stop_file: Path | None = None,
-              foundation_mode: str = "strict", foundation_record_path: Path | None = None) -> InitRecord:
-    """Run one ``kb init`` stage for ``lifecycle``'s repository and return its
-    record (also saved under ``<state_dir>/init/<repo>/<stage>.json``)."""
+def validate_options(stage, options, *, portable=False):
+    """Shared domain validation for Python, CLI and portable initialization."""
+    import math
+
+    from_existing = options.get("from_existing", False)
+    retry_unfinished = options.get("retry_unfinished", False)
+    unlimited_subscription = options.get("unlimited_subscription", False)
+    acceptance_mode = options.get("acceptance_mode", "strict")
+    depth_index_path, stop_file = options.get("depth_index_path"), options.get("stop_file")
+    foundation_mode = options.get("foundation_mode", "strict")
+    foundation_record_path = options.get("foundation_record_path")
+    feature_ids, pr_count, budget_usd = options.get("feature_ids", ()), options.get("pr_count"), options.get("budget_usd")
     if stage not in STAGES + INDEPENDENT_STAGES:
         raise InitError(f"unknown stage {stage!r}; one of {STAGES + INDEPENDENT_STAGES}")
-    _init_branch_suffix(rt)  # publication configuration is refused before any model call
     if from_existing and stage not in ("feature-discovery", "modules", "knowledge", "knowledge-deepen"):
         raise InitError("--from-existing is for feature-discovery, modules or explanatory knowledge stages only")
     if retry_unfinished and stage not in ("feature-discovery", "knowledge-deepen"):
@@ -167,8 +174,8 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
             foundation_mode == "strict" and foundation_record_path is not None):
         raise InitError("foundation_mode must be strict or partial; a foundation record requires partial mode")
     if foundation_mode == "partial" and (
-            stage not in ("knowledge", "knowledge-deepen") or (not unlimited_subscription and not getattr(rt, "portable_spec", None))
-            or (bool(foundation_record_path) != (stage == "knowledge-deepen") and not getattr(rt, "portable_spec", None))):
+            stage not in ("knowledge", "knowledge-deepen") or (not unlimited_subscription and not portable)
+            or (bool(foundation_record_path) != (stage == "knowledge-deepen") and not portable)):
         raise InitError("partial foundation requires unlimited knowledge, or knowledge-deepen with its published foundation record")
     if feature_ids and (stage != "knowledge-deepen" or not isinstance(feature_ids, tuple)
                         or any(not isinstance(f, str) or not f for f in feature_ids)):
@@ -177,6 +184,25 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
         raise InitError("unlimited_subscription must be a boolean")
     if unlimited_subscription and (stage not in ("feature-discovery", "modules", "knowledge", "knowledge-deepen") or budget_usd is not None):
         raise InitError("--unlimited-subscription is for feature-discovery, modules, knowledge or knowledge-deepen only and conflicts with --budget-usd")
+    if pr_count is not None:
+        if stage != "pr-history" or isinstance(pr_count, bool) or not isinstance(pr_count, int) or pr_count < 1:
+            raise InitError("--pr-count is a positive integer for the pr-history stage only")
+    if budget_usd is not None:
+        if stage not in ("feature-discovery", "pr-history", "knowledge-deepen") or isinstance(budget_usd, bool) \
+                or not math.isfinite(budget_usd) or budget_usd <= 0:
+            raise InitError("--budget-usd is a finite positive ceiling for feature-discovery, pr-history or knowledge-deepen only")
+
+
+def _make_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str | None = None,
+              pr_count: int | None = None, budget_usd: float | None = None,
+              from_existing: bool = False, subscription_generator: bool = False,
+              retry_unfinished: bool = False, unlimited_subscription: bool = False,
+              feature_ids: tuple[str, ...] = (), acceptance_mode: str = "strict",
+              depth_index_path: Path | None = None, stop_file: Path | None = None,
+              foundation_mode: str = "strict", foundation_record_path: Path | None = None) -> _Stage:
+    """Bind domain options; execution belongs to the shared workflow kernel."""
+    validate_options(stage, locals(), portable=bool(getattr(rt, "portable_spec", None)))
+    _init_branch_suffix(rt)
     if stage == "feature-discovery":
         from dataclasses import replace
         from .models import ModelRole
@@ -190,9 +216,11 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
             raise InitError(f"invalid feature discovery model/concurrency configuration: {exc}") from exc
         if rt.discovery_concurrency < 1:
             raise InitError("KB_DISCOVERY_CONCURRENCY must be a positive integer")
-        # Discovery never inherits the service's same-family judge waiver.
-        if rt.generator.model.casefold().split("-")[0] == rt.judge.model.casefold().split("-")[0]:
-            raise InitError("feature discovery extraction and review must use independent model families")
+        problem = knowledge_init_role_error(stage,
+            generator_provider=rt.generator.provider, generator_model=rt.generator.model,
+            judge_provider=rt.judge.provider, judge_model=rt.judge.model)
+        if problem:
+            raise InitError(problem)
     if stage == "feature-discovery" and rt.generator.provider == "zcode":
         subscription_generator = True
     rt.subscription_generator = subscription_generator
@@ -205,16 +233,10 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
     if pr_count is not None:
         from dataclasses import replace
 
-        if stage != "pr-history" or isinstance(pr_count, bool) or not isinstance(pr_count, int) or pr_count < 1:
-            raise InitError("--pr-count is a positive integer for the pr-history stage only")
         lifecycle = replace(lifecycle, init=replace(lifecycle.init, pr_history_count=pr_count))
     if budget_usd is not None:
-        import math
         from dataclasses import replace
 
-        if stage not in ("feature-discovery", "pr-history", "knowledge-deepen") or isinstance(budget_usd, bool) \
-                or not math.isfinite(budget_usd) or budget_usd <= 0:
-            raise InitError("--budget-usd is a finite positive ceiling for feature-discovery, pr-history or knowledge-deepen only")
         lifecycle = replace(lifecycle, init=replace(lifecycle.init, budget_usd=budget_usd))
     notes = []
     if lifecycle.upstream_visibility == "private" and not dry_run:
@@ -229,12 +251,14 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
         notes.append(f"generator {rt.generator.label()}: subscription billing explicitly selected; "
                      "generator USD is unreported and subscription fees are outside the stage USD accounting")
     if unlimited_subscription:
-        if any(role.fallback is not None for role in (rt.generator, rt.judge)):
-            raise InitError("--unlimited-subscription requires pinned generator and judge without fallback")
-        if rt.generator.provider != "zcode" or rt.generator.model.casefold() != "glm-5.3" \
-                or rt.judge.provider != "codex" \
-                or rt.generator.model.casefold().split("-")[0] == rt.judge.model.casefold().split("-")[0]:
-            raise InitError("--unlimited-subscription requires Zcode GLM-5.3 extraction and an independent Codex judge")
+        problem = knowledge_init_role_error(stage,
+            generator_provider=rt.generator.provider, generator_model=rt.generator.model,
+            judge_provider=rt.judge.provider, judge_model=rt.judge.model,
+            unlimited_subscription=True,
+            generator_has_fallback=rt.generator.fallback is not None,
+            judge_has_fallback=rt.judge.fallback is not None)
+        if problem:
+            raise InitError(problem)
         for role in (rt.generator, rt.judge):
             try:
                 available = rt.gateway.subscription_billing(role)
@@ -255,7 +279,29 @@ def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str
         if stage == "knowledge-deepen":
             options["foundation_record_path"] = foundation_record_path
     return stage_class(rt, lifecycle, dry_run=dry_run, pin=pin, notes=notes, author=author,
-                       from_existing=from_existing, **options).run()
+                       from_existing=from_existing, **options)
+
+
+async def run_stage_async(rt: InitRuntime, lifecycle, stage: str, **options) -> InitRecord:
+    from .init_execution import execute_init
+
+    work = _make_stage(rt, lifecycle, stage, **options)
+    await execute_init(work)
+    return work.record
+
+
+def run_stage(rt: InitRuntime, lifecycle, stage: str, *, dry_run: bool, pin: str | None = None,
+              pr_count: int | None = None, budget_usd: float | None = None,
+              from_existing: bool = False, subscription_generator: bool = False,
+              retry_unfinished: bool = False, unlimited_subscription: bool = False,
+              feature_ids: tuple[str, ...] = (), acceptance_mode: str = "strict",
+              depth_index_path: Path | None = None, stop_file: Path | None = None,
+              foundation_mode: str = "strict", foundation_record_path: Path | None = None) -> InitRecord:
+    """Synchronous compatibility API; async callers use ``run_stage_async``."""
+    options = locals()
+    import asyncio
+
+    return asyncio.run(run_stage_async(**options))
 
 
 def adapter_missing(path: str) -> str:
@@ -301,8 +347,8 @@ def _stage_class(stage: str) -> type:
 
 # -- helpers -----------------------------------------------------------------------
 
-def _fence(payload: Any) -> str:
-    return "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1).replace(
+def _fence(payload: Any, *, sort_keys: bool = False) -> str:
+    return "<untrusted_data>\n" + json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=sort_keys).replace(
         "<", "\\u003c") + "\n</untrusted_data>\n"
 
 
@@ -328,11 +374,6 @@ def _one_line(value: object, limit: int = 120) -> str:
 def _slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:40].strip("-")
     return slug or "page"
-
-
-def _page_frontmatter(title: str, *, kind: str, today: str, tags: list[str]) -> str:
-    return (f'---\ntitle: "{title}"\ncreated: {today}\nupdated: {today}\ntype: {kind}\n'
-            f"tags: [{', '.join(tags)}]\nsources: []\n---\n\n# {title}\n\n")
 
 
 def _schema_tags(text: str | None) -> set[str]:
@@ -454,11 +495,9 @@ class _Chain:
 
 def _dry_run_files(record: InitRecord) -> dict[str, str]:
     """Repository-relative files of a stage's dry-run snapshot."""
-    root = Path(str(record.pr.get("dry_run_dir") or "")) / "tree"
-    if not record.pr.get("dry_run_dir") or not root.is_dir():
-        raise InitError(f"the {record.stage} dry run left no snapshot ({root})")
-    return {p.relative_to(root).as_posix(): p.read_text(encoding="utf-8")
-            for p in sorted(root.rglob("*")) if p.is_file() and not p.name.endswith(".DELETED")}
+    from .preview import read_preview
+
+    return {path: text for path, text in read_preview(record).items() if text is not None}
 
 
 @dataclass
@@ -468,6 +507,8 @@ class _Stage:
     the publication. Subclasses set ``STAGE`` and implement ``_build``."""
 
     STAGE = ""
+    PERSIST_RULE_SOURCES = True
+    quick_map_policy_version = 1  # bare/legacy stage construction
 
     rt: InitRuntime
     lifecycle: Any
@@ -483,98 +524,15 @@ class _Stage:
     # bare (tests) has none
     briefing_docs: frozenset[str] = frozenset()
 
-    def run(self) -> InitRecord:
-        rt, lc, stage = self.rt, self.lifecycle, self.STAGE
-        init = lc.init
-        self._branch_suffix = _init_branch_suffix(rt)
-        self.repo_dir = lc.knowledge_dir
-        base_sha = self._base_for_run(rt.knowledge.fetch())
-        self._base_sha = base_sha
-        main = rt.knowledge.knowledge_files(base_sha)
-        chain = self._chain()
-        self.overlay = dict(chain.repo_files)
-        # every stage reads the adapter here (language, the flips); an unmerged
-        # adapter PR must block, never degrade to "no language" — and never be
-        # papered over by a record cached from a run before this check
-        adapter_missing_problem = adapter_missing(self._manifest_path()) if self._manifest_text() is None else ""
-        upstream = rt.upstream(lc.repo, lc.full_name)
-        upstream.sync()
-        pin = upstream.resolve(self.pin or chain.pin or "HEAD")
-        if getattr(rt, "portable_spec", None) and pin != rt.portable_spec.source_pin:
-            raise InitError("portable source pin differs from the accepted batch; create a new batch")
-        self._discovery_gate(chain, pin)
-        self.overlay = dict(chain.repo_files)
-        input_options = dict(self._input_options())
-        if self._branch_suffix:
-            # Leave legacy checkpoint identities unchanged when the option is
-            # unset, but bind an explicit batch name before extracting anything.
-            input_options["publication_branch_suffix"] = self._branch_suffix
-        digest = inputs_digest(stage=stage, repo=lc.repo, pin=pin, kb=base_sha, init=self._init_identity(),
-                               generator=rt.generator.label(), judge=rt.judge.label(), dry_run=self._mode_identity(),
-                               chain=chain.key, **input_options)
-        record_path = InitRecord.path(rt.state_dir, lc.repo, stage)
-        previous = InitRecord.load(rt.state_dir, lc.repo, stage)
-        if previous is not None and previous.pr.get("prepared") and previous.status in ("publishing", "blocked"):
-            # pushed (or about to be) but not confirmed: finish THAT publication, never re-run the stage
-            if self.dry_run:
-                raise InitError("a publication of this stage is pending (pushed, PR not confirmed); re-run "
-                                f"without --dry-run to finish it, or remove {record_path} to start over")
-            if chain.problems:
-                self.record = previous
-                return self._blocked(chain.problems)
-            problems = self._resume_input_problems(previous, digest)
-            if load_prepared(previous.pr["prepared"]).get("branch") != self._publication_branch():
-                problems.append("prepared publication belongs to a different branch suffix; "
-                                f"restore {BRANCH_SUFFIX_ENV} to its original value to resume")
-            if self._frozen_discovery and previous.discovery.get("catalog_binding") != self._discovery_binding():
-                problems.append("prepared publication belongs to a different discovery catalog; preserve it and start a new batch")
-            if problems:
-                self.record = previous
-                return self._blocked(problems)
-            return self._resume(previous)
-        if previous is not None and previous.inputs_digest == digest and not adapter_missing_problem \
-                and not chain.problems and previous.status in ("dry_run", "published", "empty") \
-                and (previous.dry_run == self.dry_run or previous.status == "published") \
-                and self._cache_reusable(previous):
-            return previous
-        if previous is not None and previous.pr.get("number") and previous.inputs_digest != digest:
-            raise InitError(f"a published {stage} record exists (PR #{previous.pr['number']}); remove "
-                            f"{record_path} to start over")
-        self.record = InitRecord(stage=stage, repo=lc.repo, pin=pin, kb_base_sha=base_sha,
-                                 inputs_digest=digest, started_at=float(int(rt.clock())),
-                                 dry_run=self.dry_run, notes=list(self.notes))
-        if self._frozen_discovery:
-            self.record.discovery["catalog_binding"] = self._discovery_binding()
-        if chain.pin and pin != chain.pin:
-            self.record.notes.append(f"pinned at {pin[:12]}, not at the earlier stages' {chain.pin[:12]}")
-        self.budget = Budget(None if rt.unlimited_subscription else init.budget_usd)
-        self.base = {**main, **chain.knowledge}
-        problems = chain.problems + self._restore_progress(previous) + self._precheck()
-        if adapter_missing_problem:
-            problems.append(adapter_missing_problem)
-        if problems:
-            return self._blocked(problems)
-        schema = rt.knowledge.show(base_sha, "doc/knowledge/SCHEMA.md")
-        if lc.repo not in _schema_tags(schema):
-            return self._blocked([f"tag {lc.repo!r} is not in the doc/knowledge/SCHEMA.md taxonomy; add it "
-                                  "(with the adapter PR) before running kb init"])
-        self.tags = [lc.repo]
-        self.today = rt.today()
-        self.release = f"init-{pin[:12]}"
-        try:
-            self.observer = upstream.observer(pin, pull=rt.pull)
-            self.upstream = upstream
-            with tempfile.TemporaryDirectory(prefix="kb-init-") as scratch:
-                tree = upstream.export(pin, Path(scratch) / "tree")
-                self._inputs(tree)
-                if self.route_problem:
-                    return self._blocked([self.route_problem])
-                return self._build(tree)
-        except (ModelUnavailable, PriceError, FactsError) as exc:
-            return self._blocked([f"{type(exc).__name__}: {exc}"])
-        finally:
-            self.record.spent_usd = round(self.budget.spent_usd, 6)
-            self.record.save(rt.state_dir)
+    def _preview_files(self, record):
+        """Human edits are untrusted inputs to a NEW dry run, never approval.
+
+        _chain hashes the returned bytes. Cache reuse, Discovery acceptance and
+        publication still use the checked reader; portable chains need acceptance.
+        """
+        from .preview import read_preview
+        return {path: text for path, text in read_preview(record, owner_review=True).items()
+                if text is not None}
 
     def _chain(self) -> _Chain:
         """Every earlier stage must be merged, or (for a dry run of this one)
@@ -666,7 +624,7 @@ class _Stage:
                                           f"before publishing {self.STAGE}")
                     continue
                 try:
-                    files = _dry_run_files(record)
+                    files = self._preview_files(record)
                 except InitError as exc:
                     chain.problems.append(str(exc))
                     continue
@@ -674,7 +632,7 @@ class _Stage:
                     chain.repo_files[rel] = text
                     if rel.startswith(KNOWLEDGE_PREFIX):
                         chain.knowledge[rel[len(KNOWLEDGE_PREFIX):]] = text
-                parts.append(f"{stage}:dry_run:{record.inputs_digest}")
+                parts.append(f"{stage}:dry_run:{record.inputs_digest}:{inputs_digest(files=files)}")
             else:
                 chain.problems.append(f"the {stage} stage is {record.status}; finish it first")
         chain.key = ";".join(parts)
@@ -1023,53 +981,20 @@ class _Stage:
         return paths
 
     def _owner_for(self, paths: list[str]) -> Owner | None:
-        """The owner that most specifically reaches the most of ``paths``
-        (routing order breaks ties); None when no owner reaches any."""
-        counts: dict[str, int] = {}
-        by_name = {o.owner: o for o in self.owners}
-        for path in paths:
-            for owner in most_specific(path, self.owners):
-                counts[owner.owner] = counts.get(owner.owner, 0) + 1
-        if not counts:
-            return None
-        order = [o.owner for o in self.owners]
-        best = max(counts, key=lambda name: (counts[name], -order.index(name)))
-        return by_name[best]
+        return owner_for_paths(paths, self.owners)
 
     def _conclude(self, rules: Mapping[str, str], evidence: list[Evidence],
                   other: Mapping[str, tuple[str | None, str | None]] | None = None,
                   check_other=None) -> InitRecord:
-        """The deterministic checks of the change (design §9.3), then the
-        publication. ``other`` are repository paths outside ``knowledge/``
-        (before, after) that ``check_other`` must accept. Every owner page of
-        a knowledge-side routes file first gets init's Direct quick map and
-        must then yield one (``init_quick_maps``)."""
-        from .init_quick_maps import owner_pages
-
-        problems = self._refresh_quick_maps()
-        try:
-            routed = owner_pages(self.head.get(f"{self.repo_dir}/{ROUTES_NAME}"))
-        except (ValueError, yaml.YAMLError):
-            routed = []   # the routes file itself is reported by the validators
-        problems += validate_change(self.base, self.head, observer=self.observer, rules=rules,
-                                    evidence=evidence, other=other, check_other=check_other,
-                                    quick_map_pages=routed)
-        changed: dict[str, str] = {KNOWLEDGE_PREFIX + p: t for p, t in self.head.items() if self.base.get(p) != t}
-        for path, (before, after) in (other or {}).items():
-            if after is not None and after != before:
-                changed[path] = after
-        self.record.files = sorted(changed)
-        if not changed and not problems:
-            self.record.status = "empty"
-            self.record.notes.append(f"the {self.STAGE} stage found nothing to change")
-            self.record.save(self.rt.state_dir)
-            return self.record
-        if not problems:
-            problems = run_knowledge_validators(self.rt.knowledge, self.record.kb_base_sha,
-                                                {**self.overlay, **changed})
-        if problems:
-            return self._blocked(problems)
-        return self._publish(changed)
+        """Finish candidate assembly; the executor owns validation and publication."""
+        self._draft = {"head": self.head, "rules": dict(rules),
+                       "evidence": [entry.to_dict() for entry in evidence],
+                       "other": dict(other or {}), "check_context": getattr(self, "_check_context", {}),
+                       "check_other": check_other.__name__ if check_other else "",
+                       "problems": self._refresh_quick_maps()}
+        # refresh may replace head rather than mutating it.
+        self._draft["head"] = self.head
+        return self.record
 
     def _refresh_quick_maps(self) -> list[str]:
         """Init's Direct quick map on every owner page of the knowledge-side
@@ -1081,20 +1006,12 @@ class _Stage:
         text = self.head.get(f"{self.repo_dir}/{ROUTES_NAME}")
         if text is None:
             return []
-        self.head, notes, problems = refresh_quick_maps(self.head, self.base, text, briefing_docs=self.briefing_docs)
+        self.head, notes, problems = refresh_quick_maps(self.head, self.base, text, briefing_docs=self.briefing_docs,
+            policy_version=self.quick_map_policy_version)
         for note in notes:
             if note not in self.record.checklist:
                 self.record.checklist.append(note)
         return problems
-
-    def _map_inputs(self, page: str) -> tuple[list[str], list[str]]:
-        """What ``page``'s map is rendered with: its owner's signals and
-        prefixes in the routes file this stage will conclude with (head,
-        else base), or nothing when no routes name it yet."""
-        from .init_quick_maps import map_inputs
-
-        routes = f"{self.repo_dir}/{ROUTES_NAME}"
-        return map_inputs(self.head.get(routes, self.base.get(routes)), page)
 
     # -- model inputs and calls -----------------------------------------------------
     def _doc_payload(self) -> list[dict]:
@@ -1111,7 +1028,15 @@ class _Stage:
         sample = self.existing.get(f"{self.repo_dir}/{INDEX_NAME}") or self.base.get(REPOS_INDEX) or ""
         return sample[:1500]
 
-    def _rules_call(self, payload: dict) -> dict:
+    def _replace_coverage(self, values):
+        from .init_generation import replace_coverage
+        replace_coverage(self.record, values)
+
+    def _generate_data(self, **request):
+        from .init_generation import generate_data
+        return generate_data(self, **request)
+
+    def _rules_call(self, payload: dict, *, system: str = SYSTEM_RULES) -> dict:
         def validate(data: dict) -> None:
             rules = data.get("rules")
             if not isinstance(rules, list):
@@ -1121,8 +1046,7 @@ class _Stage:
                         or not isinstance(rule.get("body"), str) or not isinstance(rule.get("evidence"), list):
                     raise ValueError("each rule needs title, body and evidence")
 
-        return generate(self.rt, self.budget, self.lifecycle.init, system=SYSTEM_RULES,
-                        prompt=_fence(payload), validate=validate).data
+        return self._generate_data(system=system, prompt=_fence(payload), validate=validate)
 
     def _id_source(self):
         taken = set(all_rule_ids(self.head)) | all_tombstoned_ids(self.head) | set(self.record.verdicts)
@@ -1213,6 +1137,12 @@ class _Stage:
             entries = self._evidence(candidate)
             if entries is None:
                 continue
+            if self.PERSIST_RULE_SOURCES:
+                try:
+                    candidate.section = with_rule_sources(candidate.section, [entry.path for entry in entries])
+                except LifecycleError as exc:
+                    self._drop(candidate, str(exc))
+                    continue
             problems = check_rules({candidate.rule_id: candidate.section}, self.observer)
             if problems:
                 self._drop(candidate, "; ".join(problems))
@@ -1234,7 +1164,7 @@ class _Stage:
             if advisory and not self._judge_stopped:
                 try:
                     verdict = judge(self.rt, self.budget, self.lifecycle.init, block, base=self.base,
-                                    head=running, evidence=self._judge_evidence(entries))
+                                    head=running, evidence=self._judge_evidence(entries), record=self.record)
                     label, reasons, model = classify_verdict(verdict), verdict.reasons, verdict.model
                 except BudgetExhausted as exc:
                     self._judge_stopped = True
@@ -1261,88 +1191,40 @@ class _Stage:
     def _default_page_title(self, page: str) -> str:
         return f"{self.lifecycle.repo} rules"
 
-    def _overflow_page(self, page: str, tree: Mapping[str, str]) -> str:
-        """The sibling page that takes rules once ``page`` is full: the next
-        ``<stem>-<n>.md`` that does not exist yet or is still being filled by
-        init (the repository rule page's first sibling is ``rules-doc-invariants.md``)."""
-        path = PurePosixPath(page)
-        stem = "rules-doc-invariants" if path.name == "rules.md" else path.stem
-        for n in range(1, 10):
-            name = f"{stem}.md" if n == 1 and path.name == "rules.md" else f"{stem}-{n + 1}.md"
-            sibling = str(path.with_name(name))
-            if sibling not in self.base:   # init's own page (new or still filling) or a fresh one
-                self._titles.setdefault(sibling, f"{self._page_title(page)} ({n + 1})")
-                return sibling
-        raise LifecycleError(f"no free sibling page for {page}")
-
     def _place(self, candidate: _Candidate, tree: dict[str, str]) -> dict[str, str] | None:
         """``tree`` with the candidate added; a full page moves it to a sibling
         page (as often as needed); any other refusal drops it (None)."""
-        for _ in range(10):
-            try:
-                return self._apply([candidate], tree)
-            except LifecycleError as exc:
-                if "page full" not in str(exc):
-                    self._drop(candidate, f"refused by the knowledge format: {exc}")
-                    return None
-                previous = candidate.page
-                try:
-                    candidate.page = self._overflow_page(candidate.page, tree)
-                except LifecycleError as full:
-                    self._drop(candidate, str(full))
-                    return None
-                if candidate.page == previous:
-                    self._drop(candidate, f"refused by the knowledge format: {exc}")
-                    return None
-                spilled = self.__dict__.setdefault("_spilled_from", {}).setdefault(previous, [])
-                if candidate.page not in spilled:
-                    spilled.append(candidate.page)   # the pages that took this page's overflow, in order
-                self.record.notes.append(f"{previous} is full: {candidate.rule_id} goes to {candidate.page}")
-        self._drop(candidate, "no page could take it")
-        return None
+        routes = f"{self.repo_dir}/{ROUTES_NAME}"
+        result = place_rule(tree, KnowledgeOperation(kind="add", page=candidate.page,
+                            rule_id=candidate.rule_id, section_markdown=candidate.section),
+                            base_paths=self.base, titles=self._titles, title=self._page_title(candidate.page),
+                            tags=self.tags, today=self.today, release=self.release,
+                            routes_text=self.head.get(routes, self.base.get(routes)),
+                            include_quickmaps=self.route_source != "manifest",
+                            quick_map_policy_version=self.quick_map_policy_version)
+        candidate.page = result.page
+        self._titles.update(result.titles)
+        for previous, pages in result.spills.items():
+            spilled = self.__dict__.setdefault("_spilled_from", {}).setdefault(previous, [])
+            spilled.extend(page for page in pages if page not in spilled)
+        self.record.notes.extend(result.notes)
+        if result.reason:
+            self._drop(candidate, result.reason)
+        return result.files
 
     def _apply(self, candidates: list[_Candidate], files: dict[str, str]) -> dict[str, str]:
         """``files`` with the candidates added through ``apply_operations``
         (new pages created as shells first, each linked from its index).
         Raises ``LifecycleError`` when an operation is refused."""
-        work = dict(files)
-        for page in dict.fromkeys(c.page for c in candidates):
-            if page in work:
-                continue
-            index = str(PurePosixPath(page).with_name(INDEX_NAME))
-            if index not in work:
-                # the entry page does not exist yet (empty KB): a stand-in so the
-                # rules can be applied; _write_map renders the real one
-                work[index] = _page_frontmatter("index", kind="index", today=self.today, tags=self.tags)
-            title = self._page_title(page)
-            work[page] = _page_frontmatter(title, kind="rule", today=self.today, tags=self.tags)
-            work[index] = work[index].rstrip("\n") + "\n" + index_line(page, title)
         ops = [KnowledgeOperation(kind="add", page=c.page, rule_id=c.rule_id, section_markdown=c.section)
                for c in candidates]
-        result = apply_operations(work, ops, release=self.release, today=self.today)
-        work.update(result.files)
-        self._check_capacity_with_map(work, {c.page for c in candidates})
-        return work
-
-    def _check_capacity_with_map(self, work: Mapping[str, str], pages: set[str]) -> None:
-        """A rule page must stay under the format's capacity WITH the Direct
-        quick map init renders on it (one row per rule): ``apply_operations``
-        only measures the rules, so the map is counted here, and a page that
-        would overflow with it is reported as full — the same signal that
-        moves the next rule to a sibling page (``_place``)."""
-        from .init_quick_maps import has_hand_written_map, render_quick_map, with_quick_map
-
-        if self.route_source == "manifest":
-            return   # no routes file, no map written: the format's own measure is the whole truth
-        for page in sorted(pages):
-            text = work.get(page)
-            if text is None or has_hand_written_map(text):
-                continue
-            signals, prefixes = self._map_inputs(page)   # the map as it will really be rendered
-            with_map = with_quick_map(text, render_quick_map(text, signals=signals, prefixes=prefixes))
-            over = page_over_capacity(with_map)
-            if over:
-                raise LifecycleError(f"{page}: page full once its Direct quick map is counted ({over})")
+        titles = {page: self._page_title(page) for page in dict.fromkeys(c.page for c in candidates)
+                  if page not in files}
+        routes = f"{self.repo_dir}/{ROUTES_NAME}"
+        return apply_rules(files, ops, titles=titles, tags=self.tags, today=self.today, release=self.release,
+                           routes_text=self.head.get(routes, self.base.get(routes)),
+                           include_quickmaps=self.route_source != "manifest",
+                            quick_map_policy_version=self.quick_map_policy_version)
 
     def _write_rules(self, kept: list[_Candidate]) -> None:
         """The kept rules on their placed pages. Dropping failed rules only
@@ -1370,7 +1252,7 @@ class _Stage:
         suffix = getattr(self, "_branch_suffix", "")
         return f"kb/init-{self.lifecycle.repo}-{self.STAGE}" + (f"-{suffix}" if suffix else "")
 
-    def _publish(self, changed: dict[str, str]) -> InitRecord:
+    def _prepare_publication(self, changed: dict[str, str]) -> InitRecord:
         rt, lc, record = self.rt, self.lifecycle, self.record
         stage = self.STAGE
         title = f"kb init({lc.repo}): {stage}"
@@ -1379,24 +1261,27 @@ class _Stage:
         publisher = self._publisher()
         if stage == "feature-discovery" and set(changed) - set(publisher.allowed_paths):
             return self._blocked(["feature-discovery may publish only its adapter catalog and compact report"])
-        if self.dry_run:
-            dest = InitRecord.path(rt.state_dir, lc.repo, stage).with_name(f"{stage}-dryrun")
-            InitPublisher.dry_run(dest, changed, title=title, body=body)
-            record.pr = {"dry_run_dir": str(dest)}
-            if getattr(rt, "portable_spec", None):
-                record.pr["checked_files_sha256"] = {p: hashlib.sha256(t.encode()).hexdigest()
-                    for p, t in sorted(changed.items())}
-            record.status = "dry_run"
-        else:
-            prepared = save_prepared(
-                InitRecord.path(rt.state_dir, lc.repo, stage).with_name(f"{stage}-publish.json"),
-                base_sha=record.kb_base_sha, branch=self._publication_branch(), files=changed,
-                title=title, body=body, author=self.author, when=record.started_at)
-            record.status = "publishing"
-            record.pr = {"prepared": str(prepared)}
-            record.save(rt.state_dir)
-            return self._finish(record, publisher)
+        prepared = save_prepared(
+            InitRecord.path(rt.state_dir, lc.repo, stage).with_name(f"{stage}-publish.json"),
+            base_sha=record.kb_base_sha, branch=self._publication_branch(), files=changed,
+            title=title, body=body, author=self.author or ("KB init preview", "kb-init@example.invalid"), when=record.started_at)
+        record.status = "publishing"
+        record.pr = {"prepared": str(prepared), "validation_pending": True}
         record.save(rt.state_dir)
+        return record
+
+    def _publish(self) -> InitRecord:
+        record = self.record
+        if not self.dry_run:
+            return self._resume(record)
+        prepared = load_prepared(record.pr["prepared"])
+        dest = InitRecord.path(self.rt.state_dir, record.repo, self.STAGE).with_name(f"{self.STAGE}-dryrun")
+        InitPublisher.dry_run(dest, prepared["files"], title=prepared["title"], body=prepared["body"])
+        record.pr = {"dry_run_dir": str(dest)}
+        from .preview import file_hashes
+        record.pr["checked_files_sha256"] = file_hashes(prepared["files"])
+        record.status = "dry_run"
+        record.save(self.rt.state_dir)
         return record
 
     def _finish(self, record: InitRecord, publisher: InitPublisher) -> InitRecord:
@@ -1510,9 +1395,9 @@ class _Skeleton(_Stage):
             if not isinstance(data.get("owners", []), list) or not isinstance(data.get("general_links", []), list):
                 raise ValueError("owners and general_links must be lists")
 
-        reply = generate(self.rt, self.budget, self.lifecycle.init, system=SYSTEM_MAP,
-                         prompt=_fence(payload), validate=validate)
-        plan = dict(reply.data)
+        data = self._generate_data(system=SYSTEM_MAP, prompt=_fence(payload), validate=validate,
+                                   unit="skeleton-map")
+        plan = dict(data)
         plan["_offered"] = offered
         plan["_general"] = general
         return plan
@@ -1820,12 +1705,14 @@ class _Skeleton(_Stage):
             if text is None or page not in self.base or has_hand_written_map(text):
                 out.append(owner)
                 continue
-            if mapped(text, signals=owner.get("signals") or [], prefixes=owner.get("scope_prefixes") or []):
+            if mapped(text, signals=owner.get("signals") or [], prefixes=owner.get("scope_prefixes") or [],
+                      policy_version=self.quick_map_policy_version):
                 out.append(owner)
                 continue
             sibling = next((p for p in self.__dict__.get("_spilled_from", {}).get(page, [])
                             if p in self.head and p not in self.base and self._is_rule_page(p)
-                            and mapped(self.head[p], signals=[], prefixes=[])), None)
+                            and mapped(self.head[p], signals=[], prefixes=[],
+                                       policy_version=self.quick_map_policy_version)), None)
             if sibling:
                 self.record.notes.append(f"owner {owner['owner']}: {page} has no room for a Direct quick map; "
                                          f"routed to {sibling} instead")

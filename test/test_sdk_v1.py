@@ -350,6 +350,24 @@ def test_strict_typed_result_and_decode_error():
         runtime.get_result("run-20260829-010101-abcdef")
 
 
+def test_strict_sdk_preserves_frozen_business_inputs_in_authorized_request():
+    from infermatrix_copilot.app.request_policy import enforce_strict_review_policy, PolicyError
+
+    runtime = object.__new__(StrictRuntime)
+    runtime._core = _FakeStrictCore()
+    context = {"pull": {"number": 7, "head_sha": HEAD, "title": "Frozen title"},
+        "pr_review_context": [{"body": "Historical concern", "thread_ref": "comment:1"}],
+        "ci_evidence": {"head_sha": HEAD, "read_status": "unavailable"}}
+    request = StrictReviewRequest(RepositoryRef("vllm-omni"), 7, HEAD, "", "frozen", business_context=context)
+    runtime.reserve_review(request)
+    payload = runtime._core.requests[0]
+    spec = enforce_strict_review_policy(payload, allowed_repos=["vllm-omni"])
+    assert spec.params["business_context"] == context
+    payload["params"]["business_context"]["ci_evidence"]["head_sha"] = "b" * 40
+    with pytest.raises(PolicyError, match="another head"):
+        enforce_strict_review_policy(payload, allowed_repos=["vllm-omni"])
+
+
 def test_typed_strict_config_rejects_checkout_outside_root(tmp_path):
     from infermatrix_copilot.sdk.v1 import StrictRuntimeConfig, InvalidRequestError
 
@@ -467,3 +485,39 @@ def test_strict_reservation_carries_evidence_through_policy(settings):
     from infermatrix_copilot.mcp_policy import enforce_mcp_policy
     spec = enforce_mcp_policy(payload, allowed_repos=["vllm-omni"])
     assert spec.params["carried_findings"] == [_carried().to_dict()]
+
+
+def test_old_strict_serialization_keeps_its_wire_shape():
+    from infermatrix_copilot.sdk.v1 import StrictPollResult, StrictReviewResult, StrictRuntimeConfig
+
+    review = StrictReviewResult("review.v1", HEAD, "COMMENT", "frozen result",
+                                (), (), (), True, (), False, {})
+    legacy = {"contract_version": "review.v1", "reviewed_head_sha": HEAD,
+        "verdict": "COMMENT", "summary_markdown": "frozen result", "comments": (),
+        "findings": (), "finding_rechecks": (), "rechecks_complete": True,
+        "recheck_missing": (), "stale": False, "diagnostics": {}}
+    assert review.to_dict() == legacy
+    assert StrictPollResult("run-1", "done", {}, review).to_dict() == {
+        "run_id": "run-1", "state": "done", "payload": {}, "review": legacy}
+    config = StrictRuntimeConfig(RepositoryRef("vllm-omni", "vllm-project/vllm-omni"),
+                                 "/repo", "/")
+    assert config.to_dict() == {"repository": {"alias": "vllm-omni", "full_name": "vllm-project/vllm-omni"},
+        "checkout_path": "/repo", "allowed_root": "/", "backend": "", "run_root": "",
+        "max_workers": 1, "knowledge_maintenance": {}}
+
+
+def test_new_direct_proofs_survive_result_and_nested_poll_serialization():
+    from infermatrix_copilot.sdk.v1 import StrictPollResult, StrictReviewResult, StrictRuntimeConfig
+
+    review = StrictReviewResult("review.v1", HEAD, "COMMENT", "frozen result",
+        (), (), (), True, (), False, {}, finding_dispositions=({"anchor": "a.py:1"},),
+        expected_head_sha=HEAD, actual_head_sha=HEAD, direct_result={"summary": "native verdict"})
+    wire = review.to_dict()
+    assert wire["finding_dispositions"] == ({"anchor": "a.py:1"},)
+    assert wire["expected_head_sha"] == wire["actual_head_sha"] == HEAD
+    assert wire["direct_result"] == {"summary": "native verdict"}
+    assert StrictPollResult("run-1", "done", {}, review).to_dict()["review"] == wire
+    profiles = {"codex": {"provider": "codex", "command": ["codex"]}}
+    config = StrictRuntimeConfig(RepositoryRef("vllm-omni", "vllm-project/vllm-omni"),
+                                 "/repo", "/", direct_profiles=profiles)
+    assert config.to_dict()["direct_profiles"] == profiles

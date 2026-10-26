@@ -136,6 +136,8 @@ else:
 
 @pytest.mark.parametrize("config", [
     'model_provider = "custom"\n',
+    'openai_base_url = "https://example.invalid/v1"\n',
+    'chatgpt_base_url = "https://example.invalid"\n',
     'profile = "api"\n[profiles.api]\nmodel_provider = "custom"\n',
     '[model_providers.openai]\nbase_url = "https://example.invalid"\n',
 ])
@@ -221,35 +223,88 @@ def test_run_session_timeout_is_truncated(tmp_path):
     assert outcome.truncated is True and outcome.text == ""
 
 
-def test_complete_runs_in_scratch(tmp_path):
+@pytest.mark.parametrize('ending', ['nonzero', 'failed', 'empty_error', 'missing', 'unfinished_turn'])
+def test_session_rejects_incomplete_native_result_and_settles_usage(tmp_path, monkeypatch, ending):
+    from infermatrix_copilot.budgeting import bind_call_budget
+    from infermatrix_copilot.providers import run_harness_session
+
     transport = _transport(tmp_path)
+    events = [
+        {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'PARTIAL'}},
+        {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 2}},
+    ]
+    if ending == 'failed':
+        events.append({'type': 'turn.failed', 'error': {}})
+    elif ending == 'empty_error':
+        events.append({'type': 'error'})
+    elif ending == 'missing':
+        events[-1]['type'] = 'usage.updated'
+    elif ending == 'unfinished_turn':
+        events.append({'type': 'turn.started'})
+    cli = tmp_path / 'bin/codex'
+    cli.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\n'
+                   + 'print(' + repr('\n'.join(map(json.dumps, events))) + ')\n'
+                   + ('sys.exit(7)\n' if ending == 'nonzero' else ''))
+    captured, settled = [], []
+    monkeypatch.setattr('infermatrix_copilot.llm.capture_model_call',
+                        lambda *args, **kwargs: captured.append(kwargs))
+    with bind_call_budget('test', lambda _: 'original',
+                          lambda ticket, facts: settled.append((ticket, dict(facts)))):
+        with pytest.raises(RuntimeError, match='exited 7|errored|no terminal result'):
+            run_harness_session(transport, _request(tmp_path, with_bridge=False))
+    assert len(settled) == len(captured) == 1
+    ticket, facts = settled[0]
+    assert ticket == 'original' and facts['sent'] is True
+    assert facts['outcome'] != 'completed'
+    assert facts['usage'] == {'input_tokens': 10, 'output_tokens': 2,
+                              'input_tokens_include_cache': True}
+    assert captured[0]['reported_usage'] == facts['usage']
 
-    reply = transport.complete(
-        system="CLASSIFY", messages=[{"role": "user", "content": "hi"}])
 
-    assert reply.text == "REVIEW"
-    capture = json.loads(
-        (tmp_path / "bin" / "capture.json").read_text(encoding="utf-8"))
-    assert "imc-codex-oneshot-" in capture["cwd"]
-    assert "CLASSIFY" in capture["stdin"] and "[USER]\nhi" in capture["stdin"]
+@pytest.mark.parametrize('suffix', [[], [{'type': 'turn.failed', 'error': {}}],
+                                  [{'type': 'error'}],
+                                  [{'type': 'turn.started'}]])
+def test_completion_uses_same_terminal_contract(tmp_path, suffix):
+    transport = _transport(tmp_path)
+    events = [{'type': 'turn.completed', 'usage': {'input_tokens': 10}}, *suffix]
+    if suffix:
+        with pytest.raises(RuntimeError, match='errored|no terminal result'):
+            transport._completion_reply(events, timed_out=False)
+    else:
+        assert transport._completion_reply(events, timed_out=False).usage['input_tokens'] == 10
 
 
-def test_complete_archives_all_buffered_native_events_without_changing_reply(tmp_path):
+@pytest.mark.parametrize("model", ["", "gpt-6-sol"])
+def test_complete_rejects_unsupported_tool_policy_before_dispatch(tmp_path, monkeypatch, model):
     transport = _transport(tmp_path)
     events = []
 
-    reply = transport.complete(
-        system="CLASSIFY", messages=[{"role": "user", "content": "hi"}],
-        native_event_sink=events.append)
+    def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("unsupported tool-free completion must not launch a process")
 
-    assert transport.supports_native_events
-    assert [event["type"] for event in events] == ["native.codex.event"] * 5
-    assert [event["payload"]["type"] for event in events] == [
-        "thread.started", "item.completed", "item.completed",
-        "item.completed", "turn.completed"]
-    assert events[1]["payload"]["item"] == {
-        "item_type": "command_execution", "command": "ls"}
-    assert events[3]["payload"]["item"]["text"] == reply.text == "REVIEW"
-    assert reply.stop_reason == "end_turn"
-    assert reply.usage["input_tokens"] == 50
-    assert reply.usage["output_tokens"] == 9
+    monkeypatch.setattr(transport, "_run", unexpected_dispatch)
+    monkeypatch.setattr(transport, "require_cli", unexpected_dispatch)
+    with pytest.raises(ValueError, match="codex.*builtin_tools_off"):
+        transport.complete(
+            system="CLASSIFY", messages=[{"role": "user", "content": "hi"}],
+            model=model, native_event_sink=events.append)
+
+    assert not events
+    assert not (tmp_path / "bin" / "capture.json").exists()
+    assert "builtin_tools_off" not in transport.spec.capabilities
+
+
+def test_completion_preflight_is_not_accounted_as_dispatched(tmp_path):
+    from infermatrix_copilot.providers.completion import complete_native
+
+    transport = _transport(tmp_path)
+    records = []
+    with pytest.raises(ValueError, match="builtin_tools_off") as failed:
+        complete_native(
+            lambda: transport,
+            request={"system": "CLASSIFY", "messages": []},
+            identity={"provider": "codex"}, recorder=records.append)
+    assert failed.value.native_call_sent is False
+    assert failed.value.native_call_completed is False
+    assert len(records) == 1
+    assert not (tmp_path / "bin" / "capture.json").exists()

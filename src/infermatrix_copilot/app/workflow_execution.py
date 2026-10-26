@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..adapters.base import AdapterError
+from .. import run_status as rs
+from ..providers.outcomes import requires_reconciliation
 from ..config import Settings
-from ..engine.executor import Executor
+from ..engine.executor import Executor, RunOutcome
 from ..engine.lifecycle import RunLock, RunLockHeld, run_guarded
 from ..engine.registry import StepRegistry
 from ..metrics import format_metrics_line
@@ -18,12 +20,14 @@ from ..run_trace import RunTrace
 from ..task_spec import TaskSpec
 from ..ui import style
 from .repository_context import RepositoryContext, RepositoryContextResolver
+from .agent_context import bind_agent_context
 
 
 @dataclass(frozen=True)
 class ExecutionResult:
     exit_code: int
     blocked_reason: str = ""
+    state: str = ""
 
 
 class WorkflowExecution:
@@ -31,11 +35,55 @@ class WorkflowExecution:
 
     def __init__(
         self, settings: Settings, registry: StepRegistry,
-        repository_context: RepositoryContextResolver,
+        repository_context: RepositoryContextResolver | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.repository_context = repository_context
+
+    async def execute(
+        self, playbook, *, run_dir: Path, state: dict, runtime=None,
+        llm=None, trace=None, notifier=None, held_lock: RunLock | None = None,
+        fingerprint: str = "", validate_cached=None,
+    ) -> RunOutcome:
+        """Execute a bound workflow without planning or application authority.
+
+        Callers own repository, publication and domain leases. This kernel owns
+        only a newly acquired run lock and injects resources without persisting
+        them. An existing lock remains the caller's to release.
+        """
+        run_dir = Path(run_dir)
+        lock = held_lock
+        if lock is None:
+            try:
+                lock = RunLock(run_dir).acquire()
+            except RunLockHeld as exc:
+                return RunOutcome("blocked", blocked_reason=str(exc))
+        try:
+            trace = trace if trace is not None else RunTrace(run_dir / "run_trace.jsonl")
+            from ..improve.execution import bind_execution
+
+            pending = False
+
+            def observe_error(error):
+                nonlocal pending
+                pending = pending or requires_reconciliation(error)
+
+            with bind_execution(self.settings, self.registry) as (registry, context_for, authorize):
+                executor = Executor(
+                    bind_agent_context(registry), self.settings, run_dir=run_dir, trace=trace,
+                    llm=llm, notifier=notifier, runtime=runtime,
+                    fingerprint=fingerprint, validate_cached=validate_cached,
+                    context_for=context_for, authorize=authorize,
+                    on_handler_error=observe_error,
+                )
+                outcome = await run_guarded(executor.run(playbook, state), run_dir)
+                if pending:
+                    outcome.status = rs.INTERRUPTED
+                return outcome
+        finally:
+            if held_lock is None:
+                lock.release()
 
     def run(
         self, playbook, spec: TaskSpec, run_dir: Path, *, llm,
@@ -97,6 +145,14 @@ class WorkflowExecution:
                 print(style("✋ ", "red", "bold") + str(exc))
                 return ExecutionResult(BLOCKED_EXIT, blocked_reason)
         try:
+            from .completion_execution import completion_settings_for_run
+            settings = completion_settings_for_run(self.settings, run_dir, resuming=resuming, allow_create=True)
+            execution = self
+            if settings is not self.settings:
+                execution = WorkflowExecution(settings, self.registry, self.repository_context)
+                from ..providers import HarnessLLM, llm_for
+                if isinstance(llm, HarnessLLM):
+                    llm = llm_for(settings)
             from .. import tracing
             tracing.init(run_dir.name, run_dir / "trace.jsonl")
             # Stamp the workflow into the span file itself, so a trace lifted out of
@@ -107,7 +163,7 @@ class WorkflowExecution:
                              report_only=spec.report_only, post=spec.post,
                              resuming=resuming, params=spec.params)
             trace = RunTrace(run_dir / "run_trace.jsonl")
-            notifier = Notifier(self.settings, run_dir, trace, run_dir.name)
+            notifier = Notifier(settings, run_dir, trace, run_dir.name)
             trace.record("task", spec=spec.model_dump(), resolution=resolution_mode,
                          playbook=playbook.name, tier=tier)
             state: dict = {
@@ -119,21 +175,17 @@ class WorkflowExecution:
             }
             if repo_context.high_risk_modules:
                 state["high_risk_modules"] = list(repo_context.high_risk_modules)
-            executor = Executor(self.registry, self.settings, run_dir=run_dir,
-                                trace=trace, llm=llm, notifier=notifier)
-            # run_guarded finalizes inside the event loop: playbooks that
-            # register run finalizers (lifecycle.register_finalizer) get
-            # teardown on every exit path. Nothing registered == no-op.
             outcome = asyncio.run(
-                run_guarded(executor.run(playbook, state), run_dir))
+                execution.execute(playbook, run_dir=run_dir, state=state,
+                             trace=trace, llm=llm, notifier=notifier, held_lock=lock))
 
             if outcome.status == "done":
                 notifier.resolve()
 
-            if self.settings.metrics_enabled:
+            if settings.metrics_enabled:
                 try:  # metrics are facts about the run; never let them break it
                     from ..metrics import collect_run_metrics
-                    m = collect_run_metrics(run_dir, self.settings, outcome.status)
+                    m = collect_run_metrics(run_dir, settings, outcome.status)
                     print(format_metrics_line(m, run_dir))
                 except Exception as exc:
                     trace.record("metrics_error", error=f"{type(exc).__name__}: {exc}")
@@ -145,8 +197,8 @@ class WorkflowExecution:
             if outcome.status == "blocked":
                 blocked_reason = str(outcome.blocked_reason or "")
                 print(style("  ⚠ ", "yellow", "bold") + f"{outcome.blocked_reason}\n  see {run_dir / 'ESCALATION.md'}")
-                return ExecutionResult(BLOCKED_EXIT, blocked_reason)
-            return ExecutionResult(0 if outcome.status == "done" else 1, blocked_reason)
+                return ExecutionResult(BLOCKED_EXIT, blocked_reason, outcome.status)
+            return ExecutionResult(0 if outcome.status == "done" else 1, blocked_reason, outcome.status)
         finally:
             if knowledge_lock is not None:
                 knowledge_lock.release()

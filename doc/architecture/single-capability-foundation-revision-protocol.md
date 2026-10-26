@@ -1,0 +1,11 @@
+# Foundation revision-cache 原生协议准入
+
+完整重构和Codex先验收已获用户授权。本次检查确认旧206是评估helper的软件协议上限，计划没有把它设为用户费用预算；因此新增明确命名的foundation-revision-20261017协议，仅保留原205并增加独立配对28，总保留233。未修改旧native-generation-20261016的206上限，未减少旧配额、改写旧失败或重放unknown。测试证明旧协议拒绝233，新协议每臂14次即拒绝第15次，恢复时不能把14改成15。额度单位是provider invocation，不是USD或厂商内部重试。
+
+案例复用两套已安装应用、共享quality stage／init entry／provider transport。每臂一个完整非unlimited Foundation阶段，无额外judgment supplement；调用上限14，workflow wait4230秒，phase4530秒，外层4560秒，两臂串行。源码、私有标签、源tree等价、helper、phase、解释器及安装包字节均冻结。使用--capture保留所有类型化结果并由宿主按独立标签验收，不要求旧fixture的固定11pass／1fail。应用本身的校验和恢复检查继续运行。
+
+新源码与原失败样本不同，不是重编号重跑。先在内存旧206诊断副本中检查所有非预算约束，实际233草稿被原registry拒绝，记录保留；新增协议通过相关129项验证后重新冻结helper／phase／manifest并实际准入。当前manifest身份以live-admission.json为准。
+
+远端Codex二进制hash及所选登录控制通过；固定出口代理允许chatgpt.com/api.openai.com的CONNECT/TLS并拒绝其他authority，未发送应用请求或凭据。初次以主机nobody探测被父目录遍历权限拒绝；随后root只读出口探测通过，不改变父目录或socket权限，也不把主机nobody的路径权限当作容器挂载访问权限。控制证明不冒称推理额度／模型质量已经通过。
+
+执行目录：`output/single-capability-completion-20261012/native-quality-foundation-revision-20261017`。只运行一次first-dispatch包装；原stage／call ledger存在后禁止再次调用它，观察超时只查询原句柄。运行中状态、结果及质量判断另记，不把coordinator成功当作质量通过。原Discovery／Strict未知调用、其环境及代理保持原身份。未修改生产wheel、commit、push、pin、发布或部署。完整目标仍开放。

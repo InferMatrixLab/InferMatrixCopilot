@@ -179,9 +179,12 @@ def test_mutations_fill_in_deterministically(world, monkeypatch):
     for case in synthetic.values():
         assert case["expected"] == "reject" and case["source"] == "synthetic"
         assert case["mutation"] in init_harvest.MUTATIONS
-    # same inputs, same set (the record is reused; a fresh run rebuilds identically)
+    # A fresh batch rebuilds identically. Remove both owners of progress;
+    # deleting only its business facts must not authorize cached artifacts.
     state = world["tmp"] / "state" / "init" / "toy"
     (state / "harvest-calibration.json").unlink()
+    import shutil
+    shutil.rmtree(state / "executions" / "harvest-calibration")
     second = run_stage(_runtime(world, gateway), _modules_lifecycle(), "harvest-calibration", dry_run=True)
     assert _cases(second) == cases
 

@@ -171,6 +171,8 @@ def test_run_harness_step_writes_bridge_spec_and_delegates(tmp_path, monkeypatch
     assert req.timeout_s == 42.0
     assert req.bridge_spec_path is not None and req.bridge_spec_path.is_file()
     assert req.bridge_spec_path.parent == tmp_path / "bridge"
+    import json
+    assert json.loads(req.bridge_spec_path.read_text())["knowledge_dir"] == str(settings.knowledge_dir.resolve())
 
 
 def test_run_harness_step_pins_explicit_provider_and_model(tmp_path, monkeypatch):

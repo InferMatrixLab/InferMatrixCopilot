@@ -300,8 +300,8 @@ class Ledger:
                                    .replace("_", "\\_") + "%")).fetchall()
         return {row["name"]: row["value"] for row in rows}
 
-    def set_cursor(self, repo: str, name: str, value: str) -> None:
-        with self.tx() as cur:
+    def set_cursor(self, repo: str, name: str, value: str, *, owner: str | None = None) -> None:
+        with self.fenced(owner) if owner is not None else self.tx() as cur:
             cur.execute(
                 "INSERT INTO cursors VALUES (?, ?, ?, ?) ON CONFLICT(repo, name) "
                 "DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -420,17 +420,50 @@ class Ledger:
 
     def stage_intake(self, owner: str, repo: str, changeset_id: str, *, detail: dict, status: str,
                      verdicts: list[dict], human_reason: str, drafted_events: list[int],
-                     kind: str = "intake") -> str:
+                     kind: str = "intake", expected_status: str | None = None,
+                     expected_generation: int | None = None, expected_detail: dict | None = None,
+                     companion: dict | None = None) -> str:
         """Create a change set with its verdicts, human-queue entry and event
         transitions in ONE fenced transaction (any change-set kind)."""
         now = self._clock()
+        if companion is not None:
+            if (expected_status != "review_pending" or status != "human"
+                    or companion["id"] == changeset_id
+                    or companion["detail"]["for_changeset"] != changeset_id):
+                raise ValueError("invalid companion review continuation")
+            status = "companion_pending"
+            detail = {**detail, "companion": companion["id"]}
         with self.fenced(owner) as cur:
             generation = cur.execute("SELECT generation FROM repo_state WHERE repo=?", (repo,)).fetchone()
-            cur.execute(
-                "INSERT INTO changesets (id, repo, kind, status, generation, detail, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (changeset_id, repo, kind, status, int(generation["generation"]),
-                 json.dumps(detail, sort_keys=True), now, now))
+            if expected_generation is not None:
+                original = cur.execute("SELECT generation, detail FROM changesets WHERE id=?", (changeset_id,)).fetchone()
+                if (original is None or generation is None
+                        or original["generation"] != expected_generation
+                        or generation["generation"] != expected_generation
+                        or (expected_detail is not None and json.loads(original["detail"]) != expected_detail)):
+                    raise ValueError("review intent or repository generation changed")
+            if expected_status is None:
+                cur.execute(
+                    "INSERT INTO changesets (id, repo, kind, status, generation, detail, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (changeset_id, repo, kind, status, int(generation["generation"]),
+                     json.dumps(detail, sort_keys=True), now, now))
+            else:
+                cur.execute(
+                    "UPDATE changesets SET status=?, detail=?, updated_at=? "
+                    "WHERE id=? AND repo=? AND kind=? AND status=?",
+                    (status, json.dumps(detail, sort_keys=True), now,
+                     changeset_id, repo, kind, expected_status))
+                if cur.rowcount != 1:
+                    raise ValueError('changeset no longer has the expected review intent')
+            if companion is not None:
+                cur.execute(
+                    "INSERT INTO changesets (id, repo, kind, status, generation, detail, created_at, updated_at) "
+                    "VALUES (?, ?, 'companion', 'companion_staged', ?, ?, ?, ?)",
+                    (companion["id"], repo, int(generation["generation"]),
+                     json.dumps(companion["detail"], sort_keys=True), now, now))
+                cur.execute("INSERT INTO human_queue (repo, changeset_id, reason, created_at) VALUES (?, ?, ?, ?)",
+                            (repo, companion["id"], f"review and merge the companion PR for {changeset_id}", now))
             for verdict in verdicts:
                 cur.execute(
                     "INSERT INTO verdicts (repo, changeset_id, block_id, layer, verdict, model, model_version, "

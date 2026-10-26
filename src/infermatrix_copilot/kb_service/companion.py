@@ -53,25 +53,16 @@ def companion_files(external: dict[str, str], refs, operations) -> dict[str, str
     return {path: text for path, text in files.items() if text != external[path]}
 
 
-def stage_companion(rt, lifecycle, owner: str, changeset_id: str, operations, decision,
-                    external: dict[str, str], base_sha: str) -> str | None:
-    """Stage (and hand over) the companion for ``changeset_id``; the knowledge
-    change set then waits as companion_pending. None when nothing can be
-    rewritten automatically (it stays with people)."""
+def prepare_companion(companion_id: str, changeset_id: str, operations, decision,
+                      external: dict[str, str], base_sha: str) -> dict | None:
+    """Freeze deterministic companion edits with the completed gate result."""
     files = companion_files(external, decision.l1.external_refs, operations)
     if not files:
         return None
-    companion_id = rt.ledger.new_changeset_id(lifecycle.repo, "companion")
-    rt.save_changeset_files(companion_id, {"base_sha": base_sha, "files": files, "deleted": [], "evidence": []})
-    rt.ledger.stage_intake(owner, lifecycle.repo, companion_id, kind="companion", status="companion_staged",
-                           verdicts=[], human_reason=f"review and merge the companion PR for {changeset_id}",
-                           drafted_events=[], detail={"for_changeset": changeset_id, "base_sha": base_sha,
-                                                       "refs": [list(r) for r in decision.l1.external_refs]})
-    waiting = rt.ledger.changeset(changeset_id)
-    rt.ledger.update_changeset(changeset_id, status="companion_pending",
-                               detail={**waiting["detail"], "companion": companion_id})
-    publish_companion(rt, lifecycle, companion_id)
-    return companion_id
+    return {"id": companion_id,
+            "artifact": {"base_sha": base_sha, "files": files, "deleted": [], "evidence": []},
+            "detail": {"for_changeset": changeset_id, "base_sha": base_sha,
+                       "refs": [list(r) for r in decision.l1.external_refs]}}
 
 
 def publish_companion(rt, lifecycle, companion_id: str) -> str:

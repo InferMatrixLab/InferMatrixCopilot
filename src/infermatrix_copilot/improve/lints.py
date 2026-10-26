@@ -30,6 +30,7 @@ from .reader import Unit, blob_ok, blob_text, output_text
 
 EMPTY_SHA = hashlib.sha256(b"").hexdigest()
 LINT_VERSION = 1
+COST_POLICY = 'model-facts/v1'
 
 
 @dataclass(frozen=True)
@@ -231,11 +232,11 @@ def l10_unresolved_anchors(unit, store, baseline):
     return out
 
 
-@lint("L11", "cost or latency outlier versus the workflow's own history", "RQS3e time penalty")
+@lint("L11", "cost or latency outlier versus the workflow's own history", "RQS3e time penalty", version=2)
 def l11_outliers(unit, store, baseline):
     out = []
     usd = unit_usd(unit, baseline.settings)
-    z = Baseline.robust_z(usd, baseline.usd)
+    z = Baseline.robust_z(usd, baseline.usd) if usd is not None else None
     if z is not None and z > 3:
         out.append(_f("L11", unit, f"usd {usd:.3f} robust z={z:.1f}", *unit.model_calls[:3]))
     z = Baseline.robust_z(unit.seconds, baseline.seconds)
@@ -343,18 +344,31 @@ def l17_unbacked_claims(unit, store, baseline):
 
 # -- helpers ------------------------------------------------------------------------------
 
-def unit_usd(unit: Unit, settings=None) -> float:
-    from ..metrics import model_price
+@dataclass(frozen=True)
+class UnitCost:
+    known_usd: float
+    unknown_calls: int
 
-    total = 0.0
-    for r in unit.model_calls:
-        usage = r.get("usage") or {}
-        model = str((r.get("model") or {}).get("model") or "")
-        if str((r.get("model") or {}).get("provider") or "").startswith("harness:"):
-            continue  # subscription: $0, timed only
-        pin, pout = model_price(model, settings)
-        total += int(usage.get("input_tokens") or 0) / 1e6 * pin + int(usage.get("output_tokens") or 0) / 1e6 * pout
-    return round(total, 6)
+    @property
+    def usd(self) -> float | None:
+        return None if self.unknown_calls else self.known_usd
+
+
+def unit_cost(unit: Unit, settings=None) -> UnitCost:
+    from .budget import record_usd
+
+    total, unknown = 0.0, 0
+    for record in unit.model_calls:
+        amount = record_usd(record, settings)
+        if amount is None:
+            unknown += 1
+        else:
+            total += amount
+    return UnitCost(round(total, 6), unknown)
+
+
+def unit_usd(unit: Unit, settings=None) -> float | None:
+    return unit_cost(unit, settings).usd
 
 
 def run_lints(unit: Unit, store: TraceStore, baseline: Baseline,

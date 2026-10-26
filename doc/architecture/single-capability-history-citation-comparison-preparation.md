@@ -1,0 +1,17 @@
+# History引用契约回归比较准备
+
+框架已封存；这是完整目标的后续P1准备，不重开框架。本轮零模型调用，未准入，未生成正式paid ledger。当前完整Copilot suite仍需观察原进程终态，不能由这里的准备结果推导通过。
+
+候选fd8b／Bot3bbf及native Docker40cd已独立安装、逐成员验证。本次使用原四PR源码及私有标签逐字节回归：201 revision冲突优先于capacity且失败不改revision／values，202排序副本保持重复／原输入／distinct／idempotence，203已提供QuartzDecoder的token-major cache，204缺模型页不采用模型专属规则。所有原子与owner均强制，unsupported和stale approval不容忍；partial adopted batch的approve不是完整覆盖。旧710d及7095失败结果不修改。这是已知标签的回归语料，不是新独立／盲测或提示因果实验。
+
+manifest 905e37fc68f476246dff5300a731766e9df8a357c96f55efc4fc1792c65a22f4 绑定5543项输入、两臂命令、原始标签、完整调用路径和新镜像。生成及aggregate都走实际安装应用与canonical provider；正式测量不能用受控回复代替。只准备调用，不自动派发。
+
+显式revision history-citation-20261017将新manifest上限设为479，保留全部旧459分配（含闲置和unknown），仅增加每臂10／共20个实际CLI调用的有界容量。最少每臂4提取＋1aggregate，其余只覆盖应用已有输出修复；没有额外语义循环、fallback、unknown替代或复用旧闲置。workflow／phase／stage仍为3030／3330／3360秒，concurrency1。显式retain-request-result、发布禁用；served identity及USD未知仍记未知。协议修订本身不是准入。
+
+新原生CLI／所选账号控制、原固定代理TLS与拒绝、原SDK规范宿主留存控制通过。账号控制不证明推理权限；legacy RPC受控检查也不是原生质量。评测工具新增revision回归和完整当前套件通过；原复制eval目录缺少相邻test fixtures的collection错误及错误selector日志保留，改在规范测试布局验证，产品导入仍来自安装包，不注入产品src。全部冻结harness与实际验证源码逐字节一致。
+
+初稿manifest曾绑定可变checkout中的PROTOCOL.md；正式准入前已改为冻结副本，避免未来协议修订破坏原身份恢复。原初稿保留供审阅，最终manifest与control哈希一致；没有已付费调用受到改写。
+
+admit.py只在当前完整Copilot／Bot／evaluation终态、精确skip补验、安装主流程、fresh最小消费者、实际local／SSH Docker、账号／代理、留存和新harness都通过后生成不可变准入记录；缺原source终态的实际preflight已拒绝且零派发。dispatch_once.py要求精确准入hash且不存在旧paid/stage ledger，保留首次派发身份。等待或unknown不能重启。
+
+准备目录 (host-local path: `/data/zhoutaichang/copilot/output/single-capability-completion-20261012/native-quality-history-citation-20261017`)含原始命令／结果、冻结manifest与fixture／private labels、评测协议增量patch、admit／first-dispatch wrapper。准备归档不代表已准入或质量通过。产品代码和wheel未变化。其余九层、独立标签、深层恢复、其他vendor与最终发布验收继续开放。

@@ -6,6 +6,9 @@ transport or CLI command implementation.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
+import hashlib
 import json
 import os
 import subprocess
@@ -103,9 +106,18 @@ class RunService:
     Framework-agnostic (no `mcp` import) so it is unit-testable without a live
     protocol connection."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *, worker_prefix=None):
         """Wire reservation and workflow services, register this server's
         liveness token, reconcile orphaned runs, and start the worker."""
+        # Trusted host composition may wrap Python startup; workflow arguments,
+        # process ownership and the execution claim remain owned by this service.
+        prefix = (sys.executable,) if worker_prefix is None else worker_prefix
+        if (not isinstance(prefix, (tuple, list)) or not prefix
+                or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in prefix)
+                or not Path(prefix[0]).is_absolute()
+                or not Path(prefix[0]).is_file() or not os.access(prefix[0], os.X_OK)):
+            raise ValueError('worker prefix requires an absolute executable and argument vector')
+        self.worker_prefix = tuple(prefix)
         self.settings = settings or Settings()
         self.reservations = RunReservation(self.settings)
         self.copilot = Copilot(self.settings)
@@ -246,8 +258,6 @@ class RunService:
         # re-check silently validates against different config than the parent.
         env["MCP_ALLOWED_REPO_ROOTS"] = json.dumps(
             self.settings.allowed_repo_roots)
-        if self.settings.strict_backend:
-            env["STRICT_BACKEND"] = self.settings.strict_backend
         pin = read_knowledge_pin(run_dir)
         if pin.get("knowledge_dir"):
             # the snapshot pinned at reservation, even if another is active now;
@@ -282,8 +292,42 @@ class RunService:
                 "--execute-strict-reserved"
                 if strict_compat else "--execute-reserved"
             )
+            request_bytes = (run_dir / "request.json").read_bytes()
+            request = json.loads(request_bytes)
+            status = rs.read_status(run_dir) or {}
+            fingerprint = status.get("request_fingerprint")
+            if fingerprint and fingerprint != idem.spec_fingerprint(request):
+                raise PolicyError("reserved request changed before launch")
+            from .completion_execution import backend_environment, completion_settings_for_run
+            execution_settings = completion_settings_for_run(self.settings, run_dir)
+            env['NATIVE_COMPLETION_PROFILES'] = json.dumps(execution_settings.native_completion_profiles)
+            env['NATIVE_SESSION_PROFILES'] = json.dumps(execution_settings.native_session_profiles)
+            env.update(backend_environment(execution_settings))
+            env['TRACE_STORE_ROOT'] = execution_settings.trace_store_root
+            is_direct = status.get("execution_mode") == "direct_review"
+            direct = (request.get("params") or {}).get("direct_review") if is_direct else None
+            if direct is not None:
+                from ..engine.steps.review.direct_run import check_profile
+                trusted = check_profile(direct, getattr(self, "direct_profiles", {}))
+                entry = idem.read_entry(self.run_root, direct["idempotency_key"])
+                if not entry or entry.get("spec_fingerprint") != idem.spec_fingerprint(request):
+                    raise PolicyError("Direct request changed after reservation")
+                env["COPILOT_DIRECT_PROFILE"] = json.dumps(trusted)
+                env["COPILOT_DIRECT_REQUEST_SHA256"] = hashlib.sha256(request_bytes).hexdigest()
+            command = ([*self.worker_prefix, "-m", "infermatrix_copilot.engine.steps.review.direct_run", run_id]
+                       if is_direct else
+                       [*self.worker_prefix, "-m", "infermatrix_copilot", execute_arg, run_id])
+            # A changed host wrapper cannot take over an earlier launch. This
+            # record survives an unknown Popen/wait outcome, like the run claim.
+            from ..persistence import immutable_write_bytes
+            try:
+                immutable_write_bytes(run_dir / 'worker-launch.json',
+                    (json.dumps({'schema': 'run-worker-launch/1', 'command': command},
+                                sort_keys=True) + '\n').encode(), exist_ok=True)
+            except FileExistsError as exc:
+                raise PolicyError('worker launch differs from its original binding') from exc
             proc = subprocess.Popen(
-                [sys.executable, "-m", "infermatrix_copilot", execute_arg, run_id],
+                command,
                 stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 cwd=str(self.run_root), env=env,
                 **popen_kwargs,
@@ -334,6 +378,67 @@ class RunService:
         if created and self._pin_or_fail(run_id):
             self._q.put((run_id, True))
         return run_id, created
+
+    def reserve_direct_review(self, request) -> tuple[str, bool]:
+        """Reserve trusted SDK input using the same identity and worker queue."""
+        from ..engine.steps.review.direct_run import check_profile
+
+        raw = request.to_dict()
+        check_profile(raw, getattr(self, "direct_profiles", {}))
+        review = raw["review"]
+        spec = enforce_strict_review_policy({
+            "kind": "pr_review", "repo": review["repository"]["alias"], "pr": review["pr_number"],
+            "post": False, "expected_head_sha": review["expected_head_sha"], "repo_path": raw["repo_path"],
+            "params": {"carried_findings": review["carried_findings"]},
+        }, allowed_repos=self.settings.mcp_allowed_repos, settings=self.settings)
+        # Only this typed SDK path may add execution input. The MCP allowlist
+        # still strips arbitrary params; Direct never grants write authority.
+        # Bind the nested execution input to the same authorized canonical path.
+        # Otherwise equivalent symlink spellings fail the worker's equality
+        # check and produce different business-idempotency fingerprints.
+        raw["repo_path"] = spec.repo_path
+        spec = spec.model_copy(update={"params": {**spec.params, "direct_review": raw}})
+        run_id, created = self.reservations.reserve(spec, owner_server_id=self.server_id,
+            owner_server_pid=self.pid, idempotency_key=raw["idempotency_key"])
+        if created and self._pin_or_fail(run_id):
+            self._freeze_direct_workspace(run_id, spec.model_dump())
+            self._q.put((run_id, False))
+        return run_id, created
+
+    def _freeze_direct_workspace(self, run_id: str, spec: dict) -> None:
+        from ..review.workspace import snapshot_direct_workspace
+
+        raw = spec["params"]["direct_review"]
+        try:
+            snapshot_direct_workspace(self.run_root / run_id, raw,
+                full_name=self.settings.repo_full_names.get(spec["repo"]) or raw["review"]["repository"]["full_name"])
+        except Exception as exc:
+            rs.mark(self.run_root / run_id, rs.FAILED,
+                    note=f"could not freeze Direct workspace: {type(exc).__name__}: {exc}")
+            raise
+
+    def find_review(self, key, expected_head_sha):
+        """Recover the original frozen request after an uncertain reservation."""
+        entry = idem.read_entry(self.run_root, idem.validate_key(key))
+        if not entry:
+            return None
+        run_dir = self.reservations.contained_run_dir(str(entry.get("run_id") or ""))
+        spec = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
+        if entry.get("spec_fingerprint") != idem.spec_fingerprint(spec):
+            raise PolicyError("recovered review request changed after reservation")
+        if (spec.get("kind") != "pr_review" or spec.get("repo") != self.settings.default_repo
+                or spec.get("expected_head_sha") != expected_head_sha):
+            raise PolicyError("recovered review does not match repository and head")
+        with idem.key_lock(self.run_root, key):
+            rs.reconcile_if_dead(run_dir, self.run_root)
+            if idem.relaunchable(run_dir) and rs.reclaim_queued(run_dir,
+                    owner_server_id=self.server_id, owner_server_pid=self.pid):
+                if self._pin_or_fail(run_dir.name):
+                    direct = "direct_review" in (spec.get("params") or {})
+                    if direct:
+                        self._freeze_direct_workspace(run_dir.name, spec)
+                    self._q.put((run_dir.name, not direct))
+        return run_dir.name
 
     def start_quality_review(self, spec_dict: dict) -> str:
         """Reserve the dedicated, idempotent PR quality workflow."""
@@ -415,9 +520,7 @@ class RunService:
                     "knowledge_tree_sha256": view.tree_sha256}, mode="strict", view=view)
             pin["knowledge_usage"] = usage
         path = self.run_root / run_id / KNOWLEDGE_PIN
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(pin, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_bytes(path, json.dumps(pin, sort_keys=True).encode("utf-8"))
         return pin
 
     def strict_readiness(self, repo: str, repo_path: str = "") -> list[str]:
@@ -451,7 +554,23 @@ class RunService:
             except NotImplementedError as exc:
                 missing.append(str(exc))
             else:
-                if not transport.cli_path():
+                # Packaged Strict/quality workflows use tool-free completion
+                # for reduction and repair as well as native agent sessions.
+                # CLI/auth readiness alone cannot attest that second contract.
+                try:
+                    from ..providers.completion_profiles import validate_completion_policy
+                    validate_completion_policy(self.settings, transport, require_trace=True)
+                except (ValueError, RuntimeError) as exc:
+                    missing.append(
+                        f"STRICT_BACKEND={backend} cannot provide required "
+                        f"tool-free completion: {exc}")
+                from ..providers.completion_profiles import completion_profile_config
+                if completion_profile_config(self.settings, backend, session=True) is not None:
+                    try:
+                        validate_completion_policy(self.settings, transport, session=True)
+                    except (ValueError, RuntimeError) as exc:
+                        missing.append(f'STRICT_BACKEND={backend} agent sandbox unavailable: {exc}')
+                elif not transport.cli_path():
                     missing.append(
                         f"STRICT_BACKEND={backend} selected but its CLI is "
                         "not installed; install it or set STRICT_BACKEND_CLI "
@@ -534,7 +653,12 @@ class RunService:
                                "note": status.get("note", "")}
         if state not in rs.TERMINAL:
             return out  # still queued/planning/running — poll again
-        out["result"] = contract.build_review_result(run_dir)
+        failure = run_dir / "direct-failure.json"
+        if failure.is_file():
+            out["execution_failure"] = json.loads(failure.read_text(encoding="utf-8"))
+        direct = run_dir / "direct-result.json"
+        out["result"] = (json.loads(direct.read_text(encoding="utf-8")) if direct.is_file()
+                         else contract.build_review_result(run_dir))
         report_path = run_dir / "RUN_REPORT.md"
         if state == rs.BLOCKED and (run_dir / "ESCALATION.md").exists():
             report_path = run_dir / "ESCALATION.md"

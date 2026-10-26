@@ -327,7 +327,7 @@ async def _pr_harvest_debug_knowledge(ctx: StepContext) -> StepResult:
                       outputs=outputs)
 
 
-BUGFIX_RECORD_MARKER = "<!-- infermatrix-copilot:bugfix-record:v2 -->"
+from ....knowledge_service.evidence import BUGFIX_RECORD_MARKER
 _INTAKE_ISSUE = re.compile(r"^(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)$")
 
 

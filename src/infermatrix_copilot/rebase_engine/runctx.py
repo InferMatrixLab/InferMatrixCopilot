@@ -65,10 +65,8 @@ def _atomic_write(path: Path, content: str) -> None:
 def _ensure_lock_dir_excluded(checkout: Path) -> bool:
     """Mark `locks/` git-ignored via the LOCAL `.git/info/exclude` (never a
     committed file, never dirt itself). Without this the live lock file is
-    an untracked entry, and any workspace-hygiene pass — the parent's
-    phase-1 clean-tree guard with its L2 `git clean` cleanup (which v1
-    backend runs execute against this same checkout), or a bulk
-    `git add -A` staging — would delete or commit it. A `git clean`ed lock
+    an untracked entry, and a workspace-hygiene pass using `git clean`, or
+    a bulk `git add -A` staging, would delete or commit it. A `git clean`ed lock
     file leaves its holder flocking a DELETED inode while a new run locks
     a fresh one at the same path: mutual exclusion defeated. Ignored files
     are exempt from status, non-`-x` clean, and `add -A`.
@@ -152,8 +150,7 @@ def _ensure_lock_dir_excluded(checkout: Path) -> bool:
 
 class CheckoutLock:
     """A named exclusive flock under `<checkout>/locks/<name>.lock` — the
-    shared-participation lock (plan §8: EXT1 makes the external executable
-    take it; the in-process backend and archival take the SAME file)."""
+    shared by internal rebase execution and archival."""
 
     def __init__(self, checkout: Path, name: str):
         self.checkout = Path(checkout)

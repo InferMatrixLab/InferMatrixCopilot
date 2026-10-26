@@ -28,9 +28,11 @@ from .init_budget import BudgetExhausted
 from .init_coverage import Owner
 from .init_stages import _Chain, _Stage, _numbered, _one_line, _page_frontmatter, neutral_headings
 from .init_support import InitRecord, classify_verdict, generate, judge
-from .init_knowledge_inputs import SYSTEM_KNOWLEDGE, knowledge_prompt, source_owner, source_owners, foundation_evidence
+from .init_knowledge_inputs import (FOUNDATION_GENERATION_POLICY_VERSION, SYSTEM_KNOWLEDGE,
+    knowledge_prompt, knowledge_system, source_owner, source_owners, foundation_evidence,
+    foundation_uses_full_packet)
 from .models import ModelUnavailable
-from .init_knowledge_parallel import offered_ranges, parallelism, run_jobs, restore_jobs, preferred_sources, start_interval, range_is_offered, related_test_sources
+from .init_knowledge_parallel import offered_ranges, parallelism, run_jobs, restore_jobs, preferred_sources, start_interval, range_is_offered, foundation_source_packet
 
 FACETS = ("architecture", "api", "configuration", "tradeoffs", "features", "validation")
 MAX_SOURCE_BYTES = 100_000
@@ -71,6 +73,9 @@ def validate_sections(data: dict) -> None:
 
 @dataclass
 class _Knowledge(_Stage):
+
+    GENERATION_TASK_JOURNALED = True
+
     STAGE = "knowledge"
     foundation_mode: str = "strict"
     foundation_record_path: Path | None = None
@@ -127,6 +132,11 @@ class _Knowledge(_Stage):
         options = {"knowledge_policy": hashlib.sha256(text.encode()).hexdigest(),
                    "from_existing": self.from_existing,
                    "knowledge_prompt_version": context_version(self.rt) if self.rt.unlimited_subscription else 3}
+        # Bind source-only test metadata for capped and subscription jobs alike.
+        # A prior execution fact must not be inferred from source localization.
+        options["foundation_test_evidence_version"] = 2
+        if self.STAGE == "knowledge":
+            options["foundation_generation_policy_version"] = FOUNDATION_GENERATION_POLICY_VERSION
         if self.rt.unlimited_subscription:
             options["foundation_parallel"] = {"version": 1, "workers": parallelism(self.rt),
                                                "zcode_start_interval_s": start_interval(self.rt)}
@@ -160,23 +170,32 @@ class _Knowledge(_Stage):
         validate_checkpoint(self, previous, digest)
 
     def _restore_progress(self, previous: InitRecord | None) -> list[str]:
-        if self.STAGE == "knowledge" and self.foundation_mode == "partial" and previous is not None:
+        partial = self.STAGE == "knowledge" and self.foundation_mode == "partial"
+        saved = previous.coverage.get("foundation_jobs", {}) if previous is not None else {}
+        # A completed capped batch historically permits a new policy run. Keep
+        # that behavior, but never discard the identity of unresolved dispatch.
+        if (previous is not None and previous.inputs_digest != self.record.inputs_digest
+                and saved.get("unlimited_subscription") is False and not saved.get("inflight")
+                and not partial):
+            return []
+        if previous is not None and (partial or saved):
             self._validate_unpublished_checkpoint(previous, self.record.inputs_digest)
+        if partial and previous is not None:
             from .foundation_publication import validate_initial_scope
             validate_initial_scope(self, previous)
-        if (self.rt.unlimited_subscription and previous is not None
+        if (previous is not None
                 and previous.coverage.get("foundation_jobs")
                 and previous.inputs_digest != self.record.inputs_digest):
             from .init_support import InitError
             raise InitError("foundation inputs changed; create a new pinned batch")
-        if (self.rt.unlimited_subscription and previous is not None
+        if (previous is not None and previous.coverage.get("foundation_jobs")
                 and previous.inputs_digest == self.record.inputs_digest):
             from copy import deepcopy
             self.record.coverage["foundation_jobs"] = deepcopy(previous.coverage.get("foundation_jobs", {}))
             self.budget.spent_usd = previous.spent_usd
         return []
 
-    def _publish(self, changed: dict[str, str]) -> InitRecord:
+    def _prepare_publication(self, changed: dict[str, str]) -> InitRecord:
         targets = self.record.coverage.get("knowledge", {}).get("targets", {})
         if self.STAGE == "knowledge" and getattr(self.rt, "portable_spec", None):
             from .knowledge_coverage import coverage_targets_met
@@ -198,16 +217,16 @@ class _Knowledge(_Stage):
                          "it does not establish seven-facet final acceptance or executed tests."}
             self.record.notes.append("portable foundation preview: unsupported facets remain unknown; "
                                      "final semantic-depth and structural targets are unchanged")
-            return super()._publish(changed)
+            return super()._prepare_publication(changed)
         if self.STAGE == "knowledge" and self.foundation_mode == "partial":
             from .foundation_publication import freeze_receipt
             freeze_receipt(self, changed)
-            return super()._publish(changed)
+            return super()._prepare_publication(changed)
         if (self.rt.unlimited_subscription and not self.dry_run
                 and targets.get("required") is True and targets.get("met") is not True):
             return self._blocked(["foundation targets incomplete; native progress retained; "
                                   "resume this same pinned publication batch to fill missing knowledge"])
-        return super()._publish(changed)
+        return super()._prepare_publication(changed)
 
     def _resume(self, previous: InitRecord) -> InitRecord:
         if self.STAGE == "knowledge" and self.foundation_mode == "partial":
@@ -244,8 +263,7 @@ class _Knowledge(_Stage):
         routes = self.owners
         owners = source_owners(paths, routes, policy)
         self.owners = list(owners.values())
-        if self.rt.unlimited_subscription:
-            restore_jobs(self)
+        restore_jobs(self)
         for rel in paths:
             hits = source_owner(rel, routes, owners)
             if hits:
@@ -292,19 +310,20 @@ class _Knowledge(_Stage):
                 continue
             if publication_only:
                 continue  # No fourth extraction or review: existing task proofs were replayed by restore_jobs.
-            tests = related_test_sources(self, files[name]) if self.rt.unlimited_subscription else []
-            test_bytes = sum(len(item["text"].encode()) for item in tests)
-            source = self._sources(tree, sorted(files[name], key=lambda p: (-churn[p], p)), MAX_SOURCE_BYTES - test_bytes)
-            source.extend(tests)
+            ordered_paths = sorted(files[name], key=lambda p: (-churn[p], p))
+            source, test_count = foundation_source_packet(self, ordered_paths,
+                read_sources=lambda limit: self._sources(tree, ordered_paths, limit),
+                byte_limit=MAX_SOURCE_BYTES)
             docs = self._docs_for(tree, owner)
             offered = offered_ranges(source + docs)
-            report[name]["shown_files"] = len(source) - len(tests)
+            report[name]["shown_files"] = len(source) - test_count
             report[name]["partial_files"] = [item["path"] for item in source if not item.get("test_context") and item["end"] < item["total_lines"]]
             self.record.unfinished.extend(f"{name}: byte cap truncated {path}"
                                           for path in report[name]["partial_files"])
-            if len(source) - len(tests) < len(files[name]):
-                self.record.unfinished.append(f"{name}: source cap showed {len(source) - len(tests)} of {len(files[name])} files")
-            payload = {"repository": self.lifecycle.full_name, "pin": self.record.pin, "owner": name,
+            if len(source) - test_count < len(files[name]):
+                self.record.unfinished.append(f"{name}: source cap showed {len(source) - test_count} of {len(files[name])} files")
+            payload = {"foundation_generation_policy_version": FOUNDATION_GENERATION_POLICY_VERSION,
+                       "repository": self.lifecycle.full_name, "pin": self.record.pin, "owner": name,
                        "facets": requested, "files": source, "docs": docs,
                        "existing_knowledge": self._bounded_context(existing_pages),
                        "language_sample": self._language_sample(),
@@ -317,20 +336,18 @@ class _Knowledge(_Stage):
                                    "offered": offered, "requested": requested})
                 continue
             try:
-                data = generate(self.rt, self.budget, self.lifecycle.init, system=SYSTEM_KNOWLEDGE,
-                                prompt=knowledge_prompt(payload), validate=validate_sections).data
-                for section in data["sections"]:
-                    if section["facet"] not in requested:
-                        continue
-                    result = self._section(owner, page, data, section, offered)
-                    verdict = self.record.verdicts.get(f"knowledge:{name}:{section['facet']}", {})
-                    if verdict.get("verdict") in ("unsure", "unjudged"):
-                        report[name]["facets"][section["facet"]] = "needs_review"
-                    if result is not None:
-                        key, text, entries, label = result
+                # One job at a time preserves serial head/context updates while
+                # using the same dispatch, validation and recovery coordinator.
+                for _, results in run_jobs(self, [{"owner": owner, "page": page, "payload": payload,
+                                                  "offered": offered, "requested": requested}]):
+                    for key, text, entries, label in results:
                         claims[key] = text
                         evidence.extend(entries)
-                        report[name]["facets"][section["facet"]] = "covered" if label == "pass" else "needs_review"
+                        report[name]["facets"][key.rsplit(":", 1)[-1]] = "covered"
+                    for facet in requested:
+                        verdict = self.record.verdicts.get(f"knowledge:{name}:{facet}", {})
+                        if verdict.get("verdict") in ("unsure", "unjudged"):
+                            report[name]["facets"][facet] = "needs_review"
             except BudgetExhausted as exc:
                 self.record.unfinished.extend(f"knowledge owner {n}: {exc}" for n in order[position:])
                 self.record.notes.append("knowledge stopped: budget exhausted; remaining facets are incomplete")
@@ -386,10 +403,9 @@ class _Knowledge(_Stage):
                 paths = [p.relative_to(tree).as_posix() for p in tree.rglob("*")
                          if p.is_file() and matches(p.relative_to(tree).as_posix(), feature.source_globs)]
                 source_paths = list(dict.fromkeys(list(feature.entry_points) + sorted(paths)))
-                tests = related_test_sources(self, source_paths) if self.rt.unlimited_subscription else []
-                test_bytes = sum(len(item["text"].encode()) for item in tests)
-                source = preferred_sources(self, tree, feature.id, source_paths, MAX_SOURCE_BYTES - test_bytes)
-                source.extend(tests)
+                source, _ = foundation_source_packet(self, source_paths,
+                    read_sources=lambda limit: preferred_sources(self, tree, feature.id, source_paths, limit),
+                    byte_limit=MAX_SOURCE_BYTES)
                 docs = self._sources(tree, list(feature.docs), MAX_DOC_BYTES)
                 discovery = self._discovery_catalog()
                 bundle = discovery.get("evidence_bundles", {}).get(feature.id)
@@ -412,7 +428,8 @@ class _Knowledge(_Stage):
                     continue
                 offered = offered_ranges(source + docs)
                 missing_facets = targets["features"]["items"][feature.id]["missing_facets"] or list(FACETS)
-                payload = {"repository": self.lifecycle.full_name, "pin": self.record.pin,
+                payload = {"foundation_generation_policy_version": FOUNDATION_GENERATION_POLICY_VERSION,
+                           "repository": self.lifecycle.full_name, "pin": self.record.pin,
                            "owner": "feature-" + feature.id, "feature": feature.title, "facets": missing_facets,
                            "files": source, "docs": docs,
                            "existing_knowledge": self._bounded_context({feature.page: self.head.get(feature.page, "")}),
@@ -424,15 +441,10 @@ class _Knowledge(_Stage):
                                          "offered": offered, "requested": missing_facets})
                     continue
                 try:
-                    data = generate(self.rt, self.budget, self.lifecycle.init, system=SYSTEM_KNOWLEDGE,
-                                    prompt=knowledge_prompt(payload), validate=validate_sections).data
                     owner = Owner("feature-" + feature.id, feature.page, ())
-                    for section in data["sections"]:
-                        if section["facet"] not in missing_facets:
-                            continue
-                        result = self._section(owner, feature.page, data, section, offered)
-                        if result:
-                            key, text, entries, _ = result
+                    for _, results in run_jobs(self, [{"owner": owner, "page": feature.page, "payload": payload,
+                                                      "offered": offered, "requested": missing_facets}]):
+                        for key, text, entries, _ in results:
                             claims[key] = text
                             evidence.extend(entries)
                 except BudgetExhausted:
@@ -573,6 +585,14 @@ class _Knowledge(_Stage):
                 used += len(excerpt.encode("utf-8"))
         return context
 
+    def _sections(self, owner, page, payload, offered, requested):
+        """Review each requested section immediately, preserving native receipt order."""
+        data = generate(self.rt, self.budget, self.lifecycle.init, system=knowledge_system(payload),
+                        prompt=knowledge_prompt(payload), validate=validate_sections).data
+        for section in data["sections"]:
+            if section["facet"] in requested:
+                yield data, section, self._section(owner, page, data, section, offered)
+
     def _section(self, owner: Owner, page: str, data: dict, section: dict, offered: dict[str, int]):
         facet = section["facet"]
         key = f"knowledge:{owner.owner}:{facet}"
@@ -599,7 +619,8 @@ class _Knowledge(_Stage):
                         head={**self.head, page: front + "\n" + text}, evidence=self._judge_evidence(entries))
         label = classify_verdict(verdict)
         self.record.verdicts[key] = {"verdict": label, "reasons": verdict.reasons, "model": verdict.model,
-                                     "page": page, "kind": "prose", "facet": facet}
+                                     "page": page, "kind": "prose", "facet": facet,
+                                     **({"quality_receipt": verdict.quality_receipt} if verdict.quality_receipt else {})}
         if label != "pass":
             self.record.dropped.append({"rule_id": key, "page": page, "why": f"advisory judge: {verdict.reasons}"})
             if label != "fail":
@@ -609,7 +630,7 @@ class _Knowledge(_Stage):
 
     def _judge_evidence(self, entries):
         payload = getattr(self, "_foundation_payload", {})
-        if self.rt.unlimited_subscription and payload.get("foundation_prompt_version") in (4, 5):
+        if self.rt.unlimited_subscription and foundation_uses_full_packet(payload):
             return foundation_evidence(self, payload)
         return super()._judge_evidence(entries)
 

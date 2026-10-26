@@ -24,11 +24,11 @@ Layout of the outbox (owned by the engine; the routine writes acks/inbox)::
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import datetime as dt
 import json
-import os
 import re
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -301,9 +301,7 @@ def lint_body(body: str, proposal: Proposal) -> list[str]:
 
 def _atomic_write(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True).encode("utf-8"))
 
 
 def _read_json_files(directory: Path) -> list[tuple[Path, dict]]:

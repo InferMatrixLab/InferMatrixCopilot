@@ -6,6 +6,8 @@ the host registry and are not copied into a served knowledge snapshot.
 
 from __future__ import annotations
 
+from ..persistence import atomic_write_bytes
+
 import fnmatch
 import hashlib
 import json
@@ -328,9 +330,7 @@ class RepoRegistry:
             raise RepoSpecError("registered repository conflicts; explicit migration is required")
         value["repos"][spec.repo_id] = row
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_bytes(canonical_json(value))
-        temporary.replace(self.path)
+        atomic_write_bytes(self.path, canonical_json(value))
 
     def get(self, repo_id: str) -> dict | None:
         return self._read()["repos"].get(repo_id)

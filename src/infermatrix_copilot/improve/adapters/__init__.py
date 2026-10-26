@@ -72,6 +72,55 @@ class FindingLabel:
     evidence: tuple[str, ...] = ()
 
 
+def collect_gold_votes(count, vote, *, text, quote_label):
+    """Collect independent votes, requiring every claimed hit to quote its input."""
+    from ..judges import JudgeError
+
+    votes = []
+    for _ in range(count):
+        try:
+            verdict = vote()
+        except JudgeError as exc:
+            votes.append({"status": "error", "quote": "", "error": str(exc)[:200]})
+            continue
+        status = str(verdict.get("status") or "").lower()
+        quote = str(verdict.get("quote") or "").strip()
+        if status == "hit" and (not quote or quote not in text):
+            status, quote = "miss", quote and f"[quote not in {quote_label}] {quote[:120]}"
+        votes.append({"status": status if status in ("hit", "miss") else "error", "quote": quote[:300]})
+    return votes
+
+
+def record_gold_match(unit, entry, gold, store, *, votes, judge, inconclusive):
+    """Cache only a majority of all votes; failures leave the cell retryable."""
+    hits = sum(1 for vote in votes if vote["status"] == "hit")
+    misses = sum(1 for vote in votes if vote["status"] == "miss")
+    if hits * 2 > len(votes):
+        status = "hit"
+    elif misses * 2 > len(votes):
+        status = "miss"
+    else:
+        inconclusive.append({"unit_id": unit.unit_id, "gold_id": entry.gold_id, "votes": votes})
+        return False
+    quote = next((vote["quote"] for vote in votes if vote["status"] == "hit"), "")
+    store.append("outcome", context={"unit_id": unit.unit_id, "item": unit.item, "of": unit.unit_id,
+                                     "workflow": unit.workflow},
+                 result={"type": "gold_match", "gold_id": entry.gold_id, "status": status, "quote": quote,
+                         "votes": votes, "gold_version": gold.version, "judge": judge})
+    return True
+
+
+def gold_matches(gold: Gold, outcome: Outcome) -> list[Match]:
+    """Replay the newest recorded decision for every gold entry, in gold order."""
+    latest = {str(row["result"].get("gold_id")): row for row in outcome.of_type("gold_match")}
+    out = []
+    for entry in gold.entries:
+        row = latest.get(entry.gold_id)
+        out.append(Match(entry.gold_id, str(row["result"].get("status") or "unlabeled"), evidence=(row["id"],))
+                   if row is not None else Match(entry.gold_id, "unlabeled"))
+    return out
+
+
 class OutcomeAdapter(Protocol):
     name: str
     descriptive_only: bool

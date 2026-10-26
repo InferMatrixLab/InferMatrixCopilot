@@ -12,6 +12,25 @@ def digest(value):
                                     separators=(",", ":")).encode()).hexdigest()
 
 
+def merge_ranges(ranges):
+    """Union overlapping or adjacent inclusive ranges; callers validate bounds."""
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def selected_spans(selected):
+    """Group already selected lines without changing text, path order or gaps."""
+    return [{"path": path, "start": start, "end": end,
+             "text": [numbered[n] for n in range(start, end + 1)]}
+            for path, numbered in selected.items()
+            for start, end in merge_ranges((n, n) for n in numbered)]
+
+
 def build_evidence_bundle(index, feature_id, *, catalog_hash, refs, unit_ids=(), receipts=()):
     from .feature_discovery_index import validate_evidence
 

@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping
 
+from ..git_objects import checked_read, raw_changes, tree_texts
+
 from .l1 import Change, _dangling_refs as dangling_refs, check_changeset, check_tree
 from .lifecycle import LifecycleError, Page
 from .ops import all_rule_ids
@@ -38,7 +40,6 @@ GOVERNED_PREFIXES = ("knowledge/repos/", "knowledge/general/")
 GOVERNED_SUFFIXES = (".md", ".yaml")
 EXTERNAL_REF_DIRS = ("skills/", "plugins/", "adapters/", "doc/", "playbooks/")
 EXTERNAL_SUFFIXES = (".md", ".yaml", ".yml", ".json", ".txt")
-_ZERO = "0" * 40
 
 
 class GateError(RuntimeError):
@@ -107,55 +108,15 @@ class Git:
 
     def raw_diff(self, old: str, new: str) -> list[dict]:
         """Every changed path as a manifest entry (renames are D + A)."""
-        out = self.run("diff", "--raw", "-z", "--no-renames", "--no-abbrev", old, new).split(b"\0")
-        entries: list[dict] = []
-        index = 0
-        while index < len(out) - 1:
-            meta = out[index].decode()
-            path = out[index + 1].decode("utf-8", "replace")
-            index += 2
-            if not meta.startswith(":"):
-                raise GateError(f"unexpected git diff output: {meta!r}")
-            old_mode, new_mode, old_blob, new_blob, status = meta[1:].split()
-            entries.append({
-                "path": path, "status": status[0],
-                "old_blob": "" if old_blob == _ZERO else old_blob,
-                "new_blob": "" if new_blob == _ZERO else new_blob,
-                "old_mode": "" if old_mode == "000000" else old_mode,
-                "new_mode": "" if new_mode == "000000" else new_mode,
-            })
-        return entries
+        return checked_read(GateError, lambda: raw_changes(
+            self.run("diff", "--raw", "-z", "--no-renames", "--no-abbrev", old, new)))
 
     def changed_names(self, old: str, new: str) -> list[str]:
         out = self.run("diff", "--name-only", "-z", "--no-renames", old, new, "--", "knowledge/")
         return [name.decode("utf-8", "replace") for name in out.split(b"\0") if name]
 
     def texts(self, rev: str, prefixes: tuple[str, ...], suffixes: tuple[str, ...]) -> dict[str, str]:
-        listing = self.run("ls-tree", "-r", "-z", "--full-tree", rev).split(b"\0")
-        wanted: list[tuple[str, str]] = []
-        for entry in listing:
-            if not entry:
-                continue
-            meta, _, raw_path = entry.partition(b"\t")
-            mode, kind, oid = meta.decode().split()
-            name = raw_path.decode("utf-8", "replace")
-            if kind == "blob" and mode == "100644" and name.startswith(prefixes) and name.endswith(suffixes):
-                wanted.append((name, oid))
-        if not wanted:
-            return {}
-        out = self.run("cat-file", "--batch", input="".join(f"{oid}\n" for _, oid in wanted).encode())
-        texts: dict[str, str] = {}
-        cursor = 0
-        for name, _oid in wanted:
-            header_end = out.index(b"\n", cursor)
-            size = int(out[cursor:header_end].split()[2])
-            body = out[header_end + 1: header_end + 1 + size]
-            cursor = header_end + 1 + size + 1
-            try:
-                texts[name] = body.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-        return texts
+        return checked_read(GateError, tree_texts, self.run, rev, prefixes, suffixes)
 
     def knowledge_files(self, rev: str) -> dict[str, str]:
         files = self.texts(rev, GOVERNED_PREFIXES, GOVERNED_SUFFIXES)

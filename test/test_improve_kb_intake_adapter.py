@@ -17,6 +17,7 @@ from infermatrix_copilot.improve.enroll import load_declarations
 from infermatrix_copilot.improve.judges import JudgeSpec
 from infermatrix_copilot.improve.reader import units_between
 from infermatrix_copilot.trace_store import TraceStore, trace_context
+from execution_helpers import contained_codex  # noqa: F401
 
 ITEM = "demo#12"
 SECTION = "## DEMO-2b — keep the queue bounded\n\n- 触发：x\n- 强制：reject when full ^[PR #12]\n"
@@ -139,7 +140,7 @@ def test_gold_from_incumbent_takes_only_gate_passing_rules(tmp_path):
     assert entries[0]["section"] == entries[0]["concern"]
 
 
-def test_gold_match_votes_majority_verbatim_quote_and_deterministic_empty(tmp_path):
+def test_gold_match_votes_majority_verbatim_quote_and_deterministic_empty(tmp_path, contained_codex):
     store = TraceStore(tmp_path / "t", environ={})
     ops = [{"kind": "add", "page": "repos/demo/rules.md", "rule_id": "DEMO-2b", "section_markdown": SECTION}]
     _unit(store, "arm", ops, summary={"pass": 1, "fail": 0, "human": 0, "empty": False, "rejected": False, "l1_ok": True})
@@ -156,9 +157,11 @@ def test_gold_match_votes_majority_verbatim_quote_and_deterministic_empty(tmp_pa
     def codex(argv, **kw):
         text = next(answers)
         return SimpleNamespace(returncode=0, stdout=json.dumps(
-            {"type": "item.completed", "item": {"item_type": "agent_message", "text": text}}), stderr="")
+            {"type": "item.completed", "item": {"item_type": "agent_message", "text": text}}) + '\n' +
+            json.dumps({'type':'turn.completed'}), stderr="")
 
-    adapter = KbIntakeAdapter(gold_dir=tmp_path, judge=JudgeSpec("cli", "gpt-6-sol", provider="codex"), runner=codex)
+    contained_codex.runner = codex
+    adapter = KbIntakeAdapter(gold_dir=tmp_path, judge=JudgeSpec("cli", "gpt-6-sol", provider="codex"))
     units = _units(store)
     gold = adapter.gold(ITEM)
     assert adapter.gold_match(units["arm"], gold, store) == 2

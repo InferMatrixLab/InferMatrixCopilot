@@ -342,3 +342,33 @@ def test_a_manifest_routed_page_is_measured_without_a_map(world):
     assert core.rules() and "knowledge/repos/toy/components/core/rules-2.md" not in tree
     assert not any("is full" in n for n in record.notes)
     assert QUICK_MAP_HEADING not in tree["knowledge/repos/toy/components/core/rules.md"]
+
+
+def test_rule_without_source_paths_does_not_claim_owner_scope_as_evidence():
+    page = RULE_PAGE.replace("`pkg/core.py`", "engine state").replace(
+        "`pkg/util.py::helper`", "the helper").replace("`pkg/util.py`", "the utility")
+    section = render_quick_map(page, signals=["engine"], prefixes=["pkg/", "tools/generate/"])
+    rows = [line for line in section.splitlines() if "| TOY-" in line]
+    assert len(rows) == 2
+    assert all(line.endswith("| — |") for line in rows)
+    assert "tools/generate/" not in section and "`pkg/`" not in section
+    assert _direct_quick_map_text(with_quick_map(page, section))[1] == "ok"
+
+
+def test_refresh_uses_exact_per_rule_paths_without_fabricating_fallbacks():
+    page = RULE_PAGE.replace("`pkg/util.py` never imports", "the utility never imports")
+    routes = "schema_version: 1\nowners:\n  - owner: core\n    path: repos/toy/rules.md\n    signals: [engine]\n    scope_prefixes: [pkg/, tools/generate/]\n"
+    files, notes, problems = refresh_quick_maps(
+        {"repos/toy/rules.md": page}, {}, routes, briefing_docs=())
+    assert not problems and not notes
+    quick, status = _direct_quick_map_text(files["repos/toy/rules.md"])
+    assert status == "ok"
+    assert "| Helpers stay pure | TOY-1b | — |" in quick
+    assert "| TOY-1a | `pkg/core.py`、`pkg/util.py::helper` |" in quick
+    assert "tools/generate/" not in quick
+
+
+def test_entry_page_retains_owner_scope_navigation_without_rule_evidence():
+    page = "---\ntitle: Entry\ntype: index\n---\n\n# Entry\n\nOwner navigation.\n"
+    section = render_quick_map(page, signals=["engine"], prefixes=["pkg/", "tools/generate/"])
+    assert "| engine | 入口 | `pkg/`、`tools/generate/` |" in section

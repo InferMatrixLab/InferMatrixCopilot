@@ -139,6 +139,12 @@ def test_catalog_is_repo_scoped_sorted_and_path_free(workspace):
     assert all(not Path(item).is_absolute() for item in all_pages)
 
 
+def test_proposal_identity_wire_golden(workspace):
+    validation = KnowledgeCurator(workspace).validate_proposals(_document(_rule()), _batch())
+    assert validation.accepted[0].proposal_id == (
+        "sha256:ace923c73892551b6fedab03203dfac26c97cedcf187acbdddb85a1104f963db")
+
+
 def test_reviewed_rule_evidence_is_active_source_bound_and_byte_exact():
     import hashlib
 
@@ -853,3 +859,234 @@ def test_apply_refuses_a_section_that_repeats_a_rule_id(workspace):
 
     with pytest.raises(KnowledgeCurationError, match="apply-time integrity"):
         curator.apply(tampered, updated_on="2026-08-29")
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["declared", "nested"])
+def test_apply_rechecks_new_ids_across_all_target_pages(workspace, nested):
+    """Separately validated receipts cannot introduce the same new ID twice."""
+    curator = KnowledgeCurator(workspace)
+    first = curator.validate_proposals(_document(_rule()), _batch())
+    second_rule = _rule(page=GENERAL_PAGE)
+    if nested:
+        second_rule = _rule(page=GENERAL_PAGE, rule_id="GENERAL-2", section=GENERAL_SECTION
+                            + "\n\n### X-2 — nested new identity\n\n- Required: retain its source. ^[PR #7]")
+    second = curator.validate_proposals(_document(_rule(page=OTHER_PAGE), second_rule), _batch())
+    assert len(second.accepted) == 1 and second.accepted[0].input_index == 1
+    combined = replace(first, accepted=first.accepted + second.accepted, rejected=())
+    originals = {page: (workspace / page).read_bytes() for page in (PAGE, GENERAL_PAGE)}
+
+    with pytest.raises(KnowledgeCurationError, match="append-safe"):
+        curator.apply(combined, updated_on="2026-08-29")
+
+    assert all((workspace / page).read_bytes() == data for page, data in originals.items())
+    assert not (workspace / "validator-order.txt").exists()
+
+
+@pytest.mark.parametrize("ending", ["", "\n", "\n\n\n", "\n  \n"])
+def test_append_rendering_preserves_original_prefix_bytes(workspace, ending):
+    original = PAGE_TEXT.rstrip("\n").replace("sources: [PR #1]", "sources: ['PR #1']") + ending
+    path = workspace / PAGE
+    path.write_bytes(original.encode("utf-8"))
+    curator = KnowledgeCurator(workspace)
+    validation = curator.validate_proposals(_document(_rule()), _batch())
+
+    curator.apply(validation, updated_on="2026-10-08")
+
+    prefix = original.replace("updated: 2026-08-01", "updated: 2026-10-08")
+    if not prefix.endswith(("\n", "\r")):
+        prefix += "\n"
+    assert path.read_bytes() == (prefix + "\n" + SECTION + "\n").encode("utf-8")
+
+
+def test_curate_repairs_rejection_with_one_original_evidence_packet(workspace):
+    curator = KnowledgeCurator(workspace)
+    original = (workspace / PAGE).read_bytes()
+    prompts = []
+
+    def generate(text, schema):
+        prompts.append(text)
+        assert (workspace / PAGE).read_bytes() == original
+        assert schema["properties"]["rules"]["maxItems"] == 8
+        return _document(_rule(page=OTHER_PAGE if len(prompts) == 1 else PAGE))
+
+    outcome = curator.curate(_batch(), generate=generate, updated_on="2026-10-08")
+
+    assert len(prompts) == 2 and outcome["apply_result"].applied == 1
+    assert prompts[1].count(prompts[0]) == 1  # repairs must not duplicate the bounded evidence packet
+    assert outcome["attempts"][0]["kind"] == "rejection"
+    assert outcome["attempts"][0]["retry"] is True and outcome["error"] == ""
+
+
+def test_curate_cannot_turn_a_rejection_into_no_rules(workspace):
+    replies = iter((_document(_rule(page=OTHER_PAGE)), _document()))
+    original = (workspace / PAGE).read_bytes()
+
+    outcome = KnowledgeCurator(workspace).curate(_batch(), generate=lambda *_: next(replies))
+
+    assert "empty list" in outcome["error"] and outcome["apply_result"] is None
+    assert len(outcome["attempts"]) == 2 and (workspace / PAGE).read_bytes() == original
+    assert not (workspace / "validator-order.txt").exists()
+
+
+@pytest.mark.parametrize("change", ["drop", "owner", "id", "source"])
+def test_curate_validator_repair_keeps_original_candidate_identity(workspace, change):
+    (workspace / "knowledge/tools/check_wiki_lint.py").write_text(_validator_script("broken", 1))
+    original = (workspace / PAGE).read_bytes()
+    repaired = _rule()
+    if change == "owner":
+        repaired["page"] = GENERAL_PAGE
+    elif change == "id":
+        repaired.update(rule_id="X-3", section_markdown=SECTION.replace("X-2", "X-3"))
+    elif change == "source":
+        repaired["sources"] = ["PR #1"]
+    replies = iter((_document(_rule()), _document() if change == "drop" else _document(repaired)))
+
+    def generate(*_):
+        assert (workspace / PAGE).read_bytes() == original  # rollback precedes any repair dispatch
+        return next(replies)
+
+    outcome = KnowledgeCurator(workspace).curate(_batch(), generate=generate)
+
+    assert outcome["apply_result"] is None and "preserve every rule" in outcome["error"]
+    assert len(outcome["attempts"]) == 2 and (workspace / PAGE).read_bytes() == original
+    assert (workspace / "validator-order.txt").read_text() == "tree\nbroken\n"
+
+
+def test_curate_refuses_embedded_generator_source_mutation(workspace):
+    def generate(*_):
+        (workspace / PAGE).write_text("changed by untrusted generation")
+        return _document(_rule())
+
+    with pytest.raises(KnowledgeCurationError, match="modified its source"):
+        KnowledgeCurator(workspace).curate(_batch(), generate=generate)
+    assert not (workspace / "validator-order.txt").exists()
+
+
+def test_curate_observer_failure_prevents_apply_and_repair_dispatch(workspace):
+    calls = []
+    original = (workspace / PAGE).read_bytes()
+
+    def generate(*_):
+        calls.append(1)
+        return _document(_rule())
+
+    def unavailable_journal(observation):
+        assert observation["attempt"] == 0
+        raise OSError("diagnostic disk full")
+
+    with pytest.raises(OSError, match="diagnostic disk full"):
+        KnowledgeCurator(workspace).curate(_batch(), generate=generate, on_attempt=unavailable_journal)
+    assert calls == [1] and (workspace / PAGE).read_bytes() == original
+    assert not (workspace / "validator-order.txt").exists()
+
+
+def test_curate_diagnostic_is_durable_before_the_next_dispatch_fails(workspace):
+    import json
+
+    journal = workspace / "host-diagnostics.json"
+    calls = []
+
+    def generate(*_):
+        calls.append(1)
+        if len(calls) == 2:
+            assert json.loads(journal.read_text())["rejections"]
+            raise RuntimeError("next backend unavailable")
+        return _document(_rule(page=OTHER_PAGE))
+
+    with pytest.raises(RuntimeError, match="next backend unavailable"):
+        KnowledgeCurator(workspace).curate(_batch(), generate=generate,
+            on_attempt=lambda observation: journal.write_text(json.dumps(observation)))
+    assert json.loads(journal.read_text())["kind"] == "rejection"
+    assert (workspace / PAGE).read_bytes() == PAGE_TEXT.encode()
+
+
+def test_curate_does_not_repair_after_unresolved_validator_cleanup(workspace, monkeypatch):
+    from infermatrix_copilot.knowledge_service import validation
+    from infermatrix_copilot.process_execution import ProcessCleanupError, ProcessOutcome
+    original = (workspace / PAGE).read_bytes()
+    calls = []
+    def generate(*_):
+        calls.append(True)
+        return _document(_rule())
+    def unresolved(*args, **kwargs):
+        raise ProcessCleanupError(ProcessOutcome('', '', 0))
+    monkeypatch.setattr(validation, 'run_command', unresolved)
+    outcome = KnowledgeCurator(workspace).curate(_batch(), generate=generate)
+    assert len(calls) == 1 and outcome['apply_result'] is None
+    assert (workspace / PAGE).read_bytes() == original
+    observation = outcome['attempts'][0]
+    assert not observation['retry'] and not observation['validator_result']['rolled_back']
+    assert observation['validator_result']['validators'][0]['status'] == 'unresolved'
+
+
+@pytest.mark.parametrize('failure', [RuntimeError('validator interrupted'), KeyboardInterrupt()])
+def test_unexpected_validator_exit_restores_all_pages_and_preserves_exception(workspace, monkeypatch, failure):
+    from infermatrix_copilot.knowledge_service import apply
+    originals = {page: (workspace / page).read_bytes() for page in (PAGE, GENERAL_PAGE)}
+    curator = KnowledgeCurator(workspace)
+    validation = curator.validate_proposals(
+        _document(_rule(), _rule(page=GENERAL_PAGE, rule_id='GENERAL-2', section=GENERAL_SECTION)), _batch())
+    def interrupted(*args, **kwargs):
+        assert all((workspace / page).read_bytes() != data for page, data in originals.items())
+        raise failure
+    monkeypatch.setattr(apply, 'validate_workspace', interrupted)
+    with pytest.raises(type(failure)) as caught:
+        curator.apply(validation)
+    assert caught.value is failure
+    assert all((workspace / page).read_bytes() == data for page, data in originals.items())
+
+
+def test_sigint_during_validator_restores_original_page_and_stops_validator(workspace):
+    import os
+    import signal
+    import subprocess
+    import sys
+    from infermatrix_copilot.process_tree import _start_time
+    original = (workspace / PAGE).read_bytes()
+    pidfile = workspace / 'validator-pid'
+    (workspace / 'knowledge/tools/check_knowledge_tree.py').write_text(
+        "import os,time\nfrom pathlib import Path\nPath('validator-pid').write_text(str(os.getpid()))\ntime.sleep(30)\n")
+    program = (
+        'import sys\nfrom pathlib import Path\n'
+        f'sys.path.insert(0,{str(Path(__file__).parent)!r})\n'
+        'from test_sdk_knowledge_v1 import KnowledgeCurator,_batch,_document,_rule\n'
+        f'curator=KnowledgeCurator(Path({str(workspace)!r}))\n'
+        'curator.apply(curator.validate_proposals(_document(_rule()),_batch()))\n')
+    process = subprocess.Popen([sys.executable, '-c', program], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    validator_pid = birth = None
+    def state(pid):
+        try:
+            return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+    try:
+        deadline = monotonic() + 5
+        while not pidfile.exists():
+            assert process.poll() is None
+            assert monotonic() < deadline
+            sleep(.01)
+        validator_pid = int(pidfile.read_text()); birth = _start_time(validator_pid)
+        assert (workspace / PAGE).read_bytes() != original
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=10)
+        assert process.returncode != 0 and b'KeyboardInterrupt' in stderr
+        assert state(validator_pid) in (None, 'Z', 'X')
+        assert (workspace / PAGE).read_bytes() == original
+    finally:
+        if process.poll() is None:
+            process.kill(); process.communicate(timeout=5)
+        if validator_pid is not None and birth is not None and _start_time(validator_pid) == birth and state(validator_pid) not in (None, 'Z', 'X'):
+            os.kill(validator_pid, signal.SIGKILL)
+
+
+def test_native_generation_error_keeps_original_dispatch_facts(workspace,monkeypatch):
+    from infermatrix_copilot.providers import json_session
+    failure=json_session.JSONSessionError('original native result unresolved',timeout=True)
+    failure.native_call_sent=True;failure.native_call_completed=False;failure.native_outcome_pending=True
+    def unresolved(*args,**kwargs):raise failure
+    monkeypatch.setattr(json_session,'run_readonly_json',unresolved)
+    with pytest.raises(KnowledgeCurationError) as captured:
+        KnowledgeCurator(workspace).curate(_batch())
+    error=captured.value
+    assert error.__cause__ is failure
+    assert error.native_call_sent and error.native_outcome_pending and not error.native_call_completed

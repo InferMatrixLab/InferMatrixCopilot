@@ -18,7 +18,7 @@ from .depth_inputs import DepthContext, SYSTEM_DEPTH, prompt
 from .depth_judge import review_facets
 from .init_budget import BudgetExhausted
 from .init_coverage import Owner
-from .init_history import _CheckpointBudget
+from .init_history import _checkpoint_budget
 from .init_knowledge import MAX_DOC_BYTES, _Knowledge, _MARKER
 from .init_stages import _one_line, _page_frontmatter
 from .init_support import InitError, InitRecord, generate
@@ -129,7 +129,7 @@ class _KnowledgeDepth(_Knowledge):
             self.record.status = "started"
             self.record.problems = []
             self.record.dry_run = self.dry_run
-        self.budget = _CheckpointBudget(None if getattr(self.rt, "unlimited_subscription", False)
+        self.budget = _checkpoint_budget(None if getattr(self.rt, "unlimited_subscription", False)
                                        else self.lifecycle.init.budget_usd, self.record, self.rt.state_dir)
         return []
 
@@ -193,7 +193,7 @@ class _KnowledgeDepth(_Knowledge):
             return self._blocked(initial["problems"])
         breadth = audit_coverage(self.head, tree, policy, full_name=self.lifecycle.full_name, pin=self.record.pin)
         if policy.semantic_depth_per_facet_gt is not None and not coverage_targets_met(breadth, self.foundation_mode):
-            self.record.coverage = {"semantic_depth": initial, "breadth": breadth}
+            self._replace_coverage({"semantic_depth": initial, "breadth": breadth})
             state["done"] = False
             return self._blocked(["structural coverage target is unmet; restore feature and production-file coverage before depth extraction"])
         if self.acceptance_mode == "lightweight":
@@ -237,6 +237,9 @@ class _KnowledgeDepth(_Knowledge):
             attempted = False
             for feature in order:
                 entry = states.setdefault(feature.id, {})
+                if self._pending_dispatch(entry):
+                    stopped = True
+                    continue
                 current = progress["features"][feature.id]
                 missing = current["unknown_facets"]
                 if not missing:
@@ -294,7 +297,7 @@ class _KnowledgeDepth(_Knowledge):
         breadth = audit_coverage(self.head, tree, policy, full_name=self.lifecycle.full_name, pin=self.record.pin)
         state["done"] = not stopped and (depth["target_met"] and coverage_targets_met(breadth, self.foundation_mode)
                                          if policy.semantic_depth_per_facet_gt is not None else True)
-        self.record.coverage = {"semantic_depth": depth, "breadth": breadth}
+        self._replace_coverage({"semantic_depth": depth, "breadth": breadth})
         if self.foundation_mode == "partial":
             self.record.coverage["foundation"] = {"mode": "partial", "init_complete": False,
                 "foundation_targets_met": breadth["met"],
@@ -307,10 +310,16 @@ class _KnowledgeDepth(_Knowledge):
         self.record.save(self.rt.state_dir)
         claims = {page: text for page, text in accepted.items()}
         entries = [Evidence.from_dict(e) for group in self.record.evidence.values() for e in group]
-        result = self._conclude(claims, entries)
-        if policy.semantic_depth_per_facet_gt is not None and not depth["target_met"] and result.status == "empty":
-            return self._blocked(["semantic depth target is unmet; retained checkpoint is incomplete"])
-        return result
+        return self._conclude(claims, entries)
+
+    @staticmethod
+    def _pending_dispatch(entry):
+        pending = ((entry.get("extraction_dispatched") and "draft" not in entry)
+                   or (entry.get("review_dispatched") and "checked" not in entry))
+        if pending:
+            entry["status"] = "pending"
+            entry["reason"] = "native execution outcome unknown; reconcile original dispatch before correction"
+        return pending
 
     def _begin_light_round(self, entry, requested):
         """Charge a durable logical round before dispatch, including interrupted reviews."""
@@ -324,10 +333,14 @@ class _KnowledgeDepth(_Knowledge):
         self.record.save(self.rt.state_dir)
 
     def _run_lightweight(self, tree, context, states, initial, selected_features):
+        from ..knowledge_service.drafting import AttemptPolicy
+
+        corrections = AttemptPolicy(4)
         counts = {f: initial["facet_counts"][f]["recognized"] for f in FACETS}
         positions = {feature.id: i for i, feature in enumerate(selected_features)}
         while True:
             attempted = False
+            held = False
             order = sorted(selected_features, key=lambda feature: (
                 bool(self._block_cache.get(feature.id)),
                 min((counts[f] for f in FACETS if f not in self._block_cache.get(feature.id, {})), default=80),
@@ -336,10 +349,13 @@ class _KnowledgeDepth(_Knowledge):
                 if self.stop_file and self.stop_file.exists():
                     return True
                 entry = states.setdefault(feature.id, {})
+                if self._pending_dispatch(entry):
+                    held = True
+                    continue
                 old = set(self._block_cache.get(feature.id, {}))
                 finishing = ("draft" in entry and (not entry.get("review_dispatched") or "checked" in entry))
                 requested = [f for f in FACETS if f not in old and (
-                    entry["facets"][f].get("total_attempts", 0) < 4 or
+                    corrections.allows(entry["facets"][f].get("total_attempts", 0)) or
                     finishing and f in entry.get("payload", {}).get("facets", []))]
                 if not requested:
                     entry["status"] = "complete" if len(old) == len(FACETS) else "exhausted"
@@ -368,15 +384,23 @@ class _KnowledgeDepth(_Knowledge):
                 for facet in set(self._block_cache.get(feature.id, {})) - old:
                     counts[facet] += 1
             if not attempted:
-                return False
+                return held
 
-    def _publish(self, changed):
+    def _prepare_publication(self, changed):
         depth = self.record.coverage.get("semantic_depth", {})
         unmet = self.coverage_policy.semantic_depth_per_facet_gt is not None and (
             not depth.get("target_met") or not coverage_targets_met(self.record.coverage.get("breadth", {}), self.foundation_mode))
         if unmet and not self.dry_run:
             return self._blocked(["semantic depth target is unmet; publication is blocked, checkpoint retained"])
-        result = super()._publish(changed)
+        return super()._prepare_publication(changed)
+
+    def _publish(self):
+        if not self.dry_run:
+            return super()._publish()
+        result = super()._publish()
+        depth = self.record.coverage.get("semantic_depth", {})
+        unmet = self.coverage_policy.semantic_depth_per_facet_gt is not None and (
+            not depth.get("target_met") or not coverage_targets_met(self.record.coverage.get("breadth", {}), self.foundation_mode))
         if unmet and result.status == "dry_run":
             result.status = "partial"
             result.notes.append("reviewable partial preview; semantic depth target is not met")
@@ -385,6 +409,8 @@ class _KnowledgeDepth(_Knowledge):
 
     @staticmethod
     def _slot_result(entry, facet, status, reason):
+        from ..knowledge_service.drafting import AttemptPolicy
+
         slot = entry.setdefault("facets", {}).setdefault(facet, {"attempts": 0, "evidence_visits": {}})
         event = [entry.get("attempts", 0), entry.get("review_attempts", 0)]
         if entry.get("acceptance_mode") == "lightweight":
@@ -403,13 +429,13 @@ class _KnowledgeDepth(_Knowledge):
             slot.pop("blocked", None)
             return
         if entry.get("acceptance_mode") == "lightweight":
-            if slot.get("total_attempts", 0) >= 4:
+            if not AttemptPolicy(4).allows(slot.get("total_attempts", 0)):
                 slot["blocked"] = "initial attempt and three corrections exhausted; evidence remains unknown"
             return
         key = entry.get("evidence_sha256", "no-durable-evidence")
         visits = slot.setdefault("evidence_visits", {})
         visits[key] = visits.get(key, 0) + 1
-        if visits[key] >= 3:
+        if not AttemptPolicy(3).allows(visits[key]):
             slot["blocked"] = "three unsuccessful repairs with the same pinned evidence; needs new evidence or a corrected candidate"
 
     def _docs(self, tree: Path, feature, owner, *, context=None, facets=(),
@@ -491,16 +517,12 @@ class _KnowledgeDepth(_Knowledge):
     def _judge_evidence(self, entries: list[Evidence]) -> list[dict]:
         # Supply every attested line, without the rule judge's 8KB truncation.
         # Merge overlaps so seven facets do not repeat the same large excerpt.
+        from .evidence_bundle import merge_ranges
+
         out = []
         for path in dict.fromkeys(e.path for e in entries):
-            spans = []
-            for start, end in sorted((e.start, e.end) for e in entries if e.path == path):
-                if spans and start <= spans[-1][1] + 1:
-                    spans[-1] = (spans[-1][0], max(end, spans[-1][1]))
-                else:
-                    spans.append((start, end))
             lines = (self.observer.file_text(self.record.pin, path) or "").splitlines()
-            for start, end in spans:
+            for start, end in merge_ranges((e.start, e.end) for e in entries if e.path == path):
                 out.append({"source_reference": f"{self.lifecycle.full_name}@{self.record.pin}:"
                                                  f"{path}:L{start}-L{end}",
                             "kind": "upstream_text", "text": [f"{n}: {lines[n - 1]}" for n in range(start, end + 1)]})
@@ -540,6 +562,19 @@ class _KnowledgeDepth(_Knowledge):
         ordered.update({p: t for p, t in self._bounded_context(background).items()
                         if p != feature.page and t != current})
         return self._bounded_texts(ordered, 4000)
+
+    def _block_evidence(self, blocks):
+        evidence = []
+        for block in blocks.values():
+            proof = json.loads(re.search(r"<!-- kb:depth-proof (.*?) -->", block, re.S).group(1))
+            evidence += [evidence_for(self.observer, e["path"], e["start"], e["end"]) for e in proof["evidence"]]
+        return evidence
+
+    def _depth_content(self, prefix, blocks):
+        text = prefix + "\n\n".join(blocks[f] for f in FACETS if f in blocks) + "\n"
+        evidence = self._block_evidence(blocks)
+        sources = [f"{self.lifecycle.full_name}@{self.record.pin}:{e.path}:L{e.start}-L{e.end}" for e in evidence]
+        return Page.parse(text).with_sources(list(dict.fromkeys(sources))).render(), evidence
 
     def _attempt(self, tree, context, feature, entry):
         page = depth_page(feature)
@@ -608,9 +643,12 @@ class _KnowledgeDepth(_Knowledge):
             entry["context_sha256"] = digest(_stable_prompt(payload))
             self.record.save(self.rt.state_dir)
             from .depth_inputs import system_prompt
-            entry["draft"] = generate(self.rt, self.budget, self.lifecycle.init,
-                                      system=system_prompt(self.acceptance_mode) if lightweight else SYSTEM_DEPTH,
-                                      prompt=_stable_prompt(payload), validate=validate_container).data
+            from .quality_review import checkpoint_review
+            checkpoint_review(entry, lambda: generate(self.rt, self.budget, self.lifecycle.init,
+                system=system_prompt(self.acceptance_mode) if lightweight else SYSTEM_DEPTH,
+                prompt=_stable_prompt(payload), validate=validate_container).data,
+                lambda: self.record.save(self.rt.state_dir), binding={"input_sha256": entry["context_sha256"]},
+                result_key="draft", dispatch_key="extraction_dispatched", attempts_key="extraction_calls")
             entry["status"] = "extracted"
             self.record.save(self.rt.state_dir)
         else:
@@ -680,14 +718,8 @@ class _KnowledgeDepth(_Knowledge):
         related = f"[功能概览]({Path(feature.page).name}) · [owner 入口](_index.md)\n\n"
         if self.foundation_mode == "partial" and feature.page not in self.head:
             related = "[owner 入口](_index.md)\n\n"
-        proposed = front + related + "\n\n".join(blocks[f] for f in FACETS if f in blocks) + "\n"
         # Retrieve exactly the attested spans, including retained prior facets.
-        evidence = []
-        for block in blocks.values():
-            proof = json.loads(re.search(r"<!-- kb:depth-proof (.*?) -->", block, re.S).group(1))
-            evidence += [evidence_for(self.observer, e["path"], e["start"], e["end"]) for e in proof["evidence"]]
-        sources = [f"{self.lifecycle.full_name}@{self.record.pin}:{e.path}:L{e.start}-L{e.end}" for e in evidence]
-        proposed = Page.parse(proposed).with_sources(list(dict.fromkeys(sources))).render()
+        proposed, evidence = self._depth_content(front + related, blocks)
         issues = check_rules({feature.id: proposed}, self.observer)
         if issues or page_over_capacity(proposed):
             raise ValueError("; ".join(issues) or "depth page exceeds capacity")
@@ -697,30 +729,26 @@ class _KnowledgeDepth(_Knowledge):
             new = {f: block for f, block in blocks.items() if f not in old_blocks}
             if lightweight and self.stop_file and self.stop_file.exists():
                 return  # durable draft is reviewed after resuming this same round
-            if lightweight and entry.get("review_dispatched"):
-                raise ModelUnavailable("dispatched review has no matching durable receipt; start a bounded correction round")
             if lightweight:
-                new_evidence = []
-                for block in new.values():
-                    proof = json.loads(re.search(r"<!-- kb:depth-proof (.*?) -->", block, re.S).group(1))
-                    new_evidence += [evidence_for(self.observer, e["path"], e["start"], e["end"]) for e in proof["evidence"]]
-                shown = self._judge_evidence(new_evidence)
+                shown = self._judge_evidence(self._block_evidence(new))
             else:
                 shown = self._judge_evidence(evidence)
             for block in new.values():
                 proof = json.loads(re.search(r"<!-- kb:depth-proof (.*?) -->", block, re.S).group(1))
                 if proof.get("basis") == "verified_absent":
                     shown.append({"kind": "replayed_absence_certificate", "certificate": proof["absence_certificate"]})
-            entry["review_attempts"] = entry.get("review_attempts", 0) + 1
-            if lightweight:
-                entry["review_dispatched"] = True
-            self.record.save(self.rt.state_dir)
-            entry["checked"] = {**review_facets(self.rt, self.budget, self.lifecycle.init,
-                                  feature=feature.id, pin=self.record.pin, blocks=new,
-                                  existing={**existing, page: old}, evidence=shown,
-                                  acceptance_modes={f: self.acceptance_mode for f in new}),
-                                "text_sha256": hashed}
-            self.record.save(self.rt.state_dir)
+            from .quality_review import checkpoint_review
+
+            from .depth_judge import facet_review_binding
+
+            checkpoint_review(entry, lambda: review_facets(self.rt, self.budget, self.lifecycle.init,
+                feature=feature.id, pin=self.record.pin, blocks=new,
+                existing={**existing, page: old}, evidence=shown,
+                acceptance_modes={f: self.acceptance_mode for f in new}),
+                lambda: self.record.save(self.rt.state_dir),
+                binding=facet_review_binding(hashed, new, self.rt.judge,
+                                             {f: self.acceptance_mode for f in new}),
+                dispatch_key="review_dispatched")
         checked = entry["checked"]
         passed = {f for f, result in checked["facets"].items() if result["verdict"] == "pass"}
         labels = {result["verdict"] for result in checked["facets"].values()}
@@ -747,13 +775,7 @@ class _KnowledgeDepth(_Knowledge):
         if label != "pass":
             return
         blocks = {f: block for f, block in blocks.items() if f in old_blocks or f in passed}
-        proposed = front + related + "\n\n".join(blocks[f] for f in FACETS if f in blocks) + "\n"
-        kept_evidence = []
-        for block in blocks.values():
-            proof = json.loads(re.search(r"<!-- kb:depth-proof (.*?) -->", block, re.S).group(1))
-            kept_evidence += [evidence_for(self.observer, e["path"], e["start"], e["end"]) for e in proof["evidence"]]
-        sources = [f"{self.lifecycle.full_name}@{self.record.pin}:{e.path}:L{e.start}-L{e.end}" for e in kept_evidence]
-        proposed = Page.parse(proposed).with_sources(list(dict.fromkeys(sources))).render()
+        proposed, kept_evidence = self._depth_content(front + related, blocks)
         self.head[page] = proposed
         if lightweight:
             self._block_cache[feature.id] = blocks

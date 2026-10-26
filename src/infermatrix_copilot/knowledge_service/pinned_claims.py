@@ -26,6 +26,7 @@ Standard library only (plus ``facts``). Nothing here writes anywhere.
 from __future__ import annotations
 
 import hashlib
+from ..git_objects import tree_entries
 import json
 import re
 import subprocess
@@ -129,11 +130,9 @@ class PinnedObserver:
             proc = self._git("ls-tree", "-z", sha, "--", path)
             if proc.returncode != 0:
                 raise FactsError(f"cannot list {path} at {sha[:12]}: {proc.stderr.decode()[:300]}")
-            for record in proc.stdout.decode("utf-8", "replace").split("\0"):
-                meta, _, name = record.partition("\t")
-                parts = meta.split()
-                if name == path and len(parts) == 3:
-                    self._entries[key] = (parts[1], parts[2])
+            for mode, kind, oid, name in tree_entries(proc.stdout, malformed="skip"):
+                if name.decode("utf-8", "replace") == path:
+                    self._entries[key] = (kind, oid)
                     return self._entries[key]
             if not proc.stdout:
                 self._entries[key] = None  # an empty successful lookup is immutable
@@ -262,23 +261,42 @@ def evidence_for(observer: PinnedObserver, path: str, start: int, end: int) -> E
     return Evidence(path, start, end, _digest(chunk))
 
 
-def check_evidence(entries: Iterable[Evidence], observer: PinnedObserver) -> list[str]:
-    """Problems with recorded evidence at the pin: the file must exist, the
-    range must fit, and the text in it must hash to the recorded value."""
+def _evidence_chunk(entry: Evidence, observer: PinnedObserver, texts: dict,
+                    *, verify_hash: bool) -> tuple[str | None, str | None]:
     pin = observer.head()
-    problems: list[str] = []
+    where = f"{entry.path}:L{entry.start}-L{entry.end}"
+    if entry.path not in texts:
+        texts[entry.path] = observer.file_text(pin, entry.path)
+    text = texts[entry.path]
+    if text is None:
+        return None, f"{where}: file does not exist at {pin[:12]}"
+    chunk = _range_text(text, entry.start, entry.end)
+    if chunk is None:
+        return None, f"{where}: range is outside the file at {pin[:12]}"
+    if verify_hash and _digest(chunk) != entry.sha256:
+        return None, f"{where}: content differs from the recorded evidence at {pin[:12]}"
+    return chunk, None
+
+
+def evidence_text(observer: PinnedObserver, entry: Evidence, *, verify_hash: bool = True) -> str | None:
+    """Materialize a pinned range with the canonical evidence checks.
+
+    Historical comparison readers can select ``verify_hash=False`` to inspect
+    changed source at a newer pin; missing/outside ranges then return None.
+    Git read failures always propagate. Returned text has no added final newline.
+    """
+    chunk, problem = _evidence_chunk(entry, observer, {}, verify_hash=verify_hash)
+    if problem and verify_hash:
+        raise FactsError(problem)
+    return chunk[:-1] if chunk is not None else None
+
+
+def check_evidence(entries: Iterable[Evidence], observer: PinnedObserver) -> list[str]:
+    """Problems with recorded ranges and their content hashes at the pin."""
     texts: dict[str, str | None] = {}
+    problems = []
     for entry in entries:
-        where = f"{entry.path}:L{entry.start}-L{entry.end}"
-        if entry.path not in texts:
-            texts[entry.path] = observer.file_text(pin, entry.path)
-        text = texts[entry.path]
-        if text is None:
-            problems.append(f"{where}: file does not exist at {pin[:12]}")
-            continue
-        chunk = _range_text(text, entry.start, entry.end)
-        if chunk is None:
-            problems.append(f"{where}: range is outside the file at {pin[:12]}")
-        elif _digest(chunk) != entry.sha256:
-            problems.append(f"{where}: content differs from the recorded evidence at {pin[:12]}")
+        _, problem = _evidence_chunk(entry, observer, texts, verify_hash=True)
+        if problem:
+            problems.append(problem)
     return problems

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from .model_identity import model_family as _family
+
 import argparse
 import hashlib
 import json
@@ -43,9 +45,6 @@ def _prose(block: str) -> str:
     # This is exactly the rendering used by depth_judge.review_facets.
     return re.sub(r"<!--.*?-->", "", block, flags=re.S).strip()
 
-
-def _family(model: str) -> str:
-    return model.casefold().split("-")[0]
 
 
 def _generated_prose(section: dict, repository: str, pin: str) -> str:

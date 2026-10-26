@@ -28,6 +28,17 @@ BASE_OUTPUT_SCHEMA: dict[str, str] = {
     "next_action": "suggested next step for the engine/user",
 }
 
+TASK_STATUS_GUIDANCE = (
+    "`status` describes completion of THIS STEP's assigned work, not whether "
+    "the object being examined deserves approval. Use `success` when the "
+    "requested analysis or classifications are complete and supported by "
+    "evidence, including an adverse conclusion. Put defects, verdicts and "
+    "per-item outcomes in their own fields. Use `needs_review`, `blocked` or "
+    "`failed` when the assigned work cannot be completed or required evidence "
+    "or decisions remain unresolved. Never invent evidence or upgrade an "
+    "explicit non-success status to success."
+)
+
 
 @dataclass
 class AgentDispatchContext:
@@ -63,6 +74,8 @@ class AgentDispatchContext:
             "## PERMISSIONS\n" + json.dumps(self.permissions,
                                             ensure_ascii=False, indent=1),
         ]
+        if "status" in self.output_contract:
+            parts.insert(1, "## TASK STATUS\n" + TASK_STATUS_GUIDANCE)
         if self.briefing:
             parts.append("## REPO BRIEFING (curated repo-specific directives)\n"
                          + self.briefing)

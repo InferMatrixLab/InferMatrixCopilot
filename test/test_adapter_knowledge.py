@@ -66,10 +66,8 @@ def test_module_prompt_matches_parent_golden(prompt_data, module):
     the owner asked for the rebase pipeline to consult it, so the render now
     carries knowledge-base guidance in the ADAPTIVE_GUIDANCE slot and the tool
     surface gained doc_search/doc_read. The goldens were deliberately
-    regenerated from THIS builder at that change. The shipped templates remain
-    byte-identical to the parent's — see test_templates_are_parent_verbatim,
-    which is why the guidance rides a builder-supplied token, not a template
-    edit."""
+    regenerated from THIS builder at that change. Historical parity templates
+    are bundled here; no external checkout is needed to check their renders."""
     ours = build_module_prompt(module, prompt_data, **GOLDEN_KWARGS)
     golden = (GOLDENS / f"module_prompt_{module}.txt").read_text()
     assert ours == golden
@@ -92,16 +90,8 @@ def test_live_debug_prompt_carries_rebase_attribution(prompt_data):
     assert "adjacent constructor, override, result-field" in live
 
 
-def test_templates_are_parent_verbatim():
-    """Parity templates match the parent; live additions are bounded."""
-    parent = Path("/data/zhoutaichang/copilot/vllm-omni-rebase-agent/agent/templates")
-    if not parent.is_dir():
-        pytest.skip("parent checkout not present on this machine")
-    for tmpl in sorted((REBASE_DATA / "templates").iterdir()):
-        if ".live." in tmpl.name:
-            # Live guidance is intentionally outside the parent-parity pin.
-            continue
-        assert tmpl.read_bytes() == (parent / tmpl.name).read_bytes(), tmpl.name
+def test_live_template_changes_are_bounded():
+    """Live additions remain bounded against the bundled parity template."""
     live = (REBASE_DATA / "templates" / "module_rebase.live.prompt.tmpl")
     parity = (REBASE_DATA / "templates" / "module_rebase.prompt.tmpl")
     live_text = live.read_text()
@@ -109,11 +99,61 @@ def test_templates_are_parent_verbatim():
     end = live_text.index("**Engine / unpack:**", start)
     assert "real upstream constructor" in live_text[start:end]
     without_live_guidance = live_text[:start] + live_text[end:]
-    diff = [(a, b) for a, b in zip(parity.read_text().splitlines(),
-                                   without_live_guidance.splitlines()) if a != b]
+
+    def stable_sections(text):
+        for begin, finish in (("### Debug-memory workflow (mandatory)", "{BROKEN_IMPORTS_SECTION}"),
+                              ("## Killing hung tests" if "## Killing hung tests" in text
+                               else "## Hung tests", "## Completion contract")):
+            a, b = text.index(begin), text.index(finish, text.index(begin))
+            text = text[:a] + text[b:]
+        return text.splitlines()
+
+    old_lines = stable_sections(parity.read_text())
+    new_lines = stable_sections(without_live_guidance)
+    assert len(old_lines) == len(new_lines)
+    diff = [(a, b) for a, b in zip(old_lines, new_lines) if a != b]
     assert len(diff) == 2
     assert all("imx-omni-pytest" in b and "run_module_pytest" in a
                for a, b in diff)
+
+
+def test_live_prompt_uses_registered_tool_contracts(prompt_data):
+    import jsonschema
+    import re
+
+    live = build_module_prompt("model_config", prompt_data, live=True, **GOLDEN_KWARGS)
+    assert "lib/kill_test_tree.sh" not in live
+    assert "python3 'Use `search_debug_memory`" not in live
+    assert "memory/debug_memory.md" not in live
+    definitions = {t["name"]: t for t in load_tool_schemas(REBASE_DATA / "tool_schemas.json")}
+    examples = [json.loads(raw) for raw in re.findall(r"```json\n(.*?)\n\s*```", live, re.S)]
+    assert len(examples) == 3
+    for tool, example in zip(("search_debug_memory", "record_debug_memory", "run_pytest"), examples):
+        assert f"`{tool}`" in live
+        jsonschema.validate(example, definitions[tool]["input_schema"])
+    assert examples[0]["module"] == examples[1]["module"] == "model_config"
+
+
+def test_shipped_rebase_requires_no_external_agent(monkeypatch):
+    from infermatrix_copilot.config import Settings
+    from infermatrix_copilot.engine.steps.rebase_knowledge import _knowledge_layer_paths
+    from infermatrix_copilot.rebase_engine.knowledge_attest import attest_layers
+
+    monkeypatch.delenv("REBASE_AGENT_ROOT", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.rebase_agent_root is None
+    assert "REBASE_AGENT_ROOT" not in settings.expansion_env()
+    manifest = yaml.safe_load((REBASE_DATA.parent / "manifest.yaml").read_text())
+    layers = _knowledge_layer_paths(manifest, settings)
+    assert layers == {"parent_debug_db": "", "parent_skills_dir": "",
+                      "parent_upstream_column": ""}
+    assert not attest_layers(**layers)
+    # Existing environment files may supply an explicit data import path;
+    # an unavailable legacy root cannot add a shipped runtime dependency.
+    configured = Settings(_env_file=None, rebase_agent_root="/missing/legacy")
+    assert configured.expansion_env()["REBASE_AGENT_ROOT"] == "/missing/legacy"
+    assert _knowledge_layer_paths(manifest, configured) == layers
+    assert Settings(_env_file=None, rebase_agent_root="").rebase_agent_root is None
 
 
 # -- request-shape golden ------------------------------------------------------

@@ -29,6 +29,9 @@ class AgentOutcome:
     input_tokens: int = 0
     output_tokens: int = 0
     tools_used: list[str] = field(default_factory=list)
+    # Explicit native facts, independent of legacy display counters. None means
+    # the adapter has not attested usage; an empty mapping means no known counts.
+    usage: dict | None = None
 
 
 def run_agent(

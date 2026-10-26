@@ -23,7 +23,8 @@ A record (``schema: trace/1``)::
      "error":    "",
      "env":      {copilot_version, copilot_sha, ...}}
 
-``kind`` is ``model_call``, ``tool_call`` (one agent tool invocation: its
+``kind`` is ``model_call``, ``auth_probe`` (native authentication control,
+never a model invocation), ``tool_call`` (one agent tool invocation: its
 arguments and result as blobs, ``result`` = tool, ok, refused, out_of_scope,
 bytes), ``decision`` (a gate/review verdict), ``outcome`` (what happened later:
 merged, closed, retired, accepted...) or ``replay``. Outcomes are the gold
@@ -58,6 +59,9 @@ Standard library only; importing it loads nothing else from the package.
 
 from __future__ import annotations
 
+from .persistence import atomic_write_bytes
+from .redaction import REDACTED, _secret_values, redact
+
 import contextvars
 import datetime as dt
 import gzip
@@ -77,23 +81,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 SCHEMA = "trace/1"
-KINDS = ("model_call", "tool_call", "decision", "outcome", "replay")
+KINDS = ("model_call", "auth_probe", "configuration_probe", "tool_call", "decision", "outcome", "replay")
 SCHEMA_VERSION = 2
 _CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar("trace_context", default={})
 _STORE: contextvars.ContextVar["TraceStore | None"] = contextvars.ContextVar("trace_store", default=None)
 
-_SECRET_SHAPES = re.compile(
-    r"gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|sk-ant-[A-Za-z0-9_-]{16,}"
-    r"|sk-(?:proj-)?[A-Za-z0-9_-]{20,}"
-    r"|(?:AKIA|ASIA)[A-Z0-9]{16}"
-    r"|xox[abpr]-[A-Za-z0-9-]{10,}"
-    r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
-)
-_SECRET_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|_KEY|_PAT|CREDENTIALS?)$", re.I)
-REDACTED = "[REDACTED]"
 
 # index columns per schema version; the record JSON is always the last column
 _COLUMNS_V0 = ("id", "kind", "at", "run_id", "playbook", "repo", "changeset_id", "pr",
@@ -180,19 +172,6 @@ def _unlock(fd: int) -> None:
     fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def _secret_values(environ: Mapping[str, str]) -> list[str]:
-    values = {v for k, v in environ.items() if _SECRET_NAME.search(k) and len(v) >= 8
-              and not v.startswith(("/", "~", "."))}  # paths to key files are not secrets
-    return sorted(values, key=len, reverse=True)
-
-
-def redact(text: str, environ: Mapping[str, str] | None = None) -> str:
-    """``text`` with secrets replaced by ``[REDACTED]``."""
-    for value in _secret_values(os.environ if environ is None else environ):
-        text = text.replace(value, REDACTED)
-    return _SECRET_SHAPES.sub(REDACTED, text)
-
-
 def _redact_obj(value: Any, environ: Mapping[str, str] | None = None) -> Any:
     if isinstance(value, str):
         return redact(value, environ)
@@ -268,9 +247,11 @@ def accepted_key(draft_key: str, holder: Mapping[str, Any]) -> str | None:
 _ENV: dict | None = None
 
 
-def environment_fingerprint() -> dict:
-    """Which code produced a record (computed once per process)."""
+def environment_fingerprint(*, refresh=False) -> dict:
+    """Which code produced a record; offline recovery may recheck disk identity."""
     global _ENV
+    if refresh:
+        _ENV = None
     if _ENV is None:
         from . import __version__
 
@@ -281,11 +262,13 @@ def environment_fingerprint() -> dict:
             sha = proc.stdout.strip() if proc.returncode == 0 else ""
         except (OSError, subprocess.SubprocessError):
             pass
-        _ENV = {"copilot_version": __version__, "copilot_sha": sha}
+        from .source_fingerprint import package_tree_hash, source_tree_hash
+        fingerprint = {"copilot_version": __version__, "copilot_sha": sha,
+                       "runtime_package_sha256": package_tree_hash(Path(__file__).resolve().parent)}
         root = Path(__file__).resolve().parents[2]
         if (root / "src").is_dir() and (root / "playbooks").is_dir():
-            from .improve.artifacts import tree_hash
-            _ENV["source_tree_sha"] = tree_hash(root)
+            fingerprint["source_tree_sha"] = source_tree_hash(root)
+        _ENV = fingerprint
     return dict(_ENV)
 
 
@@ -308,6 +291,145 @@ class TraceStore:
         """
         return NativeCallArchive(self, entry)
 
+    def validate_native_attempt(self, record: dict, *, require_complete=True, allow_failed=False) -> dict:
+        """Validate an original native archive against its matching trace."""
+        attempt_id = record.get("result", {}).get("native_attempt_id", "")
+        if not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+            raise ValueError("native attempt archive is missing")
+        path = self.root / "attempts" / attempt_id / "attempt.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ValueError("native attempt must be a regular local archive")
+        attempt = json.loads(path.read_text())
+        statuses = ('inflight', 'complete', 'failed', 'interrupted', 'canceled_before_dispatch') if allow_failed else ('inflight', 'complete')
+        if (record.get("schema") != SCHEMA or record.get("kind") != "model_call" or (record.get("error") and not allow_failed)
+                or attempt.get("schema") != "native-attempt/1" or attempt.get("id") != attempt_id
+                or (attempt.get("error") and not allow_failed) or attempt.get("status") not in statuses):
+            raise ValueError("native attempt is not a successful or unfinished original call")
+        for facts in (record.get('result', {}), attempt):
+            for key in ('native_call_sent', 'native_call_completed', 'native_outcome_pending'):
+                if key in facts and type(facts[key]) is not bool:
+                    raise ValueError('native attempt dispatch facts must be booleans')
+            cleanup = facts.get('process_cleanup')
+            if cleanup is not None:
+                from .process_execution import validate_cleanup_diagnostics
+                validate_cleanup_diagnostics(cleanup)
+                if facts.get('native_outcome_pending') is not True:
+                    raise ValueError('native cleanup diagnostics require an original pending outcome')
+            if not allow_failed and facts.get('native_outcome_pending') is True:
+                raise ValueError('native attempt outcome remains pending')
+        complete = attempt['status'] != 'inflight'
+        if ((require_complete and not complete)
+                or (complete and attempt.get("trace_id") != record.get("id"))
+                or (not complete and attempt.get("trace_id"))):
+            raise ValueError("native attempt is incomplete or bound to another call")
+        if (attempt.get("inputs") != record.get("inputs")
+                or attempt.get("context") != record.get("context")
+                or attempt.get("env") != record.get("env")):
+            raise ValueError("native attempt identity differs from the call record")
+        model = record.get("model", {})
+        if attempt.get("model", {}).get("native_reasoning_level", "") != model.get("native_reasoning_level", ""):
+            raise ValueError("native attempt reasoning level differs from the call record")
+        if any(attempt.get("model", {}).get(key, "") != model.get(key, "")
+               for key in ("role", "provider", "model", "effort")):
+            raise ValueError("native attempt model differs from the call record")
+        sessions = attempt.get("native_session_ids", [])
+        if (not isinstance(sessions, list) or any(not isinstance(item, str) for item in sessions)
+                or sessions != record.get("result", {}).get("native_session_ids", [])):
+            raise ValueError("native attempt sessions differ from the call record")
+        outputs = record.get("outputs", {})
+        if not outputs.get("reply") and not allow_failed:
+            raise ValueError("native call has no archived reply")
+        for blob in [*record.get("inputs", {}).values(), *outputs.values()]:
+            self.blob(blob)
+        if complete:
+            cleanup = record.get('result', {}).get('process_cleanup')
+            if attempt.get('process_cleanup') != cleanup:
+                raise ValueError('native attempt cleanup diagnostics differ from the call record')
+            if allow_failed and (attempt.get('error', '') != record.get('error', '')
+                    or any(attempt.get(key) != record.get('result', {}).get(key)
+                           for key in ('native_call_sent', 'native_call_completed', 'native_outcome_pending'))):
+                raise ValueError('native attempt outcome differs from the call record')
+            if attempt.get("outputs") != outputs:
+                raise ValueError("native attempt output references differ from the call record")
+            if (attempt.get("usage", {}) != record.get("usage", {})
+                    or attempt.get("cost_usd") != record.get("result", {}).get("cost_usd")
+                    or attempt.get("seconds") != record.get("seconds")
+                    or attempt.get("served_model", "") != model.get("served_model", "")):
+                raise ValueError("native attempt billing facts differ from the call record")
+            self.blob(attempt["native_events_sha256"])
+            if (outputs.get("native_events") is not None
+                    and attempt["native_events_sha256"] != outputs["native_events"]):
+                raise ValueError("native attempt events differ from the call record")
+        return attempt
+
+    def validate_native_attempt_outcome(self, record: dict, *, outcome="complete", require_complete=True) -> dict:
+        """Prove a requested terminal outcome without promoting unknown calls.
+
+        Diagnostic readers may inspect failed/pending archives through the raw
+        validator. Recovery and accounting use this stricter outcome policy.
+        """
+        if outcome not in ("complete", "failed"):
+            raise ValueError("recovery outcome must be complete or failed")
+        failed = outcome == "failed"
+        if failed:
+            facts = record.get("result", {})
+            if (not isinstance(record.get("error"), str) or not record["error"]
+                    or facts.get("native_call_sent") is not True
+                    or facts.get("native_call_completed") is not True
+                    or facts.get("native_outcome_pending") is not False):
+                raise ValueError("failed recovery requires an explicitly completed, non-pending failed call")
+        attempt = self.validate_native_attempt(record, require_complete=require_complete, allow_failed=failed)
+        if attempt["status"] not in ("inflight", outcome):
+            raise ValueError("native attempt status conflicts with requested recovery outcome")
+        if failed and (attempt.get("native_outcome_pending") is True or attempt.get("process_cleanup") is not None):
+            raise ValueError("native attempt outcome remains pending")
+        return attempt
+
+    def recover_native_attempt(self, attempt_id: str, record_id: str, *,
+                               writers_paused=None, offline_confirmed=False, outcome="complete") -> dict:
+        """Finalize an interrupted archive from one existing journal record.
+
+        No record is appended, model dispatched, index rebuilt or budget settled.
+        As with index repair, callers must establish that writers are stopped.
+        Failed recovery requires explicit completed-call facts and preserves the
+        original failure; it cannot reconcile a pending native execution.
+        """
+        if outcome not in ("complete", "failed"):
+            raise ValueError("recovery outcome must be complete or failed")
+        if not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+            raise ValueError("invalid native attempt identity")
+        with self._migration_lock():
+            self._require_paused(writers_paused, offline_confirmed)
+            matches = [record for record, _ in self.iter_records()
+                       if record.get("id") == record_id
+                       or record.get("result", {}).get("native_attempt_id") == attempt_id]
+            if (len(matches) != 1 or matches[0].get("id") != record_id
+                    or matches[0].get("result", {}).get("native_attempt_id") != attempt_id):
+                raise ValueError("native attempt needs one unambiguous original journal record")
+            record = matches[0]
+            attempt = self.validate_native_attempt_outcome(record, outcome=outcome, require_complete=False)
+            if attempt["status"] == outcome:
+                return attempt
+            events_path = self.root / "attempts" / attempt_id / "native-events.jsonl"
+            if events_path.is_symlink():
+                raise ValueError("native event stream must be a regular local file")
+            events = events_path.read_text() if events_path.exists() else ""
+            if self.blob(record["outputs"]["native_events"]) != events:
+                raise ValueError("native event stream differs from the completed record")
+            archive = NativeCallArchive.__new__(NativeCallArchive)
+            archive.store, archive.id, archive.path = self, attempt_id, events_path.parent
+            archive.events_path, archive.meta = events_path, attempt
+            archive.session_ids = set(attempt.get("native_session_ids", []))
+            archive.finish(record, {"reply": self.blob(record["outputs"]["reply"]),
+                                   **{key: record.get('result', {})[key]
+                                      for key in ('native_call_sent', 'native_call_completed', 'native_outcome_pending')
+                                      if key in record.get('result', {})},
+                "usage": record.get("usage", {}), "seconds": record.get("seconds"),
+                "cost_usd": record.get("result", {}).get("cost_usd"),
+                "served_model": record.get("model", {}).get("served_model", ""),
+                "error": record.get("error", "")}, status=outcome)
+            return self.validate_native_attempt_outcome(record, outcome=outcome)
+
     # blobs -----------------------------------------------------------------------
     def put_blob(self, content: str | bytes) -> str:
         """Store redacted text; bytes must be UTF-8 text (redaction needs text)."""
@@ -321,12 +443,7 @@ class TraceStore:
         path = self.root / "blobs" / digest[:2] / f"{digest}.gz"
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            with tmp.open("wb") as handle:
-                handle.write(gzip.compress(data, mtime=0))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
+            atomic_write_bytes(path, gzip.compress(data, mtime=0))
         return f"sha256:{digest}"
 
     def blob(self, ref: str) -> str:
@@ -403,12 +520,15 @@ class TraceStore:
             "context": {**current_context(), **(context or {})},
             "model": dict(model or {}), "usage": dict(usage or {}),
             "seconds": seconds,
-            "inputs": {k: self.put_blob(v) for k, v in (inputs or {}).items()},
-            "outputs": {k: self.put_blob(v) for k, v in (outputs or {}).items()},
             "result": dict(result or {}),
             "error": error or "",
             "env": environment_fingerprint(),
         }
+        if kind == 'model_call':
+            from .model_usage import observe_model_call
+            observe_model_call(_redact_obj(record, self._environ))
+        record['inputs'] = {k: self.put_blob(v) for k, v in (inputs or {}).items()}
+        record['outputs'] = {k: self.put_blob(v) for k, v in (outputs or {}).items()}
         # every string of the record, keys included, before it is serialized or indexed
         record = _redact_obj(record, self._environ)
         line = json.dumps(record, ensure_ascii=False, sort_keys=True)
@@ -457,12 +577,20 @@ class TraceStore:
             return [json.loads(row[0]) for row in conn.execute(sql, (*args, int(limit)))]
 
     # jsonl scans (the source of truth) -----------------------------------------
-    def iter_records(self) -> Iterator[tuple[dict, str]]:
-        """Every record in the JSONL files, oldest file first, as (record, line)."""
+    def iter_records(self, *, kind: str | None = None) -> Iterator[tuple[dict, str]]:
+        """Read authoritative JSONL, optionally selecting one record kind.
+
+        Filtering never uses the derived index or skips unreadable journal lines.
+        Control records may share model context without being model outcomes.
+        """
+        if kind is not None and kind not in KINDS:
+            raise ValueError("unknown record kind")
         for path in sorted((self.root / "records").glob("*.jsonl")):
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
-                    yield json.loads(line), line
+                    record = json.loads(line)
+                    if kind is None or record.get("kind") == kind:
+                        yield record, line
 
     # migration gate ---------------------------------------------------------------
     @contextmanager
@@ -707,27 +835,27 @@ class NativeCallArchive:
         self.store = store
         self.id = uuid.uuid4().hex
         self.path = store.root / "attempts" / self.id
-        self.path.mkdir(parents=True)
+        self.path.mkdir(parents=True, mode=0o700)
         self.events_path = self.path / "native-events.jsonl"
         self.session_ids: set[str] = set()
+        inputs = {"system": str(entry.get("system", ""))}
+        if "messages" in entry:
+            inputs["messages"] = json.dumps(entry["messages"] or [], ensure_ascii=False, default=str)
+        else:
+            inputs["prompt"] = str(entry.get("prompt", ""))
         self.meta = {"schema": "native-attempt/1", "id": self.id, "status": "inflight",
                      "at": store._clock(), "context": current_context(),
                      "model": {**{k: entry.get(k, "") for k in ("role", "provider", "model", "effort")},
                                **({"native_reasoning_level": entry["native_reasoning_level"]} if "native_reasoning_level" in entry else {})},
-                     "inputs": {k: store.put_blob(str(entry.get(k, ""))) for k in ("system", "prompt")},
+                     "inputs": {k: store.put_blob(value) for k, value in inputs.items()},
                      "usage": {}, "cost_usd": None, "served_model": "", "seconds": None,
                      "native_session_ids": [], "env": environment_fingerprint()}
         self._save()
 
     def _save(self):
         data = _redact_obj(self.meta, self.store._environ)
-        temporary = self.path / (uuid.uuid4().hex + ".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.path / "attempt.json")
+        atomic_write_bytes(self.path / "attempt.json",
+                           (json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
 
     def event(self, event: Mapping[str, Any]):
         event = _redact_native(dict(event), self.store._environ)
@@ -767,7 +895,65 @@ class NativeCallArchive:
                           "served_model": entry.get("served_model", ""), "seconds": entry.get("seconds"),
                           "error": entry.get("error", ""), "native_session_ids": sorted(self.session_ids),
                           "native_events_sha256": self.store.put_blob(self.payload()["native_events"])})
+        self.meta.update({key: entry[key] for key in ('native_call_sent', 'native_call_completed', 'native_outcome_pending') if key in entry})
+        if 'process_cleanup' in entry:
+            from .process_execution import validate_cleanup_diagnostics
+            self.meta['process_cleanup'] = validate_cleanup_diagnostics(entry['process_cleanup'])
         self._save()
+
+
+def native_process_fields(entry):
+    """Canonical raw diagnostics projection shared by both recorder shapes."""
+    result = {}
+    if 'process_cleanup' in entry:
+        from .process_execution import validate_cleanup_diagnostics
+        result['process_cleanup'] = validate_cleanup_diagnostics(entry['process_cleanup'])
+    process = entry.get('native_process')
+    if process is None:
+        return {}, result
+    outputs = {'native_' + channel: process[channel] for channel in ('stdout', 'stderr')}
+    result.update({'native_exit': {**{key: process[key] for key in ('returncode', 'reason')},
+        **{channel + '_sha256': hashlib.sha256(process[channel].encode()).hexdigest()
+           for channel in ('stdout', 'stderr')}}})
+    return outputs, result
+
+
+class NativeCompletionRecorder:
+    """Canonical prompt-shaped native receipts; domains retain their accounts."""
+
+    def __init__(self, store, *, strict=False):
+        self.store, self.strict = store, strict
+
+    def begin_call(self, entry):
+        return self.store.begin_call(entry)
+
+    def durable(self):
+        return NativeCompletionRecorder(self.store, strict=True)
+
+    def __call__(self, entry):
+        try:
+            process_outputs, process_result = native_process_fields(entry)
+            return self.store.append('model_call',
+                inputs={name: entry[name] for name in ('system', 'prompt')},
+                outputs={'reply': entry['reply'],
+                         **process_outputs,
+                         **({'native_events': entry['native_events']} if 'native_events' in entry else {})},
+                model={**{k: entry.get(k, '') for k in ('role', 'provider', 'model', 'effort', 'served_model')},
+                       **({'native_reasoning_level': entry['native_reasoning_level']} if 'native_reasoning_level' in entry else {})},
+                usage=entry.get('usage') or {}, seconds=entry.get('seconds'),
+                result={'stop_reason': entry.get('stop_reason', ''),
+                        'max_budget_usd': entry.get('max_budget_usd'), 'cost_usd': entry.get('cost_usd'),
+                        **({'subscription': entry['subscription']} if 'subscription' in entry else {}),
+                        **{k: entry[k] for k in ('native_attempt_id', 'native_session_ids') if k in entry},
+                        **{k: entry[k] for k in ('native_call_sent', 'native_call_completed', 'native_outcome_pending') if k in entry},
+                        **({'session_outcome': entry['session_outcome']} if 'session_outcome' in entry else {}),
+                        **process_result,
+                        **({'fallback_from': entry['fallback_from']} if entry.get('fallback_from') else {})},
+                error=entry.get('error', ''))
+        except Exception:
+            if self.strict:
+                raise
+            return None
 
 
 

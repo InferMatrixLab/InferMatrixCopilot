@@ -15,7 +15,7 @@ from infermatrix_copilot.kb_service.init_budget import Budget, BudgetExhausted
 from infermatrix_copilot.kb_service.init_coverage import Owner
 from infermatrix_copilot.kb_service.init_knowledge import _Knowledge
 from infermatrix_copilot.kb_service.init_stages import run_stage
-from infermatrix_copilot.kb_service.init_support import InitError, InitRecord
+from infermatrix_copilot.kb_service.init_support import InitError, InitRecord, checkpoint_budget
 from infermatrix_copilot.kb_service.models import ModelGateway, ModelRole
 from infermatrix_copilot.kb_service.runtime import trace_recorder
 from infermatrix_copilot.llm import Block, Reply
@@ -31,6 +31,7 @@ def test_pool_shared_cap_deterministic_assembly_and_single_failure(tmp_path, mon
     completed, applied, saves = [], [], []
     stage = SimpleNamespace(rt=SimpleNamespace(unlimited_subscription=True, environ={}, state_dir=tmp_path, gateway=None),
         record=InitRecord(stage="knowledge", repo="toy", inputs_digest="identity"), budget=Budget(None))
+    stage.budget = checkpoint_budget(None, stage.record, tmp_path)
     jobs = [{"owner": Owner(f"owner-{i}", "same-page", ()), "payload": {}, "offered": {}} for i in range(32)]
 
     def worker(stage, job):
@@ -55,8 +56,52 @@ def test_pool_shared_cap_deterministic_assembly_and_single_failure(tmp_path, mon
     list(parallel.run_jobs(stage, jobs))
     assert 1 < peak <= 13 and stage.budget.spent_usd == 32 and stage.budget._reserved == 0
     assert completed != list(range(32)) and applied == list(range(32))
-    assert len(saves) == 32 and set(saves) == {threading.current_thread().name}
+    # Workers persist budget reservations; only the coordinator adds domain
+    # results, once for each completed job.
+    assert saves.count(threading.current_thread().name) == 64  # Intent and result per job.
     assert any("owner-4" in item for item in stage.record.unfinished)
+    saved = stage.record.coverage['foundation_jobs']
+    assert len(saved['requests']) == 32 and len(saved['contexts']) == 1
+    assert {r['request']['context_sha256'] for r in saved['requests'].values()} == set(saved['contexts'])
+
+
+@pytest.mark.parametrize('damage', [None, 'owner', 'key', 'empty_list'])
+def test_foundation_crash_after_dispatch_holds_original_owner_on_resume(tmp_path, monkeypatch, damage):
+    stage = SimpleNamespace(rt=SimpleNamespace(unlimited_subscription=False, state_dir=tmp_path, gateway=None),
+        record=InitRecord(stage="knowledge", repo="toy", inputs_digest="frozen"))
+    stage.budget = checkpoint_budget(None, stage.record, tmp_path)
+    job = {"owner": Owner("owner", "page", ()), "payload": {}, "offered": {}}
+    calls = []
+
+    def interrupted(stage, job):
+        durable = InitRecord.load(tmp_path, "toy", "knowledge")
+        assert durable.coverage["foundation_jobs"]["inflight"]
+        calls.append(1)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(parallel, "_worker", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        list(parallel.run_jobs(stage, [job]))
+    stage.record = InitRecord.load(tmp_path, "toy", "knowledge")
+    stage.budget = checkpoint_budget(None, stage.record, tmp_path)
+    if damage is not None:
+        from infermatrix_copilot.kb_service.models import ModelUnavailable
+        saved = stage.record.coverage['foundation_jobs']
+        key, = saved['inflight']
+        if damage == 'owner':
+            saved['inflight'][key]['owner'] = 'another-owner'
+        elif damage == 'key':
+            saved['inflight']['wrong-key'] = saved['inflight'].pop(key)
+        else:
+            saved['inflight'] = []
+        before = copy.deepcopy(saved['inflight'])
+        with pytest.raises(ModelUnavailable, match='reconcile retained state'):
+            list(parallel.run_jobs(stage, [job]))
+        assert calls == [1] and saved['inflight'] == before
+        return
+    assert list(parallel.run_jobs(stage, [{**job, "payload": {"correction": "new prompt"}}])) == []
+    assert calls == [1]
+    assert any("reconcile original dispatch" in message for message in stage.record.unfinished)
 
 
 @pytest.mark.parametrize("value", ["0", "14", "1.5", "01", "bad"])
@@ -152,6 +197,63 @@ def _complete_native(world, *, publish=False):
     assert not record.unfinished
     return rt, record, offline, traces
 
+
+
+@pytest.mark.parametrize('condition', ['complete', 'different_page', 'unknown', 'legacy', 'lost_save_reply'])
+def test_foundation_resume_settles_only_matching_completed_intent(world, condition, monkeypatch):
+    rt, record, offline, traces = _complete_native(world)
+    original_tree, calls = _tree(record), len(offline.calls)
+    saved = record.coverage['foundation_jobs']
+    result = next(iter(saved['tasks'].values()))
+    binding = {'owner': result['owner'], 'binding': record.inputs_digest, 'attempt': 1,
+               'input_sha256': result['input_sha256'], 'page': result['page'],
+               'requested': result['requested']}
+    assert result.get('outcome_unknown') is False
+    assert parallel._dispatch_binding(SimpleNamespace(record=record), **{
+        k: result[k] for k in ('owner', 'payload', 'offered', 'page', 'requested')}) == binding
+    if condition == 'different_page':
+        binding['page'] = 'another-page'
+    if condition == 'unknown':
+        result['outcome_unknown'] = True
+    if condition == 'legacy':
+        result.pop('outcome_unknown')
+    if condition in ('unknown', 'legacy'):
+        result['result_sha256'] = parallel._hash({k: v for k, v in result.items() if k != 'result_sha256'})
+    pending = {parallel._hash(binding): binding}
+    saved['inflight'] = copy.deepcopy(pending)
+    record.status = 'started'
+    record.save(rt.state_dir)
+    # Reconstruct a pre-stage-artifact checkpoint from completed, archived
+    # worker receipts. Keeping the completed stage cache would correctly reject
+    # these changed business facts before worker recovery can run.
+    executions = InitRecord.path(rt.state_dir, 'toy', 'knowledge').parent / 'executions' / 'knowledge'
+    executions.rename(world['tmp'] / 'completed-stage-executions')
+    if condition == 'lost_save_reply':
+        save = InitRecord.save
+        interrupted = []
+
+        def lose_reply(current, path):
+            save(current, path)
+            if (not interrupted and current.coverage.get('foundation_jobs', {}).get('tasks')
+                    and current.coverage['foundation_jobs'].get('inflight') == {}):
+                interrupted.append(True)
+                raise OSError('lost checkpoint commit reply')
+
+        monkeypatch.setattr(InitRecord, 'save', lose_reply)
+        failed = run_stage(rt, _modules_lifecycle(), 'knowledge', dry_run=True, unlimited_subscription=True)
+        assert failed.status == 'blocked'
+        assert 'lost checkpoint commit reply' in ' '.join(failed.problems)
+        assert interrupted and len(offline.calls) == calls
+        monkeypatch.setattr(InitRecord, 'save', save)
+    second = run_stage(rt, _modules_lifecycle(), 'knowledge', dry_run=True, unlimited_subscription=True)
+    assert _tree(second) == original_tree and len(offline.calls) == calls
+    assert second.coverage['foundation_jobs']['inflight'] == (
+        {} if condition in ('complete', 'lost_save_reply') else pending)
+    second.status = 'started'
+    second.save(rt.state_dir)
+    third = run_stage(rt, _modules_lifecycle(), 'knowledge', dry_run=True, unlimited_subscription=True)
+    assert _tree(third) == original_tree and len(offline.calls) == calls
+    assert third.coverage['foundation_jobs']['inflight'] == second.coverage['foundation_jobs']['inflight']
 
 
 @pytest.mark.parametrize("damage", ["judge", "generator", "owner", "facet", "offered", "section"])
@@ -346,3 +448,47 @@ def test_prepared_publication_checks_original_proofs_before_resume(world, damage
         published_bytes = path.read_bytes()
         cached = run_stage(rt, _modules_lifecycle(), "knowledge", dry_run=False, from_existing=True, unlimited_subscription=True)
         assert cached.status == "published" and path.read_bytes() == published_bytes and len(offline.calls) == calls
+
+
+def test_original_foundation_request_retains_rendering_and_job_after_crash(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from infermatrix_copilot.kb_service.config import InitConfig
+    from infermatrix_copilot.kb_service.init_budget import Price
+    stage = SimpleNamespace(rt=SimpleNamespace(unlimited_subscription=False, state_dir=tmp_path, gateway=None,
+                            generator=ModelRole('generator', 'codex', 'fixture'), judge=ModelRole('judge', 'claude', 'fixture')),
+        record=InitRecord(stage='knowledge', repo='toy', pin='a'*40, inputs_digest='frozen'),
+        head={'page': 'original context'}, tags=['toy'], today='2026-10-13')
+    stage.rt.subscription_generator = True
+    stage.rt.prices = {'fixture': Price(1, 2, 100)}
+    stage.lifecycle = SimpleNamespace(init=InitConfig(judge_call_usd=0.25))
+    stage.budget = checkpoint_budget(None, stage.record, tmp_path)
+    job = {'owner': Owner('owner', 'page', ()), 'payload': {'facets': ['flow']}, 'offered': {},
+           'page': 'page', 'requested': ['flow']}
+    calls = []
+    def interrupted(stage, job):
+        calls.append(1)
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(parallel, '_worker', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        list(parallel.run_jobs(stage, [job]))
+    stage.record = InitRecord.load(tmp_path, 'toy', 'knowledge')
+    saved = stage.record.coverage['foundation_jobs']
+    key, = saved['inflight']; scope = (key, saved['inflight'][key]['attempt'])
+    stage.head['page'] = 'new context'; stage.today = '2026-10-14'; job['payload']['facets'] = ['api']
+    stage.rt.subscription_generator = False
+    stage.rt.prices['fixture'] = Price(10, 20, 1000)
+    stage.lifecycle.init = replace(stage.lifecycle.init, judge_call_usd=0.75)
+    original = parallel.original_job_request(stage, scope=scope)
+    assert original['job']['payload']['facets'] == ['flow']
+    assert original['context']['head'] == {'page': 'original context'}
+    assert original['context']['today'] == '2026-10-13'
+    assert original['context']['judge']['provider'] == 'claude'
+    assert original['context']['subscription_generator'] is True
+    assert original['context']['prices']['fixture'] == {
+        'in_usd_per_mtok': 1, 'out_usd_per_mtok': 2, 'max_output_tokens': 100}
+    assert original['context']['init']['judge_call_usd'] == 0.25
+    assert original['sequence'] == 0 and len(saved['contexts']) == 1
+    assert not list(parallel.run_jobs(stage, [job])) and calls == [1]
+    saved['contexts'][original['context_sha256']]['head']['page'] = 'tampered'
+    with pytest.raises(InitError, match='context is missing or mismatched'):
+        parallel.original_job_request(stage, scope=scope)
