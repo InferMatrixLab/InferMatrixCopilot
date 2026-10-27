@@ -103,11 +103,17 @@ HYPOTHESIS, not a fact — verify or refute each with a tool call (`diff_stat` p
 inclusion/absence; a repo-wide grep falsifies "only"/"all" claims) and record the result \
 as a `[claim-verified]`/`[claim-refuted]` findings line. Accepting the author's framing \
 without checking is the single most measured recall failure.
-14. Sibling contrast: when the diff ADDS a class/dataclass/config/file into a package, \
-list that package and READ the closest in-tree sibling (its merged twin) — every \
-invariant, validation, warning, or dedup the sibling enforces that the new code lacks \
-is a finding, and duplicated machinery gets a CONCRETE shared-helper proposal (name \
-both files and the helper), never a hedged "should we unify?" question.
+14. Semantic sibling contrast: when the diff ADDS a class/dataclass/config/file OR an \
+alternate forward/plan/dispatcher/packing/sharding path, first describe the changed \
+dataflow without its new symbol names. Search framework registries, base classes, \
+common layers, sibling models/backends, and callers for the same before/after contract; \
+then READ the nearest semantic sibling even when its name or transport differs (for \
+example cross-rank communication vs local batching). Compare transport, layout, aligned \
+side tensors, lifecycle, and hook boundaries. Every invariant, validation, warning, or \
+dedup the sibling enforces that the new code lacks is a finding, and duplicated machinery \
+gets a CONCRETE REUSE/EXTEND/shared-owner proposal (name both paths and the owner), never \
+a hedged "should we unify?" question. Similar shape alone is not enough: record NEW when \
+the contracts or owner boundaries differ materially.
 15. The PR's own numbers: any fitted formula, calibration constant, threshold, or \
 measurement table the diff introduces gets CHECKED, not admired — evaluate it with \
 `calc` (plug the doc's own numbers back in, test monotonicity/identifiability, ask \

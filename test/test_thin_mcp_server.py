@@ -186,6 +186,12 @@ def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
         for item in review["first_review_checklist"]
     )
     assert any(
+        "semantic-analogue census" in item
+        and "REUSE, EXTEND, or NEW" in item
+        and "transport, layout, side tensors, lifecycle, and hook boundary" in item
+        for item in review["first_review_checklist"]
+    )
+    assert any(
         "before reading knowledge, searching source, or running tests"
         in item
         for item in review["first_review_checklist"]
