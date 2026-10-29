@@ -1,6 +1,6 @@
 # rebase_engine/ —— 规范
 
-<!-- verified-against: 2026-10-28 -->
+<!-- verified-against: 2026-10-29 -->
 
 `LOC ~7500（26 个模块） · repo-rebase-v3 的原生 rebase 引擎 · refactor-status: ok`
 
@@ -193,7 +193,9 @@ run-20261024 里这些链在 wave 1 完成后又占着 run 的 GPU 锁约 7 小�
   `host_env={CUDA_VISIBLE_DEVICES, HF_HOME}`（见 `tool_bridge`）。
 - `module_pytest.py`：`rebase.testing.module_max_timeout_sec` 是 `TEST_TIMEOUT_SEC`
   的上限（vllm-omni 与计划预算同为 21600），`module_test_platform` 过滤非本平台
-  的 pytest 项。
+  的 pytest 项。未显式给 `-m` 的模块跑同时带上与 Buildkite 相同的 run level：
+  默认 `--run-level core_model`，标记为 `(<platform> or 平台中性) and core_model`。
+  调用方已写 `--run-level` 时，标记改用那一档，不再另加 core_model。
 - `wheel.py`：`release_venv_holders`（仅 venv 结构存在时、排除调用者祖先链）、
   EBUSY/ETXTBSY 重试、baseline rev-parse 前置校验、分支重置前 `git clean -ffd`。
 

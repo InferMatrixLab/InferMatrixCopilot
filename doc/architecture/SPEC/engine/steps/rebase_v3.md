@@ -1,6 +1,6 @@
 # engine/steps/rebase_v3.py —— 规范
 
-<!-- verified-against: 2026-10-28 -->
+<!-- verified-against: 2026-10-29 -->
 
 `LOC ~2204 · step 库（v3 rebase 装配层） · refactor-status: oversized`
 
@@ -133,6 +133,18 @@ harness 会话通过 MCP tool bridge 拿到同一套工具面，plan gate 在派
 - baseline venv（`ensure_baseline_venv`）：硬链接克隆 campaign venv 并换入
   baseline commit 的 wheel，让"omni main 对上次对齐的 wheel 是否也失败"可问；
   任何失败返回 None，保留保守的回归判定。
+
+## 操作者重跑与本地超时预算（2026-10-29）
+
+- `--resume --rerun-from wave1`：`_v3_module_rebase` 短路条件不变（done/skipped），
+  所以 failed 模块重跑、done 模块直接返回；`_v3_wave_gate` 重新裁决 wave 2。
+- `_v3_test_loop` 在 `state["rerun_from"]` 非空时以 `retry_infra=True` 调
+  `run_test_loop`：记录过的 timeout/watchdog infra 再跑一次，已通过的 job 不重跑。
+  普通 resume 下 infra 仍然粘滞。
+- `rebase.testing.local_timeout_multiplier`（默认 1，须为 >= 1 的数，否则 BLOCKED）
+  只放大本地 `TestJob.timeout_sec`；构建出的 manifest 保留 CI 的
+  `timeout_in_minutes`（shell golden 不变）。vllm-omni 取 3：Ready 的 20 分钟 CPU
+  Simple step 在共享 rebase 主机上通过 53–88% 用例、零失败时就被杀。
 
 ## 信号中断的模块：BLOCKED 收口、resume 重跑（2026-10-28）
 

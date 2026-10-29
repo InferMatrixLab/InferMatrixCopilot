@@ -127,6 +127,38 @@ def test_checkpoint_resume_skips_completed(env):
     assert counter["n"] == 2  # flaky ran twice, stable once
 
 
+def test_rerun_from_reexecutes_that_step_and_later_ones(env):
+    registry, executor, _ = env
+    calls = []
+    for name in ("one", "two", "three"):
+        registry.register(make_step(f"s.{name}", lambda ctx, n=name: (
+            calls.append(n), StepResult(True, summary=n))[1]))
+    pb = playbook([PlaybookStep("a", "s.one"), PlaybookStep("b", "s.two"),
+                   PlaybookStep("c", "s.three")])
+    assert asyncio.run(executor.run(pb, {})).status == "done"
+    calls.clear()
+
+    outcome = asyncio.run(executor.run(pb, {"rerun_from": "b"}))
+    assert outcome.status == "done"
+    assert calls == ["two", "three"]
+    calls.clear()
+    assert asyncio.run(executor.run(pb, {})).status == "done"
+    assert calls == []
+
+
+def test_rerun_from_unknown_step_blocks_without_touching_checkpoint(env):
+    registry, executor, _ = env
+    registry.register(make_step("s.one", lambda ctx: StepResult(True, summary="one")))
+    pb = playbook([PlaybookStep("a", "s.one")])
+    assert asyncio.run(executor.run(pb, {})).status == "done"
+    before = executor.progress_file.read_text(encoding="utf-8")
+
+    outcome = asyncio.run(executor.run(pb, {"rerun_from": "missing"}))
+    assert outcome.status == "blocked"
+    assert "missing" in outcome.blocked_reason
+    assert executor.progress_file.read_text(encoding="utf-8") == before
+
+
 def test_retryable_is_retried(env):
     registry, executor, _ = env
     attempts = {"n": 0}

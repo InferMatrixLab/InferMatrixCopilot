@@ -294,6 +294,15 @@ def test_test_loop_infra_is_structural(tmp_path):
         baseline_fn=baseline_fn, debug_fn=debug_fn))
     assert "timeout" not in reran
     assert result2["infra_failures"] == ["timeout: timeout"]
+    # an operator-requested rerun retries it; a pass clears the record
+    runs["timeout"] = tl.TestRunResult(0)
+    reran.clear()
+    result3 = asyncio.run(tl.run_test_loop(
+        jobs, substate=sub, run_fn=lambda s: reran.append(s) or runs[s],
+        baseline_fn=baseline_fn, debug_fn=debug_fn, retry_infra=True))
+    assert reran == ["timeout", "assertion"]
+    assert result3["infra_failures"] == []
+    assert "timeout" in result3["completed_slugs"]
 
 
 def test_infra_failure_surfaces_assertions_it_already_reported(tmp_path):
@@ -2789,3 +2798,20 @@ def test_runner_model_download_notify(tmp_path):
                    setup="echo huggingface-cli download org/model x")
     assert runner.run(job2, env).rc == 0
     assert [n for n in notified if n[0] == "dl2"] == []
+
+
+@pytest.mark.parametrize("testing,expected", [
+    ({}, 1), ({"local_timeout_multiplier": 3}, 3),
+    ({"local_timeout_multiplier": 1.5}, 1.5)])
+def test_local_timeout_multiplier_scales_only_valid_factors(testing, expected):
+    from infermatrix_copilot.engine.steps.rebase_v3 import _local_timeout_multiplier
+    assert _local_timeout_multiplier(testing) == expected
+
+
+@pytest.mark.parametrize("factor", [0, 0.5, -2, True, "3"])
+def test_local_timeout_multiplier_rejects_invalid_factor(factor):
+    from infermatrix_copilot.engine.steps.rebase_v3 import _local_timeout_multiplier
+    from infermatrix_copilot.engine.step import FailureKind, StepResult
+    result = _local_timeout_multiplier({"local_timeout_multiplier": factor})
+    assert isinstance(result, StepResult)
+    assert result.failure == FailureKind.BLOCKED

@@ -107,18 +107,25 @@ async def run_test_loop(
     debug_fn: DebugFn,
     visible_gpus: int = 0,
     phase_label: str = "Phase 3",
+    retry_infra: bool = False,
 ) -> dict:
     """Returns the parent's shape plus the structural split:
     ``{"passed", "failed", "failed_tests", "skipped_tests",
     "completed_slugs", "infra_failures"}`` — `failed_tests` holds ONLY
     assertion failures; infrastructure failures live in `infra_failures`. Progress lives under the
     substate's ``phase3_progress`` (run-stamped, so a phase-4 fallback in
-    the same run resumes past everything phase 3 already ran)."""
+    the same run resumes past everything phase 3 already ran).
+    `retry_infra` (an operator-requested rerun only) runs recorded
+    infrastructure failures again instead of keeping them structural."""
     prev = substate.get("phase3_progress", {}) or {}
     prev_completed = set(prev.get("completed", []))
     prev_failed = set(prev.get("failed", []))
     prev_skipped = set(prev.get("skipped", []))
     prev_infra = list(prev.get("infra", []))
+    if retry_infra and prev_infra:
+        log.info("%s rerun: retrying %d infrastructure failure(s): %s",
+                 phase_label, len(prev_infra), "; ".join(prev_infra[:5]))
+        prev_infra = []
     if prev_completed or prev_failed or prev_skipped:
         log.info("%s resume: %d passed, %d failed, %d skipped from previous "
                  "attempt", phase_label, len(prev_completed),

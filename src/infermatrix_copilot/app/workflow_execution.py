@@ -44,6 +44,7 @@ class WorkflowExecution:
         resolution_mode: str = "resume", tier: str = "?",
         resuming: bool = False, held_lock: RunLock | None = None,
         planned_context: RepositoryContext | None = None,
+        rerun_from: str = "",
     ) -> ExecutionResult:
         """Run a resolved `playbook` to completion in `run_dir`: init tracing +
         notifier, seed the shared state (repo path, push policy, protected
@@ -119,6 +120,8 @@ class WorkflowExecution:
                 "protected_branches": list(repo_context.protected_branches),
                 "resuming": resuming,
             }
+            if rerun_from:
+                state["rerun_from"] = rerun_from
             if repo_context.high_risk_modules:
                 state["high_risk_modules"] = list(repo_context.high_risk_modules)
             executor = Executor(self.registry, self.settings, run_dir=run_dir,

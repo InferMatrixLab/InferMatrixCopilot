@@ -193,6 +193,15 @@ def _job_key(args: list[str]) -> str:
     return "module_pytest"
 
 
+def _explicit_option(args: list[str], name: str) -> str | None:
+    for index, arg in enumerate(args):
+        if arg == name and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def _platform_filtered_args(args: list[str], testing: dict) -> tuple[list[str], str | None]:
     """Add the adapter's platform selector to otherwise unfiltered pytest.
 
@@ -201,6 +210,14 @@ def _platform_filtered_args(args: list[str], testing: dict) -> tuple[list[str], 
     Keep platform-neutral and current-platform items, including tests marked
     for several platforms.  A caller-provided ``-m`` expression is explicit
     and therefore remains authoritative.
+
+    Buildkite pairs the mark with ``--run-level`` (Ready uses
+    ``-m 'core_model and cuda' --run-level core_model``). A hardware-only
+    expression collects ``advanced_model`` / ``full_model`` items and then
+    the default ``core_model`` run level loads dummy weights, so real-weight
+    fixtures error. An unmarked module run therefore also selects
+    ``core_model``. An explicit ``--run-level`` is paired with that same
+    level instead.
     """
     platform = testing.get("module_test_platform")
     if platform is None or args[0] == "python" or args[0].startswith("python3"):
@@ -210,9 +227,17 @@ def _platform_filtered_args(args: list[str], testing: dict) -> tuple[list[str], 
         raise ValueError(f"rebase.testing.module_test_platform must be one of: {choices}")
     if any(arg == "-m" or arg.startswith("-m=") for arg in args):
         return args, None
+    level = _explicit_option(args, "--run-level") or "core_model"
+    if level not in {"core_model", "advanced_model", "full_model"}:
+        raise ValueError(
+            "--run-level must be core_model, advanced_model, or full_model")
     others = sorted(_ACCELERATOR_PLATFORMS - {platform})
-    expression = f"{platform} or (" + " and ".join(f"not {name}" for name in others) + ")"
-    return [*args, "-m", expression], platform
+    expression = (
+        f"({platform} or (" + " and ".join(f"not {name}" for name in others)
+        + f")) and {level}"
+    )
+    extra = [] if _explicit_option(args, "--run-level") else ["--run-level", level]
+    return [*args, *extra, "-m", expression], platform
 
 
 def _log_hash(log_file: str) -> tuple[str | None, str]:

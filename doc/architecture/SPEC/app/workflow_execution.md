@@ -1,6 +1,6 @@
 # app/workflow_execution.py — workflow execution boundary
 
-<!-- verified-against: 2026-10-28 -->
+<!-- verified-against: 2026-10-29 -->
 
 `WorkflowExecution` runs an already selected playbook with the caller's
 current LLM dependency. It rechecks the repository context before starting,
@@ -22,6 +22,9 @@ cancelled; `CancelledError`/`KeyboardInterrupt` is caught only when a
 shutdown request exists, otherwise it propagates as before). Finalizers have
 already run inside `run_guarded` by then: GPU locks are released and the
 upstream scratch is kept, so the run is resumable with `--resume`.
+
+A non-empty `rerun_from` is seeded as `state["rerun_from"]`; the executor
+re-executes that step and every later one.
 
 A losing run lock leaves active run artifacts untouched. A failed knowledge
 lock releases an acquired run lock. A caller-provided lock stays owned by the

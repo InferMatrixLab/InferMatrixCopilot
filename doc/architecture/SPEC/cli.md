@@ -1,6 +1,6 @@
 # cli/ —— 规范
 
-<!-- verified-against: 2026-10-27 -->
+<!-- verified-against: 2026-10-29 -->
 
 `LOC ~1420（6 个文件） · 接口 + 编排门面 · refactor-status: ok`
 
@@ -114,3 +114,4 @@ RFC 子命令原样转发与共享入口：`test_rfc_integration.py`；服务契
 
 `--resume` 现在接受可选 run id；`--repo`、`--playbook`、`--task-param` 与
 `--resume` 同用时是对保存任务的断言（见 `app/core`）。
+`--rerun-from STEP_ID`（2026-10-29）只能与 `--resume` 同用，否则 argparse 报错。

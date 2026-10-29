@@ -120,6 +120,10 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="RUN_ID",
                         help="resume RUN_ID, or the most recent run when omitted; "
                              "repo/playbook/task params assert its saved identity")
+    parser.add_argument("--rerun-from", metavar="STEP_ID",
+                        help="with --resume: execute this playbook step and "
+                             "every later step again instead of replaying "
+                             "their checkpoints")
     parser.add_argument("--playbook",
                         help="run a specific playbook by name "
                              "(incl. planner-invisible candidates); "
@@ -215,7 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume is not None:
         return copilot.resume_last(args.resume, repo=args.repo,
                                    playbook=args.playbook or "",
-                                   params=parse_task_params(args.task_param))
+                                   params=parse_task_params(args.task_param),
+                                   rerun_from=args.rerun_from or "")
+    if args.rerun_from:
+        parser.error("--rerun-from requires --resume")
     if args.playbook:
         params = parse_task_params(args.task_param)
         return copilot.run_playbook(args.playbook, params=params,

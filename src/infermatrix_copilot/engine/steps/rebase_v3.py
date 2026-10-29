@@ -10,6 +10,7 @@ RUN_REPORT always exists when the run terminates needs-human)."""
 from __future__ import annotations
 
 from dataclasses import asdict as _dc_asdict
+from dataclasses import replace as _dc_replace
 
 import asyncio
 import re
@@ -84,6 +85,21 @@ def manifest_job_to_test_job(j: Mapping):
                    timeout_sec=j["timeout_sec"], min_gpus=j["min_gpus"],
                    env=_parse_env_pairs(j.get("env", "")),
                    setup=j.get("setup", ""))
+
+
+def _local_timeout_multiplier(testing: Mapping) -> float | StepResult:
+    """`rebase.testing.local_timeout_multiplier`: scales CI `timeout_in_minutes`
+    for the local loop only. CI budgets are sized for CI agents; a shared host
+    running the same serial command can pass every item and still be killed,
+    which records a structural infra failure the push gate blocks on. The
+    built manifest keeps the CI value (shell-golden parity)."""
+    factor = testing.get("local_timeout_multiplier", 1)
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) \
+            or factor < 1:
+        return StepResult(False, FailureKind.BLOCKED,
+                          "rebase.testing.local_timeout_multiplier must be a "
+                          "number >= 1")
+    return factor
 
 
 def _tier_client(ctx: StepContext):
@@ -1522,9 +1538,17 @@ async def _v3_test_loop(ctx: StepContext) -> StepResult:
         record_fn=record_fn, review_fn=review_fn, report_fn=report_fn,
         notify_download=notify_download)
     jobs_by_slug = {j["slug"]: j for j in local_jobs}
+    timeout_multiplier = _local_timeout_multiplier(rb.get("testing") or {})
+    if isinstance(timeout_multiplier, StepResult):
+        return timeout_multiplier
+    if timeout_multiplier != 1:
+        ctx.trace.record("local_timeout_multiplier", factor=timeout_multiplier)
 
     def _job(slug: str) -> TestJob:
-        return manifest_job_to_test_job(jobs_by_slug[slug])
+        job = manifest_job_to_test_job(jobs_by_slug[slug])
+        if timeout_multiplier != 1:
+            job = _dc_replace(job, timeout_sec=job.timeout_sec * timeout_multiplier)
+        return job
 
     def _to_result(outcome) -> tl.TestRunResult:
         infra = "timeout" if outcome.timed_out else \
@@ -1677,7 +1701,8 @@ async def _v3_test_loop(ctx: StepContext) -> StepResult:
         local_jobs, substate=sub, run_fn=run_fn,
         baseline_fn=baseline_fn, debug_fn=debug_fn,
         visible_gpus=len([d for d in runner.cuda.split(",") if d.strip()
-                          and not d.strip().startswith("-")]))
+                          and not d.strip().startswith("-")]),
+        retry_infra=bool(ctx.state.get("rerun_from")))
     tl.remove_main_worktree(Path(repo), worktree_path)
     infra = result["infra_failures"] + dropped_infra
     sub.update({"tests": {
