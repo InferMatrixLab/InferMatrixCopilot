@@ -77,11 +77,14 @@ class DocumentPage(_Serializable):
     content: str
     next_offset: int | None
     review_context_id: str = ""
+    knowledge_feedback: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = super().to_dict()
         if not self.review_context_id:
             result.pop("review_context_id")
+        if not self.knowledge_feedback:
+            result.pop("knowledge_feedback")
         return result
 
 
@@ -270,6 +273,7 @@ class DirectReviewPlan(_Serializable):
     # {"status": "no_diff"} when the request carried no diff
     untested_public_api: dict[str, Any] = field(default_factory=dict)
     related_knowledge: dict[str, Any] = field(default_factory=dict)
+    knowledge_feedback: dict[str, Any] = field(default_factory=dict)
 
 FeedbackStatus = Literal[
     "checked", "disabled", "unavailable", "not_applicable"

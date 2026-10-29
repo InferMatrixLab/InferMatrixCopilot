@@ -27,6 +27,7 @@ infermatrix-copilot = "infermatrix_copilot.cli:main"
 infermatrix-copilot-mcp = "infermatrix_copilot.thin_mcp_server:main"
 infermatrix-copilot-workflow-mcp = "infermatrix_copilot.mcp_server:main"
 infermatrix-rfc = "infermatrix_copilot.rfc_service.cli:main"
+infermatrix-feedback = "infermatrix_copilot.knowledge_service.feedback_server_cli:main"
 imx-omni-pytest = "infermatrix_copilot.rebase_engine.module_pytest:main"
 
 [build-system]

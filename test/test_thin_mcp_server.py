@@ -108,6 +108,13 @@ def test_tool_annotations_mark_the_read_only_surface(monkeypatch):
     rfc_request = mcp.tool_annotations["rfc_request"]
     assert rfc_request.readOnlyHint is False and rfc_request.destructiveHint is True
     assert rfc_request.idempotentHint is False and rfc_request.openWorldHint is True
+    report = mcp.tool_annotations["knowledge_feedback_report"]
+    assert report.readOnlyHint is True and report.openWorldHint is True
+    for name in ("knowledge_learning", "knowledge_feedback", "knowledge_feedback_sync"):
+        hints = mcp.tool_annotations[name]
+        assert hints.readOnlyHint is False and hints.destructiveHint is False
+        assert hints.idempotentHint is True
+        assert hints.openWorldHint is True
 
 
 def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
@@ -128,6 +135,11 @@ def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
         "search_knowledge_context",
         "expand_knowledge_context",
         "related_knowledge_context",
+        "knowledge_learning",
+        "knowledge_feedback",
+        "knowledge_feedback_report",
+        "knowledge_feedback_sync",
+        "knowledge_agreement",
     }
 
     review = mcp.tools["review"](
@@ -150,6 +162,7 @@ def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
         "progress_update",
         "completion_gate",
         "diagnostics",
+        "knowledge_feedback",
     }
     assert review["mode"] == "direct"
     assert review["untested_public_api"] == {"status": "no_diff"}

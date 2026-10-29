@@ -1,6 +1,6 @@
 # knowledge_service/ — provider curation components
 
-<!-- verified-against: 2026-10-09 -->
+<!-- verified-against: 2026-10-29 -->
 
 Pinned source identities and depth markers accept full SHA-1 or SHA-256 Git
 commits. Evidence bodies, stored hashes and native approval semantics remain
@@ -23,12 +23,93 @@ proposals to page digests; `ApplyMixin` performs locked append-only writes,
 fixed validators and byte-exact rollback. `common` contains shared syntax,
 bounds, hashes, errors and lock capability.
 
-No component imports a CLI/MCP transport or ReviewBot, calls a model, clones,
-pushes, or publishes. The host owns evidence collection, model calls, retries,
+These curator components do not import a CLI/MCP transport or ReviewBot, call a model, clone,
+push, or publish. The host owns evidence collection, model calls, retries,
 local commits and proposal export. The public `sdk.v1.knowledge` module only
 re-exports the curator and validator error. Existing proposal IDs, errors,
 wire projections, validator order and rollback behavior are compatibility
 contracts across the move.
+
+Task completion orchestration is a separate facade in this package:
+`agreement.AgreementStore` owns the versioned disclosure, private named local
+acknowledgement, status, action gates, minimal upload attestation and revocation.
+Learning/feedback start disabled. Only `agreement_cli` can take human interactive
+acceptance after displaying actual terms and destinations, obtaining a name and
+exact `I AGREE`, then rechecking the displayed version/configuration. Ordinary
+SDK/MCP operations can inspect or revoke, never sign or supply acceptance data.
+Status/document do not create state. Publication settings and write flags cannot
+substitute for acknowledgement. Terms, publication mode/repository/base and
+collector URL bind the acceptance; changes require renewal.
+
+The disclosure covers extra host tokens/time/possible quota charges, selected
+conversation-derived sensitive data, local retention and GitHub/collector access.
+Redaction is bounded and cannot guarantee removal of every secret/private detail.
+Revoke blocks future gated learning, grading and uploads; it does not erase prior
+local/remote data and cannot guarantee cancellation of an operation in flight.
+Source reads, task status and local feedback reports remain available unsigned.
+
+`learning.TaskLearningService` owns durable prepare/submit/status, freezes a
+governed Git base and owner catalog, validates host-distilled positive/negative
+rules with the curator, and applies only in provider-owned worktrees.
+`learning_publication.LearningPublisher` can open a draft PR with current human
+agreement, fixed host destination configuration, both write flags, create-only push and exact-tree
+recovery; it never merges. Original user work is never staged or reset.
+`learning_privacy` rejects recognizable credential/private-key/chat-export
+forms; the host remains responsible for redacting other private information.
+`learning_cli` is the bounded JSON transport adapter, delegating agreement commands
+before JSON handling. None calls a model or imports raw host chat. After acceptance,
+empty lessons are valid. Identical retries reuse the
+task, proposal and publication; conflicting inputs fail.
+Each task is serialized with a cross-process file lock. SQLite transactions only
+read or persist state; worktree operations, validators, commits and network
+publication run without the database-wide writer lock so other tasks can proceed.
+New nonempty preparations verify their repository slice at the frozen Git base
+before inserting identity or creating a worktree. A repository typo left by an
+older version can be corrected only while preparation is unfinished, no proposal
+or application exists, all other identity fields match, and its worktree is absent
+or provably pristine at the same detached base. Unknown edits are preserved and
+refused rather than reset.
+
+`feedback.KnowledgeFeedbackStore` records trusted delivery receipts with current
+agreement, independently of containment. Without agreement, issuance returns
+`agreement_required` and empty targets while source reading continues. It stores
+hashes and identities, not delivered source text.
+Public ratings require a provider-issued target in the same task, integer -1/+1,
+explicit actual use, reason and outcome evidence. One immutable vote per task
+and exact target version prevents repeated reads/retries inflating scores.
+Partial content never exposes undelivered sibling rules. Reports separate
+positive, negative, net, mean and distinct-task counts by content version;
+feedback is not a semantic gate or automatic rule retirement. All runtime state
+lives outside the knowledge tree.
+
+`feedback_hub.FeedbackHubStore` is the shared team ledger. It accepts only the
+existing `knowledge-feedback/1` receipt and ratings from authenticated trusted
+providers with minimal current agreement attestations; it verifies canonical receipt and exact target-version hashes,
+document/task/repository binding, and eligibility before counting immutable
+`(task_id, target_id)` votes. Provider authentication establishes issuance trust,
+not independent semantic proof. Reports aggregate in SQLite with bounded target
+results. `feedback_http` supplies authenticated ingestion and reporting with a
+minimal unauthenticated health endpoint; `feedback_server_cli` starts the
+standard-library listener. One persistent service instance owns its state.
+Attestations contain protocol/purpose, disclosure version/hash, configuration hash,
+acceptance ID and time, never signer names or complete local records. Provider
+authentication establishes trust in that claim, not independent human-signature
+verification. The collector cannot reconstruct a person's named acknowledgement.
+
+`feedback_sync` provides a bounded HTTPS transport (HTTP only on loopback),
+refuses redirects and redacts transport errors. Credentials/destination come
+only from operator configuration. Current agreement is checked before grading,
+publication, remote reports and each upload; the actual transport URL must be in
+the accepted context. Recording a grade commits a per-rating outbox
+entry with the local vote before any network attempt. Exact retries, concurrent
+flushes and uncertain acknowledgments cannot create extra votes; failed uploads
+remain pending across restart. Sync can backfill preexisting local grades only
+with current agreement; missing/revoked consent retains pending data without upload.
+Known credential/chat-export forms are blocked before egress. Shared task IDs
+must be globally unique and remain stable across hosts. Source text and raw chat
+are never uploaded by this protocol. Scoring does not change knowledge rules.
+`report_for_scope` selects central data when configured in auto mode; a central
+failure is reported, never replaced by local counts.
 
 Knowledge Ops API 2.0 sits beside the v1 curator and does not change it:
 `lifecycle` parses rule pages (byte-exact) and their `kb:rule` footers,

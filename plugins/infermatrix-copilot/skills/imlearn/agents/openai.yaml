@@ -1,0 +1,4 @@
+interface:
+  display_name: "Imlearn"
+  short_description: "Learn from task outcomes and rate used knowledge"
+  default_prompt: "Use $imlearn to check the agreement and, only if accepted, learn from this task and grade used knowledge."

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import signal
+import sqlite3
 import sys
 import time
+import uuid
 
 from .config import Settings
 
@@ -65,10 +67,16 @@ def _docs(repo: str, view: KnowledgeView | None = None) -> KnowledgeDocs:
 
 
 def _guard(fn):
+    from .sdk.v1.models import SDKError
+
     try:
         return fn()
     except (KnowledgeDocsError, FileNotFoundError, PolicyError, TypeError,
-            ValueError) as exc:
+            ValueError, SDKError) as exc:
+        if getattr(exc, "code", "") == "agreement_required":
+            return {"status": "agreement_required", "error": str(exc),
+                    "agreement_tool": "knowledge_agreement",
+                    "human_command": "infermatrix-copilot learning agreement accept"}
         return {"error": str(exc)}
 
 
@@ -80,26 +88,47 @@ def _model_context_delivery(packet: dict) -> dict:
     return packet
 
 
-def _raw_document_delivery(result, receipt, session, view):
-    if session is None:
-        return result
-    from .knowledge_service.containment import _issue_usage
-    if result.get("path") or result.get("matches"):
-        receipt = _issue_usage({"session_id":session,"delivery":result}, view=view, session_id=session, injected=True)
-    return {**result, "knowledge_usage": receipt}
+def _feedback_delivery(result, *, view, repository, task_id="", documents=None):
+    from .knowledge_service.feedback import KnowledgeFeedbackStore
+
+    view = view or KnowledgeView.current()
+    documents = documents if documents is not None else (
+        [{"path": result["path"], "content": result.get("content", "")}]
+        if result.get("path") else result.get("matches", []))
+    try:
+        receipt = KnowledgeFeedbackStore.from_env().issue_delivery(
+            task_id=task_id or f"task-{uuid.uuid4().hex}", repository=repository,
+            view=view, documents=documents)
+    except (OSError, sqlite3.Error):
+        receipt = {"status": "unavailable", "error": "feedback_storage_unavailable"}
+    return {**result, "knowledge_feedback": receipt}
 
 
-def _legacy_plan_delivery(plan):
+def _raw_document_delivery(result, receipt, session, view, task_id=""):
+    if session is not None:
+        from .knowledge_service.containment import _issue_usage
+        if result.get("path") or result.get("matches"):
+            receipt = _issue_usage({"session_id":session,"delivery":result}, view=view, session_id=session, injected=True)
+        result = {**result, "knowledge_usage": receipt}
+    return _feedback_delivery(result, view=view, repository=result["repo"], task_id=task_id)
+
+
+def _legacy_plan_delivery(plan, task_id="", repository="", view=None):
     from .knowledge_service.containment import configuration, _usage_session_view, _issue_usage, digest
-    if not configuration()["enabled"]:
-        return plan
-    session, view = _usage_session_view(plan["knowledge_usage"])
-    context = {"raw_plan_sha256":digest(plan),
-               "documents":[{"document_id":row["path"]} for row in plan["knowledge_usage"]["pages"]],
-               "quick_maps":[{"path":view.relative(row["path"]),"content":row.get("quick_map","")}
-                             for row in plan["knowledge_routes"]],
-               "related_knowledge":plan["related_knowledge"]}
-    return {**plan,"knowledge_usage":_issue_usage(context,view=view,session_id=session,injected=True)}
+    view = view or KnowledgeView.current()
+    if configuration()["enabled"]:
+        session, view = _usage_session_view(plan["knowledge_usage"])
+        context = {"raw_plan_sha256":digest(plan),
+                   "documents":[{"document_id":row["path"]} for row in plan["knowledge_usage"]["pages"]],
+                   "quick_maps":[{"path":view.relative(row["path"]),"content":row.get("quick_map","")}
+                                 for row in plan["knowledge_routes"]],
+                   "related_knowledge":plan["related_knowledge"]}
+        plan = {**plan,"knowledge_usage":_issue_usage(context,view=view,session_id=session,injected=True)}
+    documents = [{"path": row["path"], "content": row.get("quick_map", "")}
+                 for row in plan.get("knowledge_routes", []) if row.get("quick_map")]
+    documents.extend(plan.get("related_knowledge", {}).get("documents", []))
+    return _feedback_delivery(plan, view=view, repository=_normalize_repo(repository, view),
+                              task_id=task_id, documents=documents)
 
 
 def _knowledge_entry(name: str) -> str:
@@ -288,7 +317,31 @@ def build_mcp(
             "implicit. For Direct, pass post=true only when the user "
             "explicitly asks. Strict never posts and refuses post=true: exactly "
             "one publisher owns a PR's review marker and head gate, so read the "
-            "structured result from get_review_result and publish it yourself."
+            "structured result from get_review_result and publish it yourself. "
+            "At completion of each Copilot task, FIRST call knowledge_agreement "
+            "with action=status, before distilling lessons or grading knowledge. "
+            "Only status=accepted permits extra learning/grading tokens, feedback "
+            "uploads or knowledge contributions. Missing, revoked, unavailable "
+            "or renewal_required agreement means skip those activities and finish "
+            "the requested task normally. Offer the actual agreement document "
+            "through knowledge_agreement action=show and the human signing command "
+            "infermatrix-copilot learning agreement accept once; do not repeat "
+            "the reminder on every task. Never sign or accept on the user's behalf. "
+            "Operator publication/write configuration is not human consent. "
+            "After accepted status, distill reusable positive and negative lessons "
+            "locally from the current chat. Never send raw chat histories or credentials. Use "
+            "knowledge_learning prepare then submit for evidenced owner-scoped "
+            "rules; no reusable lesson is a valid empty result. Grade only "
+            "actually used targets from knowledge_feedback delivery receipts "
+            "with score -1 or +1, used=true, a reason and outcome evidence. "
+            "Leave unused or uncertain knowledge ungraded. Reuse one task_id "
+            "through review, follow-up reads, learning and feedback; task IDs "
+            "must be globally unique, for example the host chat UUID. Retries "
+            "reuse the exact packet. With accepted agreement, configured draft PR "
+            "publication runs automatically within its existing operator write gates; retain "
+            "and report pending work if publication is unavailable. Configured "
+            "central feedback sync follows local recording automatically; pending "
+            "uploads remain durable and can be retried with knowledge_feedback_sync."
         ),
     )
 
@@ -310,6 +363,7 @@ def build_mcp(
         idempotency_key: str = "",
         diff: str = "",
         knowledge_profile: str = "legacy",
+        task_id: str = "",
     ) -> dict:
         """Begin a Direct or Strict review.
 
@@ -348,19 +402,21 @@ def build_mcp(
             if selected_mode == "direct":
                 if knowledge_profile == "adaptive":
                     from .sdk.v1.models import ChangedPath, DirectReviewRequest, RepositoryRef
-                    request = DirectReviewRequest(idempotency_key or f"direct:{target}", RepositoryRef(repo),
+                    request = DirectReviewRequest(task_id or idempotency_key or f"direct:{target}:{uuid.uuid4().hex}", RepositoryRef(repo),
                                                   0, expected_head_sha, title, body,
                                                   tuple(ChangedPath(path) for path in changed_files or ()), diff=diff)
                     return _model_context_delivery(context_client.plan_adaptive(request))
                 if knowledge_profile != "legacy":
                     raise ValueError("knowledge_profile must be legacy or adaptive")
+                view = KnowledgeView.current()
                 return _legacy_plan_delivery(direct_review_plan(
                     repo,
                     title=title,
                     body=body,
                     changed_files=changed_files,
                     diff=diff,
-                ))
+                    view=view,
+                ), task_id=task_id or idempotency_key, repository=repo, view=view)
 
             if post:
                 # Refused at the surface as well as in the policy, so the
@@ -487,11 +543,13 @@ def build_mcp(
         repo: str = "vllm-omni",
         limit: int = 20,
         knowledge_usage: dict | None = None,
+        task_id: str = "",
     ) -> dict:
         """Search knowledge; enforced reads require the review plan's knowledge_usage receipt."""
         def run() -> dict:
             from .knowledge_service.containment import _usage_session_view
             session, view = _usage_session_view(knowledge_usage)
+            view = view or KnowledgeView.current()
             selected_repo = _normalize_repo(repo, view)
             if selected_repo not in _supported_repos(view):
                 supported = ", ".join(_supported_repos(view)) or "(none)"
@@ -512,7 +570,7 @@ def build_mcp(
                     "knowledge_entry."
                 )} if not matches else {}),
             }
-            return _raw_document_delivery(result, knowledge_usage, session, view)
+            return _raw_document_delivery(result, knowledge_usage, session, view, task_id)
 
         return _guard(run)
 
@@ -522,18 +580,125 @@ def build_mcp(
         repo: str = "vllm-omni",
         offset: int = 0,
         knowledge_usage: dict | None = None,
+        task_id: str = "",
     ) -> dict:
         """Read a doc_search page; enforced reads require the review plan's knowledge_usage receipt."""
         def run() -> dict:
             from .knowledge_service.containment import _usage_session_view
             session, view = _usage_session_view(knowledge_usage)
+            view = view or KnowledgeView.current()
             selected_repo = _normalize_repo(repo, view)
             result = {
                 "repo": selected_repo,
                 **_docs(selected_repo, view).read(path, offset=offset),
             }
-            return _raw_document_delivery(result, knowledge_usage, session, view)
+            return _raw_document_delivery(result, knowledge_usage, session, view, task_id)
 
+        return _guard(run)
+
+    @mcp.tool(annotations=ToolAnnotations(
+        title="Inspect or revoke the knowledge learning agreement", readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=False))
+    def knowledge_agreement(action: str = "status") -> dict:
+        """Read status/show the actual terms, or revoke consent using local state.
+
+        Status and show do not sign or create acceptance. Acceptance is a human
+        interactive CLI action, never an MCP action. This tool accepts no signer,
+        credential, endpoint, attestation or acceptance flag.
+        """
+        from .sdk.v1.learning import KnowledgeAgreementClient
+
+        def run():
+            if action not in {"status", "show", "revoke"}:
+                raise ValueError("knowledge_agreement action must be status, show or revoke")
+            client = KnowledgeAgreementClient()
+            if action == "status":
+                return client.status()
+            if action == "show":
+                return client.document()
+            return client.revoke()
+        return _guard(run)
+
+    @mcp.tool(annotations=ToolAnnotations(
+        title="Distill task lessons into knowledge proposals", readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    def knowledge_learning(action: str, task_id: str, repo: str = "",
+                           source_pin: str = "", lessons: list[dict] | None = None,
+                           packet_digest: str = "", proposals: dict | None = None) -> dict:
+        """At task completion prepare then submit locally distilled positive/negative lessons.
+
+        First inspect knowledge_agreement(status); accepted agreement is required
+        before spending extra learning tokens. The host model uses the returned owner catalog and prompt. Send reusable
+        lessons and verification references, never a raw transcript. Draft PRs
+        require accepted human agreement, configured publication and the existing push/post gates. Empty
+        lessons are valid. Reuse task_id and the exact prepared packet on retries.
+        """
+        from .sdk.v1.learning import KnowledgeLearningClient
+
+        def run():
+            client = KnowledgeLearningClient()
+            if action == "prepare":
+                return client.prepare(task_id=task_id, repository=repo,
+                                      source_pin=source_pin, lessons=lessons or [])
+            if action == "submit":
+                return client.submit(task_id=task_id, packet_digest=packet_digest,
+                                     proposals=proposals if proposals is not None else {"rules": []})
+            if action == "status":
+                return client.status(task_id)
+            raise ValueError("knowledge_learning action must be prepare, submit or status")
+        return _guard(run)
+
+    @mcp.tool(annotations=ToolAnnotations(
+        title="Grade knowledge actually used in a task", readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    def knowledge_feedback(task_id: str, delivery_id: str, ratings: list[dict]) -> dict:
+        """Record -1/+1 only for issued targets with used=true, reason and evidence.
+
+        Require accepted human agreement before grading. Omit unused or
+        inconclusive targets. Scores measure observed utility;
+        they do not authorize rule edits, retirement, merges or suppression.
+        Configured team sync runs after local persistence; pending is not an
+        acknowledged upload. Credentials and destination are host configuration.
+        """
+        from .sdk.v1.learning import KnowledgeFeedbackClient
+
+        return _guard(lambda: KnowledgeFeedbackClient().record(
+            task_id=task_id, delivery_id=delivery_id, ratings=ratings))
+
+    @mcp.tool(annotations=ToolAnnotations(
+        title="Read knowledge quality counts", readOnlyHint=True,
+        destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    def knowledge_feedback_report(repo: str = "", limit: int = 100,
+                                  scope: str = "auto") -> dict:
+        """Read exact-version quality counts; auto uses configured team aggregation.
+
+        Scope may be auto, local or central. Central failures are errors, never
+        a silent local fallback that understates the team's actual usage.
+        """
+        from .sdk.v1.learning import KnowledgeFeedbackClient
+
+        return _guard(lambda: KnowledgeFeedbackClient().report(
+            repository=repo, limit=limit, scope=scope))
+
+    @mcp.tool(annotations=ToolAnnotations(
+        title="Retry knowledge feedback uploads", readOnlyHint=False,
+        destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    def knowledge_feedback_sync(action: str = "flush", limit: int = 100) -> dict:
+        """Retry pending uploads or inspect status using configured destination only.
+
+        Actions are flush and status. Status makes no network request. Reusing
+        original task/version identities makes retries safe after an uncertain
+        response. Neither action edits knowledge or creates another vote.
+        """
+        from .sdk.v1.learning import KnowledgeFeedbackClient
+
+        def run():
+            client = KnowledgeFeedbackClient()
+            if action == "flush":
+                return client.sync(limit=limit)
+            if action == "status":
+                return client.sync_status()
+            raise ValueError("knowledge_feedback_sync action must be flush or status")
         return _guard(run)
 
     def rfc_call(action: str, payload: dict | None = None) -> dict:

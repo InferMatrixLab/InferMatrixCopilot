@@ -51,10 +51,14 @@ from .models import (
     UnsupportedRepositoryError,
 )
 from .strict import StrictRuntime
+from .learning import KnowledgeAgreementClient, KnowledgeFeedbackClient, KnowledgeLearningClient
 from .rfc import RFC_API_VERSION, RFCClient, RFCClientError, Principal, SourceRef
 from ...trace_store import SCHEMA as TRACE_SCHEMA, TraceStore, redact, trace_context
 
 __all__ = [
+    "KnowledgeAgreementClient",
+    "KnowledgeFeedbackClient",
+    "KnowledgeLearningClient",
     "RFC_API_VERSION",
     "RFCClient",
     "RFCClientError",

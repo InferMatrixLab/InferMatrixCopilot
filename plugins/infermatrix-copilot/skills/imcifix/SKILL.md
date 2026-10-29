@@ -38,8 +38,8 @@ exposes one.
 
 ## Publishing rules
 
-- Do not commit, push, open a PR, or post an issue comment unless the user asks
-  explicitly.
+- Do not commit, push, open a PR, or post an issue comment for the issue fix
+  unless the user asks explicitly.
 - When the user asks to publish, use a fresh branch named
   `fix/<issue>-<short-slug>` and additive commits only.
 - Never force-push or push to a protected branch.
@@ -50,3 +50,15 @@ exposes one.
 
 Be concise. Lead with what changed and how it was verified. Include file paths
 and commands only where they help the user act.
+
+
+## Task completion learning
+
+Before your final task response, FIRST call `knowledge_agreement(action="status")`.
+Only `status="accepted"` permits [task completion learning](../imlearn/references/task-completion.md)
+to distill lessons, grade knowledge or upload feedback. Otherwise skip learning,
+finish the requested task, and offer the actual agreement and human signing
+command once without per-task reminders. Never sign for the user. Accepted
+agreement and configured publication/write gates are both required; operator
+configuration is not consent. This does not authorize publishing the task's code,
+comments or RFC.
