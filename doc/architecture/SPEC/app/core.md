@@ -1,6 +1,6 @@
 # app/core.py —— 规范
 
-<!-- verified-against: 2026-10-28 -->
+<!-- verified-against: 2026-10-29 -->
 
 `Copilot` is the headless workflow application. It resolves a TaskSpec,
 delegates reviewer verdict policy to `review.plan_gate`, confirms when needed,
@@ -39,6 +39,10 @@ run（`_contained_run_dir` 拒绝越界路径）；`--repo/--playbook/--task-par
 在恢复时是对已保存 task.json 的**断言**而非修改，任一不匹配即 BLOCKED。
 发布 launcher 因此能把 resume 绑定到不可变的 campaign，而不会误入更新的
 无关任务。损坏的 task.json 同样 BLOCKED 而非崩溃。
+
+`rerun_from`（`--rerun-from <step id>`，2026-10-29）是唯一会改变 resume 行为的
+参数：原样传给 `_execute`，由 executor 让该 step 及其后各 step 重新执行；保存的
+任务身份仍不改。
 
 ## 被信号终止的预约 run（2026-10-28）
 

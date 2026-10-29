@@ -164,17 +164,45 @@ def test_adapter_platform_filters_only_other_platform_items(
     monkeypatch.setattr(module_pytest, "TestRunner", CapturingRunner)
     args = ["-vv", "-s", "tests/diffusion/"]
     assert module_pytest.main(args) == 0
-    marker = "cuda or (not musa and not npu and not rocm and not xpu)"
+    marker = "(cuda or (not musa and not npu and not rocm and not xpu)) and core_model"
     assert observed["job"].command == (
-        "python -m pytest -vv -s tests/diffusion/ -m " + shlex.quote(marker)
+        "python -m pytest -vv -s tests/diffusion/ --run-level core_model -m "
+        + shlex.quote(marker)
     )
     receipt = json.loads(receipts(wrapper_env)[0].read_text())
     requested = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
-    effective = json.dumps([*args, "-m", marker], ensure_ascii=False,
-                           separators=(",", ":"))
+    effective = json.dumps(
+        [*args, "--run-level", "core_model", "-m", marker],
+        ensure_ascii=False, separators=(",", ":"))
     assert receipt["requested_argv_sha256"] == hashlib.sha256(requested.encode()).hexdigest()
     assert receipt["effective_argv_sha256"] == hashlib.sha256(effective.encode()).hexdigest()
     assert receipt["platform_marker_injected"] == "cuda"
+
+
+def test_explicit_run_level_is_paired_and_not_forced_to_core(
+    tmp_path, monkeypatch, wrapper_env
+):
+    configure_adapter(
+        tmp_path, wrapper_env, monkeypatch, {"module_test_platform": "cuda"}
+    )
+    observed = {}
+
+    class CapturingRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, job, env):
+            observed["job"] = job
+            return Outcome(rc=0)
+
+    monkeypatch.setattr(module_pytest, "TestRunner", CapturingRunner)
+    args = ["-vv", "--run-level", "advanced_model", "tests/entrypoints/"]
+    assert module_pytest.main(args) == 0
+    marker = "(cuda or (not musa and not npu and not rocm and not xpu)) and advanced_model"
+    assert observed["job"].command == (
+        "python -m pytest -vv --run-level advanced_model tests/entrypoints/ -m "
+        + shlex.quote(marker)
+    )
 
 
 def test_explicit_marker_and_command_mode_are_not_rewritten(

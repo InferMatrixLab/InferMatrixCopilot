@@ -134,9 +134,31 @@ class Executor:
                 stack.enter_context(governed(governor_for(self.settings, ledger_dir_for(self.settings))))
             return await self._run_steps(playbook, state)
 
+    def _drop_from(self, playbook: "Playbook", progress: dict,
+                   step_id: str) -> str:
+        """Operator `--rerun-from`: forget `step_id` and every later step so
+        they execute again. Returns an error string for an unknown id."""
+        ids = [s.id for s in playbook.steps]
+        if step_id not in ids:
+            return (f"--rerun-from: step '{step_id}' is not in playbook "
+                    f"'{playbook.name}'")
+        later = ids[ids.index(step_id):]
+        dropped = [i for i in later if i in progress["completed"]]
+        for i in dropped:
+            del progress["completed"][i]
+        self._save_progress(progress)
+        self.trace.record("rerun_from", step=step_id, dropped=dropped)
+        return ""
+
     async def _run_steps(self, playbook: "Playbook", state: dict) -> RunOutcome:
         progress = self._load_progress()
         outcome = RunOutcome(status="done")
+        if state.get("rerun_from"):
+            error = self._drop_from(playbook, progress, state["rerun_from"])
+            if error:
+                outcome.status = "blocked"
+                outcome.blocked_reason = error
+                return outcome
         state.setdefault("playbook", playbook.name)
         # Run-scoped params (CLI `--task-param`, or intent-derived) reach every
         # step. Without this a step's `ctx.params.get(...)` only ever saw the

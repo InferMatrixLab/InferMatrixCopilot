@@ -58,7 +58,7 @@ def test_explicit_resume_selects_release_despite_unrelated_newer_run(resume_cont
     assert len(calls) == 1
     assert calls[0][2] == release
     assert calls[0][1].params["force_upstream_commit"] == RELEASE_COMMIT
-    assert calls[0][3] == {"resuming": True}
+    assert calls[0][3] == {"resuming": True, "rerun_from": ""}
 
 
 def test_bare_resume_still_selects_latest(resume_context):
@@ -180,4 +180,28 @@ def test_cli_forwards_run_selection_and_identity_assertions(
     assert calls == [((selected,), {"repo": "vllm-omni",
                                    "playbook": "repo-rebase-v3",
                                    "params": {"force_upstream_commit": RELEASE_COMMIT,
-                                              "retry_limit": 1}})]
+                                              "retry_limit": 1},
+                                   "rerun_from": ""})]
+
+
+def test_cli_forwards_rerun_from_only_with_resume(tmp_path, monkeypatch, capsys):
+    calls = []
+    fake = SimpleNamespace(resume_last=lambda *args, **kwargs: calls.append(
+        (args, kwargs)) or 0)
+    monkeypatch.setattr(entry, "Copilot", lambda: fake)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("IMX_INVOCATION_ID", raising=False)
+
+    assert entry.main(["--resume", RELEASE_RUN, "--rerun-from", "wave1"]) == 0
+    assert calls[0][1]["rerun_from"] == "wave1"
+    with pytest.raises(SystemExit):
+        entry.main(["--playbook", "repo-rebase-v3", "--rerun-from", "wave1"])
+    assert "--rerun-from requires --resume" in capsys.readouterr().err
+
+
+def test_resume_passes_rerun_from_to_execution(resume_context):
+    copilot, calls = resume_context
+    _save_run(copilot.settings.run_root, RELEASE_RUN)
+
+    assert copilot.resume_last(RELEASE_RUN, rerun_from="wave1") == 0
+    assert calls[0][3]["rerun_from"] == "wave1"

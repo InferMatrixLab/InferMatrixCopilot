@@ -331,6 +331,10 @@ rebase:
     # The wrapper refuses a TEST_TIMEOUT_SEC above this cap; it must not be
     # lower than the planned budget above or every required command is refused.
     module_max_timeout_sec: 21600
+    # Ready's CPU "Simple" steps budget 20 minutes for CI agents. On the shared
+    # rebase host the same serial commands passed 53-88% of their items with
+    # zero failures before that budget expired (run-20261028-152707-a60091).
+    local_timeout_multiplier: 3
     # Phase-2 module agents run on the CUDA wheel/runtime above. Broad pytest
     # paths must retain CUDA-capable and platform-neutral items while leaving
     # NPU/ROCm/XPU/MUSA-only items to their native CI lanes.

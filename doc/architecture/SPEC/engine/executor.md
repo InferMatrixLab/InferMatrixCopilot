@@ -1,6 +1,6 @@
 # engine/executor.py —— 规范
 
-<!-- verified-against: 2026-10-04 -->
+<!-- verified-against: 2026-10-29 -->
 
 `LOC ~293 · 引擎底座（那个循环） · refactor-status: ok`
 
@@ -34,6 +34,9 @@ helper：`_eval_when`、`_merge`。
   step 自己的 params **之下**，所以 `--task-param limit=5` 不会被静默丢弃。
   **playbook 自己的 params 在合并中获胜** —— 其中好几个是安全攸关的
   （`force_push`、`pre_push`），因此被撰写下来的不变量**不得**被命令行覆盖。
+- **`state["rerun_from"]`**（操作者 `--resume --rerun-from <step id>`）：开跑前从
+  progress.json 删掉该 step 及其后所有 step 的检查点并落盘，记 `rerun_from` trace；
+  未知 step id → BLOCKED，检查点不动。之前的 step 照常重放。
 - step 的 span 会记录 playbook 的 step id 和 foreach 条目键：同一个 spec 可能在一个
   playbook 里跑两次、还会再扇出，所以**光靠 `step` 无法标识这份工作**。
 

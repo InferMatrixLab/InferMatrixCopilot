@@ -264,7 +264,8 @@ class Copilot:
     def _execute(self, playbook, spec: TaskSpec, run_dir: Path, *,
                  resolution_mode: str = "resume", tier: str = "?",
                  resuming: bool = False, held_lock: RunLock | None = None,
-                 planned_context: RepositoryContext | None = None) -> int:
+                 planned_context: RepositoryContext | None = None,
+                 rerun_from: str = "") -> int:
         """Compatibility entry point; application keeps the last-run summary."""
         self.last_run_dir = run_dir
         self.last_blocked_reason = ""
@@ -272,6 +273,7 @@ class Copilot:
             playbook, spec, run_dir, resolution_mode=resolution_mode,
             tier=tier, resuming=resuming, held_lock=held_lock,
             planned_context=planned_context, llm=self.llm,
+            rerun_from=rerun_from,
         )
         self.last_blocked_reason = result.blocked_reason
         return result.exit_code
@@ -294,12 +296,14 @@ class Copilot:
         return 0
 
     def resume_last(self, run_id: str = "", *, repo: str = "",
-                    playbook: str = "", params: dict | None = None) -> int:
+                    playbook: str = "", params: dict | None = None,
+                    rerun_from: str = "") -> int:
         """Resume a selected run, or the latest run when no id is supplied.
 
         Target arguments are assertions against the saved task, never edits to
         it. Release launchers can therefore bind resume to an immutable campaign
-        without accidentally entering a newer, unrelated task.
+        without accidentally entering a newer, unrelated task. `rerun_from`
+        re-executes that playbook step and everything after it.
         """
         if run_id:
             try:
@@ -348,7 +352,8 @@ class Copilot:
                 print(style("✋ cannot resume: ", "red", "bold") + str(exc))
                 return BLOCKED_EXIT
             print(f"↻ resuming {run_dir.name}: {spec.describe()}")
-            return self._execute(saved_playbook, spec, run_dir, resuming=True)
+            return self._execute(saved_playbook, spec, run_dir, resuming=True,
+                                 rerun_from=rerun_from)
         print("no resumable run found")
         return 1
 
