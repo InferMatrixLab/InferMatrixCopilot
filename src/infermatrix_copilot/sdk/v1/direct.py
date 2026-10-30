@@ -7,8 +7,9 @@ import importlib.metadata
 import json
 import re
 import threading
+import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -126,6 +127,8 @@ class _IssuedContext:
     carried_findings: tuple[dict, ...] = ()
     knowledge_view: Any = None
     knowledge_usage: dict | None = None
+    task_id: str = ""
+    repository: str = ""
 
 
 class DirectClient:
@@ -169,6 +172,46 @@ class DirectClient:
 
     def capabilities(self) -> Capabilities:
         return get_capabilities()
+
+    @staticmethod
+    def _feedback(view, task_id: str, repository: str, documents: list[dict]) -> dict:
+        import sqlite3
+
+        from ...knowledge_service.agreement import AgreementStore
+        from ...knowledge_service.feedback import KnowledgeFeedbackStore
+
+        if AgreementStore.from_env().status()["status"] != "accepted":
+            return {"status": "agreement_required", "protocol": "knowledge-feedback/1", "targets": []}
+
+        try:
+            return KnowledgeFeedbackStore.from_env().issue_delivery(
+                task_id=task_id, repository=repository, view=view, documents=documents)
+        except (OSError, sqlite3.Error):
+            return {"status": "unavailable", "error": "feedback_storage_unavailable"}
+
+    def _task_repository(self, view, task_id: str) -> str | None:
+        """Reuse the task's delivery context, including across client restarts."""
+        import sqlite3
+
+        from ...direct_routing import _normalize_repo
+        from ...knowledge_service.feedback import KnowledgeFeedbackStore
+
+        with self._context_lock:
+            repositories = {issued.repository for issued in self._issued_contexts.values()
+                            if issued.task_id == task_id and issued.repository}
+        unavailable = False
+        try:
+            repositories.update(KnowledgeFeedbackStore.from_env().repositories_for_task(task_id))
+        except (OSError, sqlite3.Error):
+            # Feedback is optional. A failed lookup must not expose private paths
+            # or prevent delivering source when storage is unavailable.
+            unavailable = True
+        canonical = {_normalize_repo(repository, view) for repository in repositories}
+        if len(canonical) > 1:
+            raise InvalidRequestError(
+                "task_id has multiple repository contexts; supply repository or review_context_id"
+            )
+        return next(iter(canonical), None if unavailable else "")
 
     def _document_path(self, document_id: str, view=None) -> Path:
         view = view if view is not None else self._view()
@@ -228,13 +271,18 @@ class DirectClient:
         offset: int = 0,
         max_bytes: int = _EXCERPT_BYTES,
         review_context_id: str = "",
+        task_id: str = "",
+        repository: str = "",
     ) -> DocumentPage:
         """Read one knowledge document page.
 
         With ``review_context_id`` the read (and every later page of it) comes
         from the knowledge tree that review's plan was issued from, so a snapshot
         activated mid-review cannot change what the reviewer reads. Without it,
-        the currently active tree is used.
+        the currently active tree is used. An explicit ``task_id`` reuses its
+        existing repository context for feedback. Before any plan has bound a
+        task, general documents require ``repository`` to avoid inventing a
+        second knowledge identity under the generic repository name.
         """
         if offset < 0 or max_bytes < 1 or max_bytes > _EXCERPT_BYTES:
             raise InvalidRequestError(
@@ -268,10 +316,48 @@ class DirectClient:
         session = issued.knowledge_usage.get("delivery_session") if context_id and issued.knowledge_usage else None
         if configuration()["enabled"] and not session:
             raise ContainmentError("enforced Direct document reads require a bound review delivery session")
+        from ...direct_routing import _normalize_repo
+
+        if not isinstance(repository, str):
+            raise InvalidRequestError("repository must be a string")
+        explicit_repository = _normalize_repo(repository, view) if repository.strip() else ""
+        if explicit_repository and explicit_repository != "general":
+            from ...kb_service.repo_spec import resolve_snapshot_repo
+
+            if resolve_snapshot_repo(view, explicit_repository) is None:
+                raise UnsupportedRepositoryError("repository must identify served knowledge")
+        if context_id:
+            bound_repository = issued.repository
+            if explicit_repository and explicit_repository != bound_repository:
+                raise InvalidRequestError("repository does not match review_context_id")
+        else:
+            from ...knowledge_service.agreement import AgreementStore
+
+            agreement_accepted = AgreementStore.from_env().status()["status"] == "accepted"
+            bound_repository = (self._task_repository(view, task_id)
+                                if agreement_accepted and task_id and not explicit_repository else "")
+        feedback_unavailable = bound_repository is None
+        repository = explicit_repository or bound_repository
+        if not repository:
+            if document_id.startswith("repos/"):
+                repository = _normalize_repo(document_id.split("/")[1], view)
+            elif task_id and not feedback_unavailable and (context_id or agreement_accepted):
+                raise InvalidRequestError(
+                    "general document reads with task_id require repository or an existing review context"
+                )
+            else:
+                repository = "general"
+        feedback = ({"status": "unavailable", "error": "feedback_storage_unavailable"}
+                    if feedback_unavailable else self._feedback(
+                        view, (issued.task_id if context_id else "") or task_id or f"task-{uuid.uuid4().hex}",
+                        repository, ([{"path": document_id, "content": result.content}]
+                                     if PurePosixPath(document_id).suffix.casefold() == ".md" else [])))
+        result = replace(result, knowledge_feedback=feedback)
         _issue_usage(result.to_dict(), view=view, session_id=session)
         return result
 
-    def _request_values(self, request: DirectReviewRequest, *, allow_sha256: bool = False) -> tuple[str, list[str]]:
+    def _request_values(self, request: DirectReviewRequest, *, allow_sha256: bool = False,
+                        view=None) -> tuple[str, list[str]]:
         alias = request.repository.alias.strip()
         if not request.review_id.strip():
             raise InvalidRequestError("review_id must not be empty")
@@ -279,10 +365,12 @@ class DirectClient:
             raise InvalidRequestError("pr_number must be >= 0")
         if not alias:
             raise InvalidRequestError("repository alias must not be empty")
-        from ...kb_service.repo_spec import resolve_snapshot_repo
-        binding = resolve_snapshot_repo(self._view(), alias)
+        view = view if view is not None else self._view()
+        from ...direct_routing import _normalize_repo
+        from ...kb_service.repo_spec import list_snapshot_repos, resolve_snapshot_repo
+        binding = resolve_snapshot_repo(view, alias)
         if binding is None and alias.replace("_", "-").casefold() not in {
-            item.casefold() for item in self.capabilities().supported_repositories
+            item.repo_id.casefold() for item in list_snapshot_repos(view)
         }:
             raise UnsupportedRepositoryError(f"unsupported repository: {alias!r}")
         head = request.expected_head_sha.strip()
@@ -300,14 +388,14 @@ class DirectClient:
                     f"changed path must be repository-relative: {item.path!r}"
                 )
             changed_files.append(path.as_posix())
-        return alias, changed_files
+        return _normalize_repo(alias, view), changed_files
 
     @with_containment
     def open_knowledge_context(self, request: DirectReviewRequest, *, budget=None) -> dict:
         """Opt into the cumulative adaptive protocol; the v1 plan stays unchanged."""
         from ...knowledge_context import KnowledgeContextService
-        alias, _ = self._request_values(request, allow_sha256=True)
         view = self._view()
+        alias, _ = self._request_values(request, allow_sha256=True, view=view)
         service = KnowledgeContextService(view, self._knowledge_context_path,
                                           allowed_repositories=self._allowed_knowledge_repositories,
                                           knowledge_maintenance=self._knowledge_maintenance)
@@ -345,9 +433,9 @@ class DirectClient:
     def plan_adaptive(self, request: DirectReviewRequest, *, budget=None) -> dict:
         """Return one budgeted model packet, with references instead of SDK excerpts."""
         from ...direct_routing import direct_review_plan
-        alias, changed = self._request_values(request, allow_sha256=True)
         status = self.open_knowledge_context(request, budget=budget)
         service, session_id = self._knowledge_context(status["session_id"]), status["session_id"]
+        alias, changed = self._request_values(request, allow_sha256=True, view=service.view)
         raw = direct_review_plan(alias, title=request.title, body=request.body,
                                  changed_files=changed, diff=request.diff, view=service.view)
         routes = [{"path": service.view.relative(row["path"]), "kind": "direct_map"}
@@ -370,9 +458,14 @@ class DirectClient:
                 "progress_update": raw["progress_update"], "completion_gate": raw["completion_gate"],
                 "guidance": related.get("guidance", ""),
                 "truncated": guide_packet["truncated"] or related["truncated"]}
+        from ...knowledge_service.feedback import model_content_documents
+
+        packet["knowledge_feedback"] = self._feedback(
+            service.view, request.review_id, alias, model_content_documents(content))
         usage = _issue_usage(packet, view=service.view, session_id=session_id)
         self._remember_context(context_id, request.expected_head_sha.casefold(),
-                               tuple(row.to_dict() for row in request.carried_findings), service.view, usage)
+                               tuple(row.to_dict() for row in request.carried_findings), service.view, usage,
+                               task_id=request.review_id, repository=alias)
         return packet
 
     def read_knowledge_context(self, session_id: str, document_id: str, *, offset: int = 0,
@@ -391,8 +484,11 @@ class DirectClient:
 
     def _remember_context(
         self, context_id: str, expected_head_sha: str, carried=(), view=None, usage=None,
+        *, task_id: str = "", repository: str = "",
     ) -> None:
         view = view if view is not None else self._view()
+        from ...direct_routing import _normalize_repo
+        repository = _normalize_repo(repository, view) if repository else ""
         with self._context_lock:
             self._issued_contexts[context_id] = _IssuedContext(
                 expected_head_sha=expected_head_sha,
@@ -400,6 +496,8 @@ class DirectClient:
                 carried_findings=tuple(carried),
                 knowledge_view=view,
                 knowledge_usage=usage,
+                task_id=task_id,
+                repository=repository,
             )
             self._issued_contexts.move_to_end(context_id)
             while len(self._issued_contexts) > self._max_issued_contexts:
@@ -415,9 +513,9 @@ class DirectClient:
 
         carried = tuple(item.to_dict() for item in request.carried_findings)
         validate_carried(carried)
-        alias, changed_files = self._request_values(request)
-        expected_head = request.expected_head_sha.strip().casefold()
         view = self._view()
+        alias, changed_files = self._request_values(request, view=view)
+        expected_head = request.expected_head_sha.strip().casefold()
         revision = self._revision(view.root)
         raw = direct_review_plan(
             alias,
@@ -506,8 +604,16 @@ class DirectClient:
             untested_public_api=dict(raw.get("untested_public_api") or {}),
             related_knowledge=related,
         )
+        references = [plan.knowledge_entry, *plan.mandatory_review_guides, *plan.document_maps,
+                      *(route.document for route in plan.knowledge_routes)]
+        documents = [{"path": ref.document_id, "content": ref.excerpt} for ref in references]
+        documents.extend({"path": row["document"]["document_id"],
+                          "content": row["document"]["excerpt"]}
+                         for row in related.get("documents", []) if row.get("document"))
+        plan = replace(plan, knowledge_feedback=self._feedback(view, request.review_id, alias, documents))
         usage = _issue_usage(plan.to_dict(), view=view, session_id=review_context_id.removeprefix("sha256:"))
-        self._remember_context(review_context_id, expected_head, carried, view, usage)
+        self._remember_context(review_context_id, expected_head, carried, view, usage,
+                               task_id=request.review_id, repository=alias)
         return plan
 
     @with_containment

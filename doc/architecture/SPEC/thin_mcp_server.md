@@ -1,6 +1,6 @@
 # thin_mcp_server.py —— 规范
 
-<!-- verified-against: 2026-10-16 -->
+<!-- verified-against: 2026-10-29 -->
 
 `LOC ~490 · 默认 MCP：Direct 门面 + Strict 入口 · refactor-status: ok`
 
@@ -10,7 +10,7 @@
 同时通过 RFC SDK 委托已配置工作区的草稿、纳管、进度与人工决策操作。
 
 ## 功能
-十五个工具：`review`（按 `mode` 分流）、`validate_direct_review`、
+工具包括：`review`（按 `mode` 分流）、`validate_direct_review`、
 `get_review_status` / `get_review_result`（转发给 `CopilotMCP`）、
 `update_knowledge`、`doc_search`、`doc_read`，显式自适应会话
 `open_knowledge_context` / `read_knowledge_context` / `search_knowledge_context` /
@@ -18,7 +18,7 @@
 `rfc_request`、`rfc_capabilities`、`rfc_status`。
 
 ## 公开契约
-上述十五个工具；`build_mcp(...)`；`main()`。`review(knowledge_profile="adaptive")`
+上述工具；`build_mcp(...)`；`main()`。`review(knowledge_profile="adaptive")`
 返回单一实际 `model_content` 和不重复正文的引用；默认 `legacy` 保持旧契约。
 会话工具累积预算，跨仓库目标只在主机授权与 confirmed 固定依赖同时成立时可读；
 模型不能通过工具参数扩大权限。模型容量与源码/输出留白是明确配置，非探测结果。
@@ -31,6 +31,41 @@ RFC 工具签名为 `rfc_request(action, payload=None)`、`rfc_capabilities()`�
 `rfc_request` 同样转发 `chat.*`、`rfcs.work` 的人工实现记录，以及 `rfcs.graph` 的
 可逆节点分组。聊天调用先返回任务 ID，完整候选需通过 preview/apply 明确确认；
 本门面不执行模型工具循环，也不能自行通过验收或修改授权。
+
+Task completion exposes `knowledge_agreement(action="status"|"show"|"revoke")`
+through the lazy agreement SDK. It has no accept action, signer, attestation,
+credential or endpoint argument. Because revoke changes private local state, the
+tool declares `readOnlyHint=false`, `openWorldHint=false`. Status/show do not
+create acceptance; only the human interactive CLI can accept actual terms.
+
+Task completion also exposes `knowledge_learning(action, task_id, repo,
+source_pin, lessons, packet_digest, proposals)`, `knowledge_feedback(task_id,
+delivery_id, ratings)`, read-only `knowledge_feedback_report(repo, limit, scope)`
+and `knowledge_feedback_sync(action="flush"|"status", limit=100)`.
+Installed skills and server instructions FIRST check agreement status before
+extra learning tokens, distillation, grading or uploads. Default missing/revoked/
+renewal-required/unavailable agreement means skip optional work and finish the
+requested task; offer the actual terms and human signing command once, without
+repeated per-task reminders. The host may never accept for the user. After
+acceptance, the host model distills locally; the server never imports a transcript
+or calls another model. Triggering is before the final task response, not during
+progress/status turns. Publication requires current acknowledgement, configured
+local or draft-PR mode and both write flags; it never merges. Operator settings
+are not consent. Mutating tools declare truthful annotations. Feedback
+recording/reporting/sync can contact the configured collector and declare
+open-world access. Local persistence precedes upload; failed uploads stay
+pending. Report scope auto uses central when configured and never silently
+falls back to local on remote failure. Sync status makes no network request.
+Neither a destination nor a credential is accepted through tool arguments.
+
+With current agreement, legacy review, doc reads/searches and adaptive packets return
+independent `knowledge_feedback` receipts even with containment disabled. Without
+agreement, feedback metadata reports `agreement_required` and empty targets with
+no delivery ID, while source content remains available. Optional
+`task_id` on legacy review/read/search groups follow-up deliveries. Actual
+delivery does not imply use: grades require a delivered target, explicit
+`used=true`, integer -1/+1, reason and observed evidence. Feedback is private
+runtime state, separate from containment and semantic knowledge approval.
 
 ## 不变量（**C1**、**C2**、**D1**）
 - **Direct 在这个 server 里不跑任何模型。** 它返回知识路由和一份治理契约；阅读由

@@ -72,4 +72,16 @@ fix direction. Use the knowledge rules to discover and verify findings, but do
 not expose rule IDs, coverage tables, matrices, or PASS/MISSING_EVIDENCE rows
 unless the user explicitly asks for the full audit artifact. If there are no
 findings, say so briefly and name any material validation gap. Do not post or
-edit unless explicitly asked.
+edit target-repository artifacts unless explicitly asked.
+
+
+## Task completion learning
+
+Before your final task response, FIRST call `knowledge_agreement(action="status")`.
+Only `status="accepted"` permits [task completion learning](../imlearn/references/task-completion.md)
+to distill lessons, grade knowledge or upload feedback. Otherwise skip learning,
+finish the requested task, and offer the actual agreement and human signing
+command once without per-task reminders. Never sign for the user. Accepted
+agreement and configured publication/write gates are both required; operator
+configuration is not consent. This does not authorize publishing the task's code,
+comments or RFC.

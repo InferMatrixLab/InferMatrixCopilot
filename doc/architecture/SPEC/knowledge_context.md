@@ -1,6 +1,6 @@
 # knowledge_context.py —— 规范
 
-<!-- verified-against: 2026-10-08 -->
+<!-- verified-against: 2026-10-29 -->
 
 ## 职责与公开契约
 
@@ -8,6 +8,27 @@
 `ContextBudget` 声明模型窗口与留白；`ContextError` 拒绝身份、权限或预算不一致。
 `open_session` / `status` / `expand` 管理会话；`related` / `search` / `read` / `inject`
 返回同一累计预算下的实际正文和引用。服务不调用模型、不改知识页、不宣称评审准确率。
+
+With current human agreement, a delivery additionally issues a `knowledge_feedback`
+receipt for the exact post-budget fragments, using the session's review ID as task identity. Cached
+requests retain a successfully issued receipt. After a transient storage failure,
+a cached retry can repair feedback metadata from the exact saved model content,
+after the original integrity and availability checks. The cache digest is updated
+without rerunning retrieval, spending tokens or changing delivered source content.
+Storage failures expose only `feedback_storage_unavailable`, never raw exceptions.
+Prior containment receipts remain valid while the updated packet gets its own
+issuance record. No omitted sibling rule becomes eligible from
+another fragment of its page. Feedback state is outside the knowledge tree and
+works independently of optional signed containment. Neither issuance nor a
+retrieval increments positive/negative counts; an evidenced use rating does.
+
+Learning and feedback are disabled by default. Without current acceptance,
+feedback metadata is `{status: "agreement_required", targets: []}` with no delivery
+ID, and the source delivery remains available. Cached deliveries recheck agreement;
+old receipts do not permit grading or uploads after revocation. Host contracts
+check status before extra distillation/grading tokens. Agreement version or
+destination changes require human renewal, independent of containment and context
+budget. Local status/reports and source reads do not require acceptance.
 
 ## 身份与权限
 

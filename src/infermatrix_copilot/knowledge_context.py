@@ -217,6 +217,18 @@ class KnowledgeContextService:
                 _issue_usage(result, view=self.view, session_id=session_id)
             return result
 
+    def _feedback_receipt(self, task_id: str, repository: str, documents: list[dict]) -> dict:
+        from .knowledge_service.agreement import AgreementStore
+        from .knowledge_service.feedback import KnowledgeFeedbackStore
+
+        if AgreementStore.from_env().status()["status"] != "accepted":
+            return {"status": "agreement_required", "protocol": "knowledge-feedback/1", "targets": []}
+        try:
+            return KnowledgeFeedbackStore.from_env().issue_delivery(
+                task_id=task_id, repository=repository, view=self.view, documents=documents)
+        except (OSError, sqlite3.Error):
+            return {"status": "unavailable", "error": "feedback_storage_unavailable"}
+
     def _deliver_current(self, session_id: str, request: dict, build: Callable) -> dict:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -239,9 +251,30 @@ class KnowledgeContextService:
                     raise ContextError("cached context receipt/content integrity check failed")
                 for reference in result["documents"]:
                     self.view.path(reference["path"])
+                from .knowledge_service.agreement import AgreementStore
+
+                feedback = result.get("knowledge_feedback", {})
+                if AgreementStore.from_env().status()["status"] != "accepted":
+                    feedback = {"status": "agreement_required", "protocol": "knowledge-feedback/1", "targets": []}
+                elif feedback.get("status") in {"unavailable", "agreement_required"}:
+                    from .knowledge_service.feedback import model_content_documents
+
+                    # Repair only delivery metadata after the original packet
+                    # passes integrity checks. Replaying retrieval could spend
+                    # budget again or grant targets that were never delivered.
+                    feedback = self._feedback_receipt(
+                        state["identity"]["review_id"], binding["repo_id"],
+                        model_content_documents(content))
+                if feedback != result.get("knowledge_feedback", {}):
+                    result = {**result, "knowledge_feedback": feedback}
+                    state["requests"][key] = {"request": request, "result": result,
+                        "receipt_sha256": _digest({"session_id": session_id, "request": request,
+                                                  "active_tokens": state["active_tokens"], "result": result})}
+                    self._save(db, session_id, state)
                 return result
             units, extra = build(docs)
             rendered, references, truncated = [], [], False
+            feedback_documents = []
             for unit in units:
                 budget_partial = False
                 content = unit.pop("content")
@@ -287,6 +320,7 @@ class KnowledgeContextService:
                 state["units"][unit_hash] = {"delivered_chars": previous["delivered_chars"] + len(content),
                                              "complete": not budget_partial}
                 references.append({**unit, "repo_id": binding["repo_id"], "content_sha256": hashlib.sha256(content.encode()).hexdigest()})
+                feedback_documents.append({"path": unit["path"], "content": content})
                 rendered.append(full)
                 if state["consumed_tokens"] >= state["active_tokens"]:
                     break
@@ -298,6 +332,8 @@ class KnowledgeContextService:
                       "remaining_tokens": state["active_tokens"] - state["consumed_tokens"],
                       "token_accounting": self.tokenizer_id, "actual_provider_usage": "unknown", **extra}
             result["model_content_sha256"] = hashlib.sha256(result["model_content"].encode()).hexdigest()
+            result["knowledge_feedback"] = self._feedback_receipt(
+                state["identity"]["review_id"], binding["repo_id"], feedback_documents)
             if request["op"] == "read" and references and references[-1].get("partial"):
                 result["next_offset"] = request["offset"] + state["units"][unit_hash]["delivered_chars"]
             state["requests"][key] = {"request": request, "result": result,

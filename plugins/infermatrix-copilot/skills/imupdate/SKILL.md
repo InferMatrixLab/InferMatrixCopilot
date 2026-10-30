@@ -68,8 +68,9 @@ When the argument is not a local path, use the host model to resolve it:
    Read the relevant upstream diff before changing InferMatrixCopilot.
 4. Update only facts proven by the report and source: the release baseline,
    model catalog, component source maps, pins, or adapter manifest. Never
-   generate or rewrite owner rules automatically; report semantic-rule
-   candidates for human review.
+   generate or rewrite owner rules automatically as part of the structural update. Send
+   reusable semantic lessons through the separate task completion learning
+   workflow and its reviewable knowledge contribution.
 5. When machine audit is available, run the same command with `--mode enforce`,
    then run:
 
@@ -87,3 +88,15 @@ When the argument is not a local path, use the host model to resolve it:
 
 The audit is evidence collection, not the updater. Codex performs the bounded
 knowledge edits and must not commit, push, or open a PR unless asked.
+
+
+## Task completion learning
+
+Before your final task response, FIRST call `knowledge_agreement(action="status")`.
+Only `status="accepted"` permits [task completion learning](../imlearn/references/task-completion.md)
+to distill lessons, grade knowledge or upload feedback. Otherwise skip learning,
+finish the requested task, and offer the actual agreement and human signing
+command once without per-task reminders. Never sign for the user. Accepted
+agreement and configured publication/write gates are both required; operator
+configuration is not consent. This does not authorize publishing the task's code,
+comments or RFC.

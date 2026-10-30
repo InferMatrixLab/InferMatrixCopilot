@@ -239,6 +239,25 @@ main/分支构建。如果 main 构建早于刚合入的改动，还要追溯该
 
 ## 快速上手 3 · 更新知识库
 
+任务学习和知识评分**默认关闭**，不影响正常读取知识。宿主先检查协议状态；
+只有本人在交互终端阅读实际条款、填写姓名并输入 `I AGREE` 后，才可从当前
+对话提炼正面/负面经验并为实际用过的知识记录带证据的 `-1` / `+1`。
+这会额外消耗宿主模型 token、时间和可能的额度；选取的摘要与证据仍可能含敏感信息。
+Agent、MCP、SDK 和发布配置都不能代替本人接受协议。
+
+```sh
+infermatrix-copilot learning agreement show
+infermatrix-copilot learning agreement accept   # 由本人在交互终端执行
+infermatrix-copilot learning agreement status
+infermatrix-copilot learning agreement revoke
+```
+
+接受后，安装的 Skill 在任务结束时触发学习，`imlearn` 也可手动补跑；知识 draft PR
+仍需配置目标及 push/post 闸，团队评分上传仍需独立配置 collector。
+条款版本或发布/collector 目标变化后需重新接受。撤销阻止后续门禁通过，但不删除
+已经保存或发出的内容，也不能保证中止进行中的操作；不会每个任务反复要求签署。
+配置、质量统计和接口见[任务学习指南](doc/guide/knowledge-learning.md)。
+
 上游发版或目录变化后，用 `imupdate` 把**结构事实**（模型清单、registry、
 deploy、路径路由、source pin）同步进知识库——只改 InferMatrixCopilot 的
 知识，不动目标仓库：

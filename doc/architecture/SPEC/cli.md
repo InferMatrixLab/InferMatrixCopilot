@@ -21,6 +21,22 @@ flag CLI 与 `Copilot` 门面：解析 → 过门 → 执行；并持有 run 目
   动作，零 LLM**，需 `--repo <name>`，支持 report-only；见 RUNBOOK）。
 - `rfc`：在主 argparse 解析前把其余 argv 原样交给 `rfc_service.cli.main`，
   与独立的 `infermatrix-rfc` 共用入口，不创建 Copilot run 或调用模型。
+- `learning` delegates to `knowledge_service.learning_cli.main` before general
+  parsing: agreement, prepare, submit, status, feedback, report, sync, sync-status. Bounded JSON file/stdin
+  inputs share SDK/MCP services; this path never constructs a model or Copilot.
+  `report --scope auto|local|central` selects the team aggregate when configured
+  by default. `sync --limit 100` retries durable uploads; `sync-status` is local
+  inspection. `infermatrix-feedback` independently starts the authenticated
+  collector via `knowledge_service.feedback_server_cli` without a model or MCP.
+- `learning agreement show|status|accept|revoke` delegates to `agreement_cli`
+  before the learning JSON parser. Show/status are side-effect-free inspection.
+  Accept requires a human TTY, displays the actual versioned terms and configured
+  destinations, and asks for a name plus exact `I AGREE`; no flags or pipes can
+  accept. Agents must not execute acceptance for the person. Prepare/submit,
+  grading and sync are off until current acceptance; task status, source reads
+  and explicit local reports remain available. Changed terms/destinations require
+  renewed acknowledgement. Revoke gates future operations, not already completed
+  or in-flight external effects. See [the learning guide](../../guide/knowledge-learning.md).
 
 ## 公开契约（可从 `infermatrix_copilot.cli` import）
 `main(argv)`；`Copilot`（`resolve`、`run_task`、`run_playbook`、`run_queue`、

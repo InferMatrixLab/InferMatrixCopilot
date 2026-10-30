@@ -1,6 +1,6 @@
 # sdk/ —— 规范
 
-<!-- verified-against: 2026-10-16 -->
+<!-- verified-against: 2026-10-29 -->
 
 
 `Python SDK v1 · 跨仓库唯一 typed 边界 · refactor-status: ok`
@@ -16,6 +16,49 @@
 `thin_mcp_server` 或其私有 helper。
 
 ## 公开契约
+
+- `KnowledgeAgreementClient.document/status/revoke` is the lazy inspection-only
+  agreement facade. It has no acceptance method, signer/attestation input or
+  endpoint override. Status/document do not create acceptance state. Named
+  acknowledgement is human-only through `learning agreement accept` in a TTY,
+  bound to current terms and configured publication/collector destinations.
+  Changed terms/destinations require renewal. Revoke gates future work without
+  deleting prior data or guaranteeing cancellation of in-flight operations.
+- `KnowledgeLearningClient.prepare/submit/status` and
+  `KnowledgeFeedbackClient.record/report/sync/sync_status` lazily delegate to the same durable
+  services as MCP and `learning` CLI. Importing either class does not open state,
+  resolve a workspace or initialize model credentials. Prepare/submit/record/sync
+  require agreement before creating their runtimes. Lesson distillation uses
+  extra host-model tokens/time and possible quota; it is off until accepted.
+  Publication additionally requires operator destination and write gates.
+- With current agreement, feedback records persist locally before optional configured central sync.
+  `report(scope="auto"|"local"|"central")` uses the team aggregate when
+  configured by default; central failures do not silently return local counts.
+  `sync(limit=100)` retries durable pending uploads and `sync_status()` inspects
+  the queue without a network request. Neither endpoint nor token is accepted
+  from model/tool input. An SDK `state_dir` override changes storage location
+  while retaining the operator's configured transport.
+  Task status, explicit local reports and sync status remain readable unsigned.
+  Central reports/uploads require current acceptance for the actual destination.
+- `DirectReviewPlan` and `DocumentPage` add `knowledge_feedback` receipts.
+  Plan receipts bind `review_id`; follow-up `read_document` uses that plan's task
+  identity, or explicit `task_id` for standalone reads. Receipts contain exact
+  delivered-version targets, not source text. Adaptive packets carry the same
+  receipt for only their actual model content. Existing containment issuance
+  binds the final returned packet including this metadata.
+  Unsigned/revoked/renewal-required delivery instead returns `agreement_required`
+  with empty targets and no delivery ID, without blocking the original source
+  read. A previously issued receipt cannot bypass the later grading/upload gate.
+- Feedback repositories are normalized against the pinned view before plan
+  issuance and follow-up context storage. `read_document(repository=...)` can
+  bind a standalone general-page read to its task's canonical repository;
+  an explicit task ID otherwise reuses an unambiguous prior delivery context,
+  including after client restart. A task with no known or multiple repository
+  contexts must supply a repository/context for general-page reads. Reads without
+  an explicit task ID retain standalone behavior. Existing receipts and votes
+  are immutable; canonicalization does not rewrite historical identities.
+  Optional feedback-storage failures return a fixed unavailable code and do not
+  prevent source delivery.
 
 `changes_preview()` / `changes_apply()` 绑定人工编辑的完整候选、版本、摘要及幂等键；
 未传 reason 时保留预览原因。`list_rfcs()` 支持可选服务端筛选与分页；`grants()`、

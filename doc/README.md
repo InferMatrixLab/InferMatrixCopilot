@@ -17,6 +17,7 @@
 | 文档 | 内容 |
 |---|---|
 | [`guide/backends.md`](guide/backends.md) | **后端**：五个 provider 怎么选、怎么配、权限如何保持（Strict） |
+| [`guide/knowledge-learning.md`](guide/knowledge-learning.md) | 任务完成时提炼正负经验、自动知识 draft PR 与实际使用质量评分 |
 | [`guide/hosts/`](guide/hosts/README.md) | **宿主端**：在 Codex / Claude Code / Cursor 里使用 copilot（Direct） |
 | [`guide/mcp.md`](guide/mcp.md) | MCP 安装与七个工具接口 |
 | [`guide/self-evolution.md`](guide/self-evolution.md) | 用自进化引擎改进评审、知识摄取与引擎自身 |

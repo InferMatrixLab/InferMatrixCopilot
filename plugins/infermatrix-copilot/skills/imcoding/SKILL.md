@@ -92,3 +92,15 @@ server-side coding workflow or a second model.
 Report what now works, the relevant files, checks actually run and their results,
 and any remaining limitation. Distinguish implemented behavior from verified
 behavior. Keep the handoff proportionate to the change.
+
+
+## Task completion learning
+
+Before your final task response, FIRST call `knowledge_agreement(action="status")`.
+Only `status="accepted"` permits [task completion learning](../imlearn/references/task-completion.md)
+to distill lessons, grade knowledge or upload feedback. Otherwise skip learning,
+finish the requested task, and offer the actual agreement and human signing
+command once without per-task reminders. Never sign for the user. Accepted
+agreement and configured publication/write gates are both required; operator
+configuration is not consent. This does not authorize publishing the task's code,
+comments or RFC.
