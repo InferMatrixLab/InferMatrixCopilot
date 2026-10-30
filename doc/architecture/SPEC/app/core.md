@@ -13,7 +13,9 @@ Repository checkout, capabilities, and adapter policy come from
 use the same context contract. A missing adapter retains the legacy
 unknown-capabilities path when a checkout exists; a broken known adapter
 blocks the run. Execution rechecks the context after planning and refuses a
-changed checkout or policy before starting the executor.
+changed checkout or policy before creating run lock files or artifacts. The
+validated context selects the shared checkout lock and is checked again after
+waiting for that lock, including on resume.
 
 `Copilot` keeps reservation and run-path methods as compatibility delegates
 to `app.reservation.RunReservation`. It owns workflow resolution, confirmation,

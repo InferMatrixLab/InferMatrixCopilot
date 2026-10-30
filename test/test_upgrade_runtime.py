@@ -234,7 +234,8 @@ def test_execution_keeps_rerun_checkpoint_and_releases_both_locks(
     monkeypatch.setattr("infermatrix_copilot.app.core.execution_lock", shared_lock)
     copilot = Copilot.__new__(Copilot)
     copilot.llm = None
-    copilot._repo_path_for = lambda spec: str(tmp_path / "checkout")
+    copilot.repository_context = SimpleNamespace(for_spec=lambda spec:
+        SimpleNamespace(repo_path=str(tmp_path / "checkout")))
     copilot.workflow_execution = SimpleNamespace(run=execute)
     spec = TaskSpec(kind="pr_review", repo="demo", pr=12)
     assert copilot._execute(None, spec, run, resuming=True, rerun_from="wave1") == 0

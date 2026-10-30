@@ -272,6 +272,19 @@ class Copilot:
         """Compatibility entry point; application keeps the last-run summary."""
         self.last_run_dir = run_dir
         self.last_blocked_reason = ""
+        # Resolve policy before creating lock files or run artifacts. The
+        # workflow rechecks it after locking in case it changed while queued.
+        try:
+            repo_context = self.repository_context.for_spec(spec)
+        except AdapterError as exc:
+            self.last_blocked_reason = f"repository context invalid: {exc}"
+            print(style("✋ ", "red", "bold") + self.last_blocked_reason)
+            return BLOCKED_EXIT
+        if planned_context is not None and repo_context != planned_context:
+            self.last_blocked_reason = "repository context changed after planning"
+            print(style("✋ ", "red", "bold") + self.last_blocked_reason)
+            return BLOCKED_EXIT
+        checkout = repo_context.repo_path or f"repo:{spec.repo}"
         # Always acquire the per-run lock before the shared checkout lock.
         # Reversing that order could deadlock an explicit resume against a
         # reserved child waiting for the same checkout.
@@ -282,17 +295,11 @@ class Copilot:
             print(style("✋ ", "red", "bold") + str(exc))
             return BLOCKED_EXIT
         try:
-            try:
-                checkout = self._repo_path_for(spec) or f"repo:{spec.repo}"
-            except AdapterError as exc:
-                self.last_blocked_reason = f"repository context invalid: {exc}"
-                print(style("✋ ", "red", "bold") + self.last_blocked_reason)
-                return BLOCKED_EXIT
             with execution_lock(checkout, spec.pr):
                 result = self.workflow_execution.run(
                     playbook, spec, run_dir, resolution_mode=resolution_mode,
                     tier=tier, resuming=resuming, held_lock=lock,
-                    planned_context=planned_context, llm=self.llm,
+                    planned_context=repo_context, llm=self.llm,
                     rerun_from=rerun_from,
                 )
         finally:
