@@ -132,7 +132,9 @@ harness 会话通过 MCP tool bridge 拿到同一套工具面，plan gate 在派
   `upstream_commit` 重新确保 scratch。
 - baseline venv（`ensure_baseline_venv`）：硬链接克隆 campaign venv 并换入
   baseline commit 的 wheel，让"omni main 对上次对齐的 wheel 是否也失败"可问；
-  任何失败返回 None，保留保守的回归判定。
+  使用发布 wheel（若配置 URL）或非 editable 安装，删除临时源码后再验证导入；
+  克隆的 console/activation 脚本通过原子替换改为 baseline 路径，不能写穿硬链接
+  修改 campaign。缓存复用也必须通过导入检查。任何失败返回 None，保留保守的回归判定。
 
 ## 操作者重跑与本地超时预算（2026-10-29）
 
