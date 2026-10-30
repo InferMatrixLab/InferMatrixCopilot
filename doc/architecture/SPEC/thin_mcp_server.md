@@ -1,6 +1,6 @@
 # thin_mcp_server.py —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~490 · 默认 MCP：Direct 门面 + Strict 入口 · refactor-status: ok`
 
@@ -15,7 +15,8 @@
 `update_knowledge`、`doc_search`、`doc_read`，显式自适应会话
 `open_knowledge_context` / `read_knowledge_context` / `search_knowledge_context` /
 `related_knowledge_context` / `expand_knowledge_context`，以及
-`rfc_request`、`rfc_capabilities`、`rfc_status`。
+`rfc_request`、`rfc_capabilities`、`rfc_status`，及版本化安装的
+`get_workflow` / `get_update_status`。
 
 ## 公开契约
 上述工具；`build_mcp(...)`；`main()`。`review(knowledge_profile="adaptive")`
@@ -117,8 +118,8 @@ runtime state, separate from containment and semantic knowledge approval.
   无注解工具逐次弹批准框，headless 下自动取消，见 #86）靠这些提示放行只读面：
   `review` 保留状态变更（预留 Strict run）与触网（Strict 子进程）；
   `rfc_request` 能写工作区与排队发布，因此 `readOnlyHint=false`、
-  `destructiveHint=true`、`idempotentHint=false`。其余十三个工具全部
-  `readOnlyHint=true`，相对于源码、知识内容和 forge 都只读；知识会话接口
+  `destructiveHint=true`、`idempotentHint=false`。工作流、升级状态、知识读取与
+  知识会话工具声明 `readOnlyHint=true`，相对于源码、知识内容和 forge 都只读；知识会话接口
   会写主机私有运行账本。RFC 能力与进度工具声明 `idempotentHint=true`。
   把一个会修改知识或源码的工具标成只读，比不标更糟。
   （要求 `mcp>=1.8`，注解类型自该版本起可用。）
@@ -137,7 +138,8 @@ Direct 路径里不调模型；不含 Strict 后台机器（`mcp_server.py`）�
 ## 依赖（允许）
 stdlib + `mcp` extra + `.direct_routing`（下划线别名 re-import）+
 `.adapters` + `.config` + `.intent.resolve_repo_alias` +
-`.knowledge_docs` + `.mcp_policy` + `.mcp_server` + 惰性导入 `.sdk.v1.rfc`。
+`.knowledge_docs` + `.mcp_policy` + `.mcp_server` + 惰性导入 `.sdk.v1.rfc`
+和 `.upgrade` / `.upgrade.workflows` / `.upgrade.runtime`。
 
 ## 测试
 `test_thin_mcp_server.py`（42 例，别名保持调用点不变）、`test_thin_mcp.py`、
@@ -162,3 +164,11 @@ RFC 工具签名、动作委托、工具注解及宿主身份：`test_rfc_integr
 Raw adaptive MCP responses are actual host-model context delivery. Initial plans and nonempty read/search/related follow-ups record `injected=True` using the privately issued exact packet; JSON-fenced source text is decoded for unit attribution. Metadata-only budget expansion does not claim injected content. All deliveries are bound to the same durable provider-private session, so final validation of the original plan receipt includes later follow-up pages and fails closed if any become held.
 
 With enforcement enabled, raw `doc_read` and `doc_search` additionally require the optional `knowledge_usage` parameter carrying the original plan receipt. They resolve its protected issuance and pinned view, then register actual delivered content in the same journal before returning an updated receipt. Omitting provenance fails closed; activating another snapshot does not switch an existing review's follow-up root. Raw legacy initial delivery records only its actual quickmap/background fragments as injected at the MCP return boundary. Internal SDK calls to the raw planner do not claim injection. Disabled tool signatures remain backward compatible through the optional parameter.
+
+## 2026-10-30 版本化工作流
+
+`get_workflow(skill_name, skill_protocol=1)` 返回当前进程 release 的完整宿主
+Skill 与物理引用路径；不兼容协议拒绝执行。写知识的工作流另外绑定可写的
+authoring checkout，不能修改安装制品。`get_update_status()` 仅读取当前、活动、
+待安装版本和升级状态，不下载、不启动 updater。贡献入口同时支持 wheel 内的
+`_runtime/doc/knowledge/`。升级与进程固定契约见 [upgrade.md](upgrade.md)。

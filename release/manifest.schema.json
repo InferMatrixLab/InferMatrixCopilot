@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Signed Copilot release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "release_id", "version", "commit", "channel", "sequence", "published_at", "requires_python", "min_launcher_version", "runtime_schema", "skill_protocol", "knowledge_formats", "artifacts"],
+  "properties": {
+    "schema": {"const": 1},
+    "release_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,127}$"},
+    "version": {"type": "string", "minLength": 1},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "channel": {"enum": ["stable", "preview"]},
+    "sequence": {"type": "integer", "minimum": 1},
+    "published_at": {"type": "string", "format": "date-time"},
+    "requires_python": {"type": "string", "minLength": 1},
+    "min_launcher_version": {"type": "integer", "minimum": 1},
+    "runtime_schema": {"const": 1},
+    "skill_protocol": {"const": 1},
+    "knowledge_formats": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "uniqueItems": true},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle", "wheel"],
+      "properties": {
+        "bundle": {
+          "type": "object", "additionalProperties": false,
+          "required": ["url", "sha256", "size"],
+          "properties": {
+            "url": {"type": "string", "pattern": "^https://", "format": "uri"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "size": {"type": "integer", "minimum": 1}
+          }
+        },
+        "wheel": {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^wheel/[A-Za-z0-9_.+\\-]+\\.whl$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    }
+  }
+}

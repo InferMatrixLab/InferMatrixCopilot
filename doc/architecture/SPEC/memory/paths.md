@@ -1,6 +1,6 @@
 # memory/paths.py —— 规范
 
-<!-- verified-against: 2026-08-25 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~262 · 记忆（可变知识位置的唯一解析器 + run/迁移锁） · refactor-status: ok`
 
@@ -21,7 +21,7 @@ checkpoint、backups、两把锁）。切换未激活 → 逐消费者的历史�
 `KnowledgeRunLock(.acquire_shared/.acquire_exclusive/.release)`。
 
 ## 不变量（**D4/E2**）
-- **切换未激活 = 字节恒等**：未列名仓库解析出的每个位置都与本模块存在前
+- **未托管且切换未激活 = 字节恒等**：未列名仓库解析出的每个位置都与本模块存在前
   各消费者用的完全一致（含每个 no-adapter 回退）—— 纯重构，由测试钉死。
   debug 三成员（`rebase_backend_db`/`shared_write_db`/`debug_read_layers`）
   刻意镜像历史的**逐消费者**接线，切换前必须继续互不相同。
@@ -58,3 +58,11 @@ stdlib（`os`/`dataclasses`/`pathlib`，`fcntl` 带 POSIX 守卫）；marker 验
 `_require_migration_marker` 是浓缩的 FTS 取证（每个分支对应一条评审发现）——
 保持"marker 的声明不是证据"这个立场，别为省事削弱任何一个探针。
 PR4d 全量切换落地后，逐消费者的三个 debug 成员应收敛并删掉分叉注释。
+
+## Managed installation paths (2026-10-30)
+
+When `COPILOT_RELEASE_ROOT` identifies a managed installation, immutable adapter
+stores remain read fallbacks. Learned debug-memory writes and repository-map
+caches use the stable per-repository state directory outside the release.
+Explicit knowledge-runtime cutover still validates its migration marker.
+Unmanaged installations retain the existing legacy-path contract.

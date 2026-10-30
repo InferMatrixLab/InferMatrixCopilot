@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
@@ -148,3 +149,32 @@ def test_workflow_execution_import_does_not_load_transports():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_checkout_change_while_waiting_for_execution_lock_blocks(
+    settings, tmp_path, monkeypatch,
+):
+    original = tmp_path / "original-checkout"
+    changed = tmp_path / "changed-checkout"
+    manifest = _adapter(settings, original)
+    copilot = Copilot(settings)
+    spec = TaskSpec(kind="repo_rebase", repo="vllm-omni")
+    run_dir = tmp_path / "run-context-changed-while-queued"
+
+    @contextmanager
+    def queued_checkout_lock(checkout, pr):
+        assert checkout == str(original)
+        # Another session updates the adapter while this run waits for the
+        # previous checkout's shared execution lock. Resumes have no planning
+        # context, so the validated lock context must become their assertion.
+        manifest.write_text(manifest.read_text().replace(str(original), str(changed)))
+        yield
+
+    monkeypatch.setattr("infermatrix_copilot.app.core.execution_lock", queued_checkout_lock)
+    code = copilot._execute(None, spec, run_dir, resuming=True)
+
+    assert code == BLOCKED_EXIT
+    assert copilot.last_blocked_reason == "repository context changed after planning"
+    assert not (run_dir / "run_trace.jsonl").exists()
+    with RunLock(run_dir):
+        pass

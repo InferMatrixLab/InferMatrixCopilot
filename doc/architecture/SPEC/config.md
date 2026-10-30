@@ -1,6 +1,6 @@
 # config.py —— 规范
 
-<!-- verified-against: 2026-10-27 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~658 · 配置 · refactor-status: oversized`
 
@@ -47,7 +47,7 @@ confirmed 依赖及源码/目录 pin 一同验证，空配置只允许当前仓�
   键一律排除，dotenv 读取 `interpolate=False`——manifest 路径永远不能把凭据拉进
   错误信息或日志；Settings 字段在重名时获胜（已体现进程 env 优先）。
 - **`imx_knowledge_runtime` 按仓库 fail-closed**：列出的仓库在 resolve 时校验
-  `MIGRATION_COMPLETE.json`，缺标记即失败；未列出的仓库保持 legacy 路径逐字节不变。
+  `MIGRATION_COMPLETE.json`，缺标记即失败；未托管安装中未列出的仓库保持 legacy 路径逐字节不变。
 - `github_token` 只服务 v3 远端 CI 推送的 **header 认证**（推送传输按设计禁用
   credential helper，绝不落共享凭据存储）。
 - **`STRICT_BACKEND` 在前面就被校验**，失败时列出合法集合。未知后端**绝不能**到达
@@ -111,3 +111,12 @@ debug harness 会话的墙钟预算，取代 `ModuleRunConfig.harness_timeout_s`
 ## 自主进化接入
 
 自主进化新增 `improve_evaluation_mode=objective`、`improve_promotion_mode=automatic`、`improve_evolve_model`；固定单模型，无需判官。总开关与周预算默认不变。
+
+## Managed installation home (2026-10-30)
+
+`INFERMATRIX_COPILOT_HOME` selects the stable user configuration, default run
+directory and memory database; it defaults to `~/.infermatrix-copilot`.
+The managed CLI can additionally select its existing authoring checkout's
+`.env` through `COPILOT_SOURCE_CONFIG`. Source configuration, managed user
+configuration, cwd overrides and process environment retain their precedence.
+Background upgrades never rewrite model credentials or repository bindings.

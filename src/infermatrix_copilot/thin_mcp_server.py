@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from .config import Settings
 
@@ -150,6 +151,7 @@ def _contributing_entry() -> str:
     tree, so an installed wheel still answers the tool.
     """
     for candidate in (_ROOT / "doc" / "knowledge" / "CONTRIBUTING.md",
+                      Path(__file__).resolve().parent / "_runtime" / "doc" / "knowledge" / "CONTRIBUTING.md",
                       KnowledgeView.current().root.parent / "doc" / "knowledge" / "CONTRIBUTING.md"):
         if candidate.is_file():
             return str(candidate.resolve())
@@ -344,6 +346,23 @@ def build_mcp(
             "uploads remain durable and can be retried with knowledge_feedback_sync."
         ),
     )
+
+    @mcp.tool(annotations=read_only)
+    def get_workflow(skill_name: str, skill_protocol: int = 1) -> dict:
+        """Read this server release's complete workflow for a stable host skill."""
+        from .upgrade.workflows import get_workflow as resolve_workflow
+
+        return _guard(lambda: resolve_workflow(skill_name, skill_protocol))
+
+    @mcp.tool(annotations=read_only)
+    def get_update_status() -> dict:
+        """Read installed, active, and running release status; never update."""
+        from .upgrade import UpdateManager
+        from .upgrade.runtime import current_release
+
+        result = UpdateManager().status()
+        result["running_release"] = current_release()["release_id"]
+        return result
 
     @mcp.tool(annotations=ToolAnnotations(
         title="Start a Direct or Strict review",

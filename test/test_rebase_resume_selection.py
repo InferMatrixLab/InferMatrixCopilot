@@ -169,7 +169,7 @@ def test_cli_forwards_run_selection_and_identity_assertions(
     calls = []
     fake = SimpleNamespace(resume_last=lambda *args, **kwargs: calls.append(
         (args, kwargs)) or 17)
-    monkeypatch.setattr(entry, "Copilot", lambda: fake)
+    monkeypatch.setattr("infermatrix_copilot.cli.copilot.Copilot", lambda: fake)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("IMX_INVOCATION_ID", raising=False)
 
@@ -188,7 +188,7 @@ def test_cli_forwards_rerun_from_only_with_resume(tmp_path, monkeypatch, capsys)
     calls = []
     fake = SimpleNamespace(resume_last=lambda *args, **kwargs: calls.append(
         (args, kwargs)) or 0)
-    monkeypatch.setattr(entry, "Copilot", lambda: fake)
+    monkeypatch.setattr("infermatrix_copilot.cli.copilot.Copilot", lambda: fake)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("IMX_INVOCATION_ID", raising=False)
 

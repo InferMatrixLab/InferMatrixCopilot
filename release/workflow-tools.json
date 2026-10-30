@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "tools": {
+    "audit_vllm_omni_release": {
+      "path": "tools/audit_vllm_omni_release.py",
+      "replace_commands": ["python <infermatrix-root>/tools/audit_vllm_omni_release.py"],
+      "workspace_options": {
+        "--project-root": ".",
+        "--knowledge-root": "knowledge",
+        "--baseline": "adapters/vllm_omni/release_baseline.yaml",
+        "--adapter-manifest": "adapters/vllm_omni/manifest.yaml"
+      }
+    },
+    "audit_knowledge_depth": {
+      "path": "tools/audit_knowledge_depth.py",
+      "replace_commands": ["PYTHONPATH=src python tools/audit_knowledge_depth.py"],
+      "workspace_options": {"--root": "."}
+    },
+    "audit_review_retrieval": {
+      "path": "tools/audit_review_retrieval.py",
+      "replace_commands": ["PYTHONPATH=src python tools/audit_review_retrieval.py"],
+      "workspace_options": {"--root": "."}
+    },
+    "check_knowledge_tree": {
+      "path": "knowledge/tools/check_knowledge_tree.py",
+      "replace_commands": ["python knowledge/tools/check_knowledge_tree.py"],
+      "bind_workspace_file": true
+    },
+    "check_wiki_lint": {
+      "path": "knowledge/tools/check_wiki_lint.py",
+      "replace_commands": ["python knowledge/tools/check_wiki_lint.py"],
+      "bind_workspace_file": true
+    }
+  }
+}

@@ -94,7 +94,7 @@ jobs:
           if "vllm-gr" not in caps.supported_repositories:
               sys.exit("installed SDK omits vLLM-GR review support")
           dist_version = importlib.metadata.version("infermatrix-copilot")
-          if not (__version__ == dist_version == caps.distribution_version == "0.2.0"):
+          if not (__version__ == dist_version == caps.distribution_version):
               sys.exit(
                   "version mismatch: "
                   f"module={__version__}, metadata={dist_version}, "
@@ -176,7 +176,7 @@ jobs:
               with StrictRuntime(settings_overrides={
                   "_env_file": None, "run_root": run_root,
               }) as strict:
-                  if strict.capabilities().distribution_version != "0.2.0":
+                  if strict.capabilities().distribution_version != dist_version:
                       sys.exit("Strict facade capabilities mismatch")
           print("packaged runtime data resolves via _resource_dir:",
                 ", ".join(_RESOURCE_MARKERS))
@@ -205,3 +205,21 @@ jobs:
           python knowledge/tools/check_wiki_lint.py
           python -m pytest -q knowledge/tools/test_check_knowledge_tree.py \
                     knowledge/tools/test_check_review_report.py
+
+  windows-upgrade:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install upgrade test dependencies
+        run: python -m pip install -e ".[dev,mcp,kb,updater]"
+      - name: Verify Windows file locks, launcher and upgrade persistence
+        run: >-
+          python -m pytest -q
+          test/test_upgrade_runtime.py
+          test/test_upgrade_bootstrap.py
+          test/test_upgrade_manager.py
+          test/test_upgrade_releases.py
+          test/test_upgrade_workflows.py

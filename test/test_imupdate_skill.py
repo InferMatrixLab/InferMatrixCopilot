@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 
@@ -25,14 +26,25 @@ def test_imupdate_skill_supports_three_input_modes() -> None:
     assert "generate or rewrite owner rules automatically" in text
 
 
-def test_installer_and_docs_expose_imupdate() -> None:
-    installer = (ROOT / "scripts" / "install_mcp.py").read_text(encoding="utf-8")
+def test_installer_and_docs_expose_imupdate(monkeypatch, tmp_path) -> None:
+    spec = importlib.util.spec_from_file_location("imupdate_installer", ROOT / "scripts/install_mcp.py")
+    installer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    command = ["python", "managed-launcher.pyz", "--home", str(tmp_path / ".infermatrix-copilot"), "mcp"]
+    for host, skills_root in (
+        ("codex", ".agents/skills"),
+        ("claude", ".claude/skills"),
+        ("cursor", ".cursor/skills"),
+        ("zcode", ".zcode/skills"),
+    ):
+        getattr(installer, "_install_" + host)(tmp_path, command, managed=True)
+        installed = tmp_path / skills_root / "imupdate"
+        text = (installed / "SKILL.md").read_text(encoding="utf-8")
+        assert 'get_workflow(skill_name="imupdate", skill_protocol=1)' in text
+        assert "name: imupdate" in text
+        assert (installed / "agents/openai.yaml").is_file()
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert "SKILLS_SOURCE" in installer
-    assert '_install_skills(config_root / ".agents" / "skills")' in installer
-    assert '_install_skills(config_root / ".claude" / "skills")' in installer
-    assert '_install_skills(cursor_root / "skills")' in installer
     assert "/imupdate /path/to/vllm-omni" in readme
     assert "$imupdate vllm-omni" in readme
     assert "$imdesign" in readme

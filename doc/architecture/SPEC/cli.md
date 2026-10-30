@@ -1,6 +1,6 @@
 # cli/ —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~1420（6 个文件） · 接口 + 编排门面 · refactor-status: ok`
 
@@ -93,7 +93,7 @@ flag CLI 与 `Copilot` 门面：解析 → 过门 → 执行；并持有 run 目
 ## 依赖（允许）
 `engine/*`、`playbooks/*`、`intent`、`task_spec`、`adapters/base`、`push`、
 `review/reviewer`、`notify`、`run_trace`、`config`、`ui`、`chat`。
-独立服务入口允许惰性委托 `kb_service.cli`、`rfc_service.cli`；服务自身的授权、
+独立服务入口允许惰性委托 `kb_service.cli`、`rfc_service.cli`、`upgrade.cli`；服务自身的授权、
 状态与执行契约分别属于对应服务规范。
 **任何下层都不得 import 它**（**§ARCH.4.2**）。
 
@@ -131,3 +131,13 @@ RFC 子命令原样转发与共享入口：`test_rfc_integration.py`；服务契
 `--resume` 现在接受可选 run id；`--repo`、`--playbook`、`--task-param` 与
 `--resume` 同用时是对保存任务的断言（见 `app/core`）。
 `--rerun-from STEP_ID`（2026-10-29）只能与 `--resume` 同用，否则 argparse 报错。
+
+## 自动升级接入（2026-10-30）
+
+`infermatrix-copilot upgrade …` 在构造 `Copilot` 或模型之前分派到
+`upgrade.cli.main`；CLI 包惰性导出 `Copilot`，损坏应用的升级状态与恢复命令仍可用。
+`--resume` 固定选中的 run 后，向原 release 的物理解释器转发 `--resume RUN_ID`、
+身份断言与 `--rerun-from`。内部 `--resume-params-json` 无损传递保存任务参数的类型。
+保留原始 run，不自动重放已经完成的任务。托管安装的执行还在 worker 内持有
+跨进程 checkout/PR 锁，以覆盖不同 MCP 进程和 release；运行时固定与控制面契约见
+[upgrade.md](upgrade.md)。

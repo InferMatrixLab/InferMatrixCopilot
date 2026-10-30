@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
@@ -12,7 +13,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_USER_CONFIG = Path.home() / ".infermatrix-copilot" / ".env"
+_USER_HOME = Path(os.environ.get("INFERMATRIX_COPILOT_HOME") or Path.home() / ".infermatrix-copilot").expanduser()
+_USER_CONFIG = _USER_HOME / ".env"
+_SOURCE_CONFIG = Path(os.environ.get("COPILOT_SOURCE_CONFIG") or _REPO_ROOT / ".env")
 # Upper bound on concurrently executing runs in one run service; each run is a
 # subprocess driving a vendor harness, so this is a sanity cap, not a target.
 MAX_STRICT_WORKERS_LIMIT = 32
@@ -93,7 +96,7 @@ class Settings(BaseSettings):
     # loaded in that order. Installed wheels have no writable repo-local .env,
     # so the user config is the durable Strict setup location.
     model_config = SettingsConfigDict(
-        env_file=(str(_REPO_ROOT / ".env"), str(_USER_CONFIG), ".env"),
+        env_file=(str(_SOURCE_CONFIG), str(_USER_CONFIG), ".env"),
         env_file_encoding="utf-8", extra="ignore",
     )
 
@@ -217,7 +220,7 @@ class Settings(BaseSettings):
     knowledge_intake_issue: str = ""
 
     # Engine
-    run_root: Path = Path.home() / ".infermatrix-copilot" / "runs"
+    run_root: Path = _USER_HOME / "runs"
     max_step_retries: int = 1
     max_agent_iters: int = 40
     playbooks_dir: Path = _resource_dir("playbooks")
@@ -334,7 +337,7 @@ class Settings(BaseSettings):
     # Agent-step runtime (engine/agent_runtime/)
     review_max_iters: int = 12          # tool-loop budget for agent steps
     skills_dir: Path = _resource_dir("skills")
-    memory_db: Path = Path.home() / ".infermatrix-copilot" / "debug_memory.db"
+    memory_db: Path = _USER_HOME / "debug_memory.db"
     evidence_item_chars: int = 24000  # was 6000: starving lenses pushed them
                                       # to re-read full files as per-lens tool
                                       # results — uncached tokens x n_lenses;

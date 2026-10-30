@@ -28,6 +28,7 @@ from ..review.plan_gate import _mode_review_context, review_plan_gate
 from ..review.reviewer import run_plan_review
 from ..task_spec import TaskSpec
 from ..ui import style
+from ..upgrade.runtime import delegate_to_release, execution_lock, pin_run_release
 from .reservation import RunReservation
 from .repository_context import RepositoryContext, RepositoryContextResolver
 from .workflow_execution import WorkflowExecution
@@ -185,6 +186,7 @@ class Copilot:
                   f"-{uuid.uuid4().hex[:6]}")  # unique — same-second runs collided
         run_dir = self.settings.run_root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        pin_run_release(run_dir)
         (run_dir / "task.json").write_text(json.dumps({
             "spec": spec.model_dump(), "playbook": playbook_to_doc(resolution.playbook),
             "invocation_id": os.environ.get("IMX_INVOCATION_ID", ""),
@@ -254,6 +256,7 @@ class Copilot:
                   f"-{uuid.uuid4().hex[:6]}")  # unique — same-second runs collided
         run_dir = self.settings.run_root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        pin_run_release(run_dir)
         (run_dir / "task.json").write_text(json.dumps({
             "spec": spec.model_dump(), "playbook": playbook_to_doc(playbook),
             "invocation_id": os.environ.get("IMX_INVOCATION_ID", ""),
@@ -269,12 +272,39 @@ class Copilot:
         """Compatibility entry point; application keeps the last-run summary."""
         self.last_run_dir = run_dir
         self.last_blocked_reason = ""
-        result = self.workflow_execution.run(
-            playbook, spec, run_dir, resolution_mode=resolution_mode,
-            tier=tier, resuming=resuming, held_lock=held_lock,
-            planned_context=planned_context, llm=self.llm,
-            rerun_from=rerun_from,
-        )
+        # Resolve policy before creating lock files or run artifacts. The
+        # workflow rechecks it after locking in case it changed while queued.
+        try:
+            repo_context = self.repository_context.for_spec(spec)
+        except AdapterError as exc:
+            self.last_blocked_reason = f"repository context invalid: {exc}"
+            print(style("✋ ", "red", "bold") + self.last_blocked_reason)
+            return BLOCKED_EXIT
+        if planned_context is not None and repo_context != planned_context:
+            self.last_blocked_reason = "repository context changed after planning"
+            print(style("✋ ", "red", "bold") + self.last_blocked_reason)
+            return BLOCKED_EXIT
+        checkout = repo_context.repo_path or f"repo:{spec.repo}"
+        # Always acquire the per-run lock before the shared checkout lock.
+        # Reversing that order could deadlock an explicit resume against a
+        # reserved child waiting for the same checkout.
+        try:
+            lock = held_lock or RunLock(run_dir).acquire()
+        except RunLockHeld as exc:
+            self.last_blocked_reason = str(exc)
+            print(style("✋ ", "red", "bold") + str(exc))
+            return BLOCKED_EXIT
+        try:
+            with execution_lock(checkout, spec.pr):
+                result = self.workflow_execution.run(
+                    playbook, spec, run_dir, resolution_mode=resolution_mode,
+                    tier=tier, resuming=resuming, held_lock=lock,
+                    planned_context=repo_context, llm=self.llm,
+                    rerun_from=rerun_from,
+                )
+        finally:
+            if held_lock is None:
+                lock.release()
         self.last_blocked_reason = result.blocked_reason
         return result.exit_code
 
@@ -321,6 +351,25 @@ class Copilot:
                     print(f"✋ cannot resume {run_id}: task.json is missing")
                     return BLOCKED_EXIT
                 continue
+            # Keep the exact selection and identity assertions when entering
+            # an older release. Its own task model remains authoritative for
+            # execution; no current-release workflow is run before delegation.
+            resume_args = ["--resume", run_dir.name]
+            if repo:
+                resume_args.extend(["--repo", repo])
+            if playbook:
+                resume_args.extend(["--playbook", playbook])
+            if params:
+                resume_args.extend(["--resume-params-json", json.dumps(params)])
+            if rerun_from:
+                resume_args.extend(["--rerun-from", rerun_from])
+            try:
+                delegated = delegate_to_release(run_dir, resume_args)
+            except RuntimeError as exc:
+                print(style("✋ cannot resume: ", "red", "bold") + str(exc))
+                return BLOCKED_EXIT
+            if delegated is not None:
+                return delegated
             try:
                 saved = json.loads(task_file.read_text(encoding="utf-8"))
                 spec = TaskSpec(**saved["spec"])
@@ -394,6 +443,15 @@ class Copilot:
     def _execute_reserved(self, run_id: str, policy) -> int:
         """Shared reserved-run executor with an authoritative child policy."""
         run_dir = self._contained_run_dir(run_id)
+        try:
+            argument = ("--execute-strict-reserved" if policy.__name__ ==
+                        "enforce_strict_review_policy" else "--execute-reserved")
+            delegated = delegate_to_release(run_dir, [argument, run_id])
+        except RuntimeError as exc:
+            print(style("✋ cannot execute: ", "red", "bold") + str(exc))
+            return BLOCKED_EXIT
+        if delegated is not None:
+            return delegated
         try:
             # Lock the whole reserved-run lifecycle before the first status
             # write: a duplicate child must not overwrite child_pid, flip
