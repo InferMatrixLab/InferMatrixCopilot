@@ -102,6 +102,29 @@ def _local_timeout_multiplier(testing: Mapping) -> float | StepResult:
     return factor
 
 
+def _local_test_job(job, *, timeout_multiplier: float, virtualenv: bool):
+    """Adapt container commands to the selected local runtime and budget.
+
+    VIRTUAL_ENV is supplied by _target_test_env for both candidate and
+    baseline runs. The CI manifest itself remains unchanged.
+    """
+    command = job.command
+    if virtualenv:
+        command = re.sub(
+            r'(?m)^([ \t]*uv[ \t]+pip[ \t]+install[ \t]+)--system(?=[ \t]|$)',
+            r'\1--python "$VIRTUAL_ENV/bin/python"', command)
+    if timeout_multiplier != 1:
+        # Ready jobs also put direct timeout commands around individual
+        # pytest invocations. Scaling only the outer runner leaves those
+        # inner CI budgets unchanged and still kills valid local runs.
+        command = re.sub(
+            r'(?m)^([ \t]*timeout[ \t]+)(\d+(?:\.\d+)?)([smhd]?)(?=[ \t])',
+            lambda m: (f'{m[1]}{float(m[2]) * timeout_multiplier:g}{m[3]}'),
+            command)
+    return _dc_replace(job, command=command,
+                       timeout_sec=job.timeout_sec * timeout_multiplier)
+
+
 def _tier_client(ctx: StepContext):
     """The run's agent backend via `Settings.tier_target` — the ONLY place a
     tier's model may pair with an endpoint and credential. Returns
@@ -1546,9 +1569,10 @@ async def _v3_test_loop(ctx: StepContext) -> StepResult:
 
     def _job(slug: str) -> TestJob:
         job = manifest_job_to_test_job(jobs_by_slug[slug])
-        if timeout_multiplier != 1:
-            job = _dc_replace(job, timeout_sec=job.timeout_sec * timeout_multiplier)
-        return job
+        return _local_test_job(
+            job, timeout_multiplier=timeout_multiplier,
+            virtualenv=bool(_target_venv(
+                manifest, extra=ctx.settings.expansion_env())))
 
     def _to_result(outcome) -> tl.TestRunResult:
         infra = "timeout" if outcome.timed_out else \

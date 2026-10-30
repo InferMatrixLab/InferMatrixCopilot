@@ -2815,3 +2815,43 @@ def test_local_timeout_multiplier_rejects_invalid_factor(factor):
     result = _local_timeout_multiplier({"local_timeout_multiplier": factor})
     assert isinstance(result, StepResult)
     assert result.failure == FailureKind.BLOCKED
+
+
+def test_local_test_job_targets_each_runtime_without_system_install(tmp_path):
+    """The same job must install into the candidate or baseline it is running."""
+    import os
+
+    from infermatrix_copilot.engine.steps.rebase_v3 import _local_test_job
+    from infermatrix_copilot.testing.runner import TestJob
+
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    uv = binary / "uv"
+    uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    uv.chmod(0o755)
+    original = TestJob(key="attention", command="uv pip install --system --no-deps fastvideo-kernel==0.3.4",
+                       timeout_sec=1200, min_gpus=1)
+    local = _local_test_job(original, timeout_multiplier=1, virtualenv=True)
+    for runtime in ("candidate runtime", "baseline runtime"):
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                   VIRTUAL_ENV=str(tmp_path / runtime))
+        result = subprocess.run(["bash", "--norc", "-c", local.command],
+                                env=env, capture_output=True, text=True, check=True)
+        assert result.stdout.splitlines() == [
+            "pip", "install", "--python", str(tmp_path / runtime / "bin/python"),
+            "--no-deps", "fastvideo-kernel==0.3.4"]
+    assert "--system" in original.command
+    assert _local_test_job(original, timeout_multiplier=1, virtualenv=False) == original
+
+
+def test_local_timeout_budget_reaches_inner_commands(tmp_path):
+    from infermatrix_copilot.engine.steps.rebase_v3 import _local_test_job
+    from infermatrix_copilot.testing.runner import TestJob
+
+    original = TestJob(key="distributed", command="timeout 0.05s sleep 0.15\ntimeout 0.05s sleep 0.15",
+                       timeout_sec=10, min_gpus=0)
+    assert subprocess.run(["bash", "--norc", "-ec", original.command]).returncode == 124
+    local = _local_test_job(original, timeout_multiplier=10, virtualenv=True)
+    assert subprocess.run(["bash", "--norc", "-ec", local.command]).returncode == 0
+    assert local.timeout_sec == 100
+    assert original.timeout_sec == 10
