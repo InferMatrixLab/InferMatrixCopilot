@@ -1,6 +1,6 @@
 # rebase_engine/ —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~7500（26 个模块） · repo-rebase-v3 的原生 rebase 引擎 · refactor-status: ok`
 
@@ -88,6 +88,9 @@ runner/LLM/CI client 全部可注入 —— 每个模块都能离线测试。
   取锁（父级 parity）。
 - wheel：每个 uv 调用 `--python` 显式指向**声明的目标 venv** —— 启动
   shell 的 venv 状态绝不影响装到哪；只有 import 验证失败才重试。
+- baseline venv：克隆后的 launcher/activation 路径必须独立且重复修复幂等；
+  baseline 包优先安装冻结 wheel，否则非 editable 安装源码。临时 worktree
+  删除后须再次从 venv 目录验证 import；缓存也须验证实际 import，不能只信版本元数据。
 - CI 创建受守卫：durable op 记录先于 API 调用，恢复按 op id 精确匹配，
   **不确定时绝不重复创建**。
 - 每个被 monitor 的 CI round 持久化实际 monitor 时长，供 run metrics 从 durable
