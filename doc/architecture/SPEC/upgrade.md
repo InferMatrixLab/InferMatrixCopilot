@@ -52,6 +52,9 @@ See [the usage guide](../../guide/auto-upgrades.md) and
   schema, skill protocol, knowledge format or launcher protocol need maintenance.
 - Protocol-1 host skill wrappers fetch full instructions from their session's
   MCP runtime. Migration of previously cached full skills requires a host reload.
+- Workflow reference keys use forward-slash relative paths on every platform;
+  values are native physical paths. Rendered CLI commands preserve literal
+  Windows paths and PowerShell quoting when inserted into instructions.
 - Release directories are retained; no garbage collector removes a live,
   queued or resumable runtime implicitly.
 

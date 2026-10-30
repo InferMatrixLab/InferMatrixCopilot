@@ -141,14 +141,18 @@ def get_workflow(skill_name: str, skill_protocol: int = 1) -> dict:
         # Execute the release's code against the explicit authoring workspace;
         # `uvx --from <checkout>` would silently switch to that checkout's code.
         if skill_name == "imkbinit":
-            content = re.sub(
-                r"## Launcher\n.*?(?=\n## 1\. Resolve)",
+            launcher = (
                 "## Launcher\n\nUse this release-pinned command as `<imc>`:\n\n"
                 f"```text\n{cli_command}\n```\n\n"
                 "The runner selects the authoring workspace's adapters and knowledge "
                 "while keeping the installed release's CLI and model workflows. "
-                "Check it with `<imc> kb --help`.\n",
-                content, flags=re.DOTALL)
+                "Check it with `<imc> kb --help`.\n"
+            )
+            # Commands contain literal Windows backslashes, not regex escapes
+            # or capture references. A callback inserts the text unchanged.
+            content = re.sub(
+                r"## Launcher\n.*?(?=\n## 1\. Resolve)",
+                lambda _match: launcher, content, flags=re.DOTALL)
         for name, tool in tools.items():
             for command in tool.get("replace_commands", []):
                 content = content.replace(command, support_commands[name])
@@ -163,8 +167,9 @@ def get_workflow(skill_name: str, skill_protocol: int = 1) -> dict:
     )
     content = content.replace("\n# ", "\n" + binding + "# ", 1)
     # Explicit reference paths work for tools that don't inherit SKILL.md's
-    # directory as their cwd. Keep release-local references with the workflow.
-    references = {str(item.relative_to(directory)): str(item.resolve())
+    # directory as their cwd. Protocol keys follow Markdown's forward slashes;
+    # physical path values retain their native filesystem spelling.
+    references = {item.relative_to(directory).as_posix(): str(item.resolve())
                   for item in directory.rglob("*")
                   if item.is_file() and item.name != "SKILL.md"}
     return {

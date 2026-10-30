@@ -1,7 +1,8 @@
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,29 @@ def test_workflow_is_release_local_and_returns_complete_references(tmp_path, mon
     assert result["release_id"] == "pinned-release"
     assert result["content"].endswith("Full workflow.\n")
     assert Path(result["references"]["references/guide.md"]).read_text() == "Complete reference."
+
+
+def test_workflow_reference_keys_use_forward_slashes_on_windows(tmp_path, monkeypatch):
+    package = tmp_path / "installed-package"
+    skill = package / "_runtime/host_skills/imdesign"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: imdesign\n---\nFull workflow.\n")
+    reference = skill / "references/guide.md"
+    reference.write_text("Complete reference.")
+    monkeypatch.setattr(workflows, "_PACKAGE", package)
+    relative_to = type(reference).relative_to
+
+    def windows_relative_to(path, *args, **kwargs):
+        relative = relative_to(path, *args, **kwargs)
+        return PureWindowsPath(relative) if path == reference else relative
+
+    # Exercise the public response using Windows relative-path semantics even
+    # when the files themselves live on a POSIX test runner.
+    with monkeypatch.context() as windows:
+        windows.setattr(type(reference), "relative_to", windows_relative_to)
+        result = workflows.get_workflow("imdesign")
+
+    assert result["references"] == {"references/guide.md": str(reference.resolve())}
 
 
 @pytest.mark.parametrize("name,protocol", [("../imdesign", 1), ("/imdesign", 1),
@@ -88,21 +112,55 @@ def test_managed_workflow_uses_physical_cli_and_protects_skill_sources(tmp_path,
     assert "get_workflow('imupdate', 1)" in result["content"]
 
 
-def test_authoring_workflow_uses_release_runner_for_cli_and_audits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("windows_commands", [False, True])
+def test_authoring_workflow_uses_release_runner_for_cli_and_audits(tmp_path, monkeypatch, windows_commands):
     authoring = _authoring(tmp_path / "authoring")
     monkeypatch.setenv("COPILOT_RELEASE_ROOT", str(tmp_path / "managed"))
     monkeypatch.setenv("COPILOT_RUNTIME_PYTHON", sys.executable)
     monkeypatch.setenv("COPILOT_AUTHORING_ROOT", str(authoring))
+    if windows_commands:
+        monkeypatch.setattr(workflows, "os", SimpleNamespace(name="nt", environ=os.environ))
     result = workflows.get_workflow("imkbinit")
     assert result["cli_argv"] == [sys.executable, "-I", "-m", workflows.__name__,
                                   "--workspace", str(authoring), "cli", "--"]
     assert "uvx --from" not in result["content"]
     assert "PYTHONPATH=src python tools/" not in result["content"]
-    assert "tool audit_knowledge_depth" in result["content"]
+    assert result["support_commands"]["audit_knowledge_depth"] in result["content"]
     update = workflows.get_workflow("imupdate")
     assert "python <infermatrix-root>/tools/" not in update["content"]
-    assert "tool audit_vllm_omni_release" in update["content"]
-    assert "tool check_knowledge_tree" in update["content"]
+    assert update["support_commands"]["audit_vllm_omni_release"] in update["content"]
+    assert update["support_commands"]["check_knowledge_tree"] in update["content"]
+
+
+def test_windows_authoring_launcher_preserves_literal_paths(tmp_path, monkeypatch):
+    package = tmp_path / "installed-package"
+    skill = package / "_runtime/host_skills/imkbinit"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: imkbinit\n---\n\n# Init workflow\n\n"
+        "## Launcher\n\nuvx --from old-checkout infermatrix-copilot\n\n"
+        "## 1. Resolve the repository\n\nContinue.\n"
+    )
+    python = str(PureWindowsPath(r"C:\hostedtoolcache\Python\3.12\python.exe"))
+    authoring = PureWindowsPath(r"C:\Users\O'Connor\authoring\1")
+    monkeypatch.setattr(workflows, "_PACKAGE", package)
+    monkeypatch.setattr(workflows, "_authoring_root", lambda: authoring)
+    monkeypatch.setattr(workflows, "current_release", lambda: {
+        "python": python, "release_id": "windows-release"})
+    monkeypatch.setenv("COPILOT_RELEASE_ROOT", str(tmp_path / "managed"))
+    # Replace only this module's OS facade; changing os.name globally would
+    # make pathlib try to access a Windows filesystem on POSIX.
+    monkeypatch.setattr(workflows, "os", SimpleNamespace(name="nt", environ=os.environ))
+
+    result = workflows.get_workflow("imkbinit")
+
+    assert result["cli_argv"] == [python, "-I", "-m", workflows.__name__,
+                                  "--workspace", str(authoring), "cli", "--"]
+    expected = ("& '" + python + "' '-I' '-m' '" + workflows.__name__
+                + "' '--workspace' 'C:\\Users\\O''Connor\\authoring\\1' 'cli' '--'")
+    assert f"```text\n{expected}\n```" in result["content"]
+    assert "uvx --from" not in result["content"]
+    assert "## 1. Resolve the repository\n\nContinue." in result["content"]
 
 
 def test_support_runner_uses_bundled_tool_with_explicit_workspace(tmp_path, monkeypatch):
