@@ -190,7 +190,7 @@ def test_capabilities_identify_package_protocols_and_resources():
     caps = DirectClient().capabilities()
 
     assert caps.sdk_api_version == "1.0.0"
-    assert caps.distribution_version == __version__ == "0.2.0"
+    assert caps.distribution_version == __version__
     assert caps.direct_api_version
     assert caps.strict_api_version
     assert caps.quality_api_version == "1.0.0"
@@ -332,7 +332,7 @@ def test_strict_facade_preserves_idempotency_and_hides_private_paths():
     assert result.to_dict()["payload"]["result"] == {"verdict": "APPROVE"}
     assert result.payload["offset_seen"] == 12
     assert "report_path" not in result.payload
-    assert runtime.capabilities().distribution_version == "0.2.0"
+    assert runtime.capabilities().distribution_version == __version__
 
 
 def test_strict_typed_result_and_decode_error():
@@ -425,7 +425,7 @@ def test_strict_runtime_public_capabilities_smoke(tmp_path):
     }) as runtime:
         caps = runtime.capabilities()
 
-    assert caps.distribution_version == "0.2.0"
+    assert caps.distribution_version == __version__
     assert caps.strict_api_version == "1.4.0"
     assert caps.knowledge_api_version == KNOWLEDGE_API_VERSION
     assert caps.supports_knowledge_curation is True

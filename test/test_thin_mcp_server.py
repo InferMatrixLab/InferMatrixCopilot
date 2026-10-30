@@ -94,7 +94,8 @@ def test_tool_annotations_mark_the_read_only_surface(monkeypatch):
     assert review.openWorldHint is True
     for name in ("validate_direct_review", "get_review_result",
                  "get_review_status", "update_knowledge", "doc_search",
-                 "doc_read", "open_knowledge_context", "read_knowledge_context",
+                 "doc_read", "get_workflow", "get_update_status",
+                 "open_knowledge_context", "read_knowledge_context",
                  "search_knowledge_context", "related_knowledge_context",
                  "expand_knowledge_context"):
         hints = mcp.tool_annotations[name]
@@ -127,6 +128,8 @@ def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
         "update_knowledge",
         "doc_search",
         "doc_read",
+        "get_workflow",
+        "get_update_status",
         "rfc_request",
         "rfc_capabilities",
         "rfc_status",
@@ -1018,3 +1021,27 @@ def test_heading_only_section_is_not_a_usable_quick_map(tmp_path):
     route = tms._direct_route("owner", str(page), "test")
     assert route["quick_map_status"] == "unavailable"
     assert route["read_required"] is True
+
+
+def test_stable_skill_tool_reads_the_running_workflow(monkeypatch):
+    monkeypatch.setenv("COPILOT_RELEASE_ID", "this-server-release")
+    mcp, _core = _fake_mcp(monkeypatch)
+    result = mcp.tools["get_workflow"]("imdesign", 1)
+    assert result["release_id"] == "this-server-release"
+    assert "name: imdesign" in result["content"]
+    assert "error" in mcp.tools["get_workflow"]("../../outside", 1)
+    assert "error" in mcp.tools["get_workflow"]("imdesign", 2)
+
+
+def test_update_status_tool_reads_manager_and_running_release(monkeypatch):
+    from infermatrix_copilot import upgrade
+
+    class ReadOnlyManager:
+        def status(self):
+            return {"active_release": "next-release"}
+
+    monkeypatch.setitem(upgrade.__dict__, "UpdateManager", ReadOnlyManager)
+    monkeypatch.setenv("COPILOT_RELEASE_ID", "this-server-release")
+    mcp, _core = _fake_mcp(monkeypatch)
+    assert mcp.tools["get_update_status"]() == {
+        "active_release": "next-release", "running_release": "this-server-release"}

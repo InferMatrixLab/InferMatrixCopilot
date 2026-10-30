@@ -71,12 +71,16 @@ Use InferMatrixCopilot in Direct mode to review this PR.
 **Strict / CLI（独立运行）：**
 
 ```bash
-# 创建 venv、editable 安装和 ./infermatrix-copilot 包装器
+# 安装托管运行时、自动升级入口和 ./infermatrix-copilot 包装器
 bash install.sh
 ./infermatrix-copilot doctor  # 预检：每个 ✗ 都打印确切的修复命令
 ```
 
-`install.sh` 会在仓库根从模板生成 `.env`（已被 git 忽略，永不覆盖已有的）；
+默认安装使用托管启动器；通过签名验证和自检的新版本用于后续会话，运行中的任务
+保留原版本。签名信任配置、版本固定与回滚见[自动升级指南](doc/guide/auto-upgrades.md)。
+开发者可用 `bash install.sh --development` 保留 editable 安装。
+
+`install.sh` 默认建立 `~/.infermatrix-copilot/.env`，保留已有配置和密钥；
 Strict 还要在其中配置 `REPO_PATHS`。使用 API 后端时，填写
 `ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，各自支持可选的 `*_BASE_URL`；
 也可以改用订阅制 harness 后端。API 配置、常用 flag 与排查见
@@ -85,9 +89,10 @@ Strict 还要在其中配置 `REPO_PATHS`。使用 API 后端时，填写
 
 ## 配置 .env
 
-`install.sh` / `install-mcp.sh` 会从 [`.env.template`](.env.template) 生成
-`.env`（CLI 用仓库根的 `.env`，Direct/MCP 宿主用
-`~/.infermatrix-copilot/.env`）。`.env` 已被 git 忽略——**绝不提交**，token
+`install.sh` / `install-mcp.sh` 默认建立 `~/.infermatrix-copilot/.env`，
+CLI 与 MCP 共用它。`bash install.sh --development` 从
+[`.env.template`](.env.template) 生成仓库根的 `.env`；已有配置和密钥均保留。
+`.env` 已被 git 忽略——**绝不提交**，token
 和机器本地的绝对路径只放这里。
 
 最小可用配置分三层：Direct 只需要仓库映射；Strict/CLI 加模型；rebase 的

@@ -66,6 +66,7 @@ class KnowledgePaths:
         state = memory_db.parent / "state" / repo
         active = repo and repo in getattr(settings,
                                           "knowledge_runtime_repos", set())
+        managed = bool(os.environ.get("COPILOT_RELEASE_ROOT"))
         if active:
             cls._require_migration_marker(state, repo)
             state_db = state / "debug_memory.db"
@@ -83,11 +84,20 @@ class KnowledgePaths:
             seed_skills = Path(settings.skills_dir)
             read_layers = (state_db,) if active else (memory_db,)
             repo_map_cache = state / "repo_map" if active else None
+        if managed and not active:
+            # Installed releases are immutable seeds. Learned data belongs to
+            # the stable user state, and remains available after an upgrade.
+            # Keep the legacy/global stores as read fallbacks; no implicit
+            # schema migration or modification of the authoring checkout.
+            state_db = state / "debug_memory.db"
+            read_layers = tuple(dict.fromkeys((state_db, *read_layers)))
+            repo_map_cache = state / "repo_map"
         return cls(
             repo=repo,
             state_dir=state,
-            rebase_backend_db=state_db if active else memory_db,
-            shared_write_db=adapter_db if adapter_db is not None else memory_db,
+            rebase_backend_db=state_db if active or managed else memory_db,
+            shared_write_db=(state_db if managed else
+                             adapter_db if adapter_db is not None else memory_db),
             debug_read_layers=read_layers,
             skills_seed_dir=seed_skills,
             skills_runtime_dir=state / "skills_runtime",

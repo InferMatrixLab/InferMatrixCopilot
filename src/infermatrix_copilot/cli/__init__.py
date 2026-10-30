@@ -15,10 +15,17 @@ Copilot` importers are unchanged.
 
 from __future__ import annotations
 
-from .copilot import Copilot
 from .entry import main
 
 __all__ = ["Copilot", "main"]
+
+
+def __getattr__(name: str):
+    if name == "Copilot":
+        from .copilot import Copilot
+
+        return Copilot
+    raise AttributeError(name)
 
 
 if __name__ == "__main__":

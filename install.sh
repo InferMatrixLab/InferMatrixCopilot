@@ -4,9 +4,8 @@
 #   bash install.sh              install (idempotent)
 #   bash install.sh --uninstall  remove ONLY what this installer created
 #
-# Creates/reuses a venv, installs the package, seeds .env from the template if
-# absent (never overwrites, never prints secret values), writes a repo-local
-# ./infermatrix-copilot wrapper (no PATH mutation), and finishes with the doctor.
+# Managed installation is the default. Use --development for the editable
+# checkout installer, or --uninstall to remove only its legacy local artifacts.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,9 +22,16 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     else
         echo "no $MANIFEST — nothing this installer created to remove"
     fi
-    echo "note: .env was NOT touched (it may hold your keys)"
+    echo "note: .env, managed installations, and host registrations were NOT touched"
     exit 0
 fi
+
+# Managed CLI and MCP hosts share the same independent launcher. The legacy
+# editable path remains available for contributors.
+if [[ "${1:-}" != "--development" ]]; then
+    exec ./install-mcp.sh --cli-only --local-cli-wrapper "$PWD/infermatrix-copilot" "$@"
+fi
+shift
 
 created=()
 

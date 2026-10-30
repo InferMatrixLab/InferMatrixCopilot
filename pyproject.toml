@@ -1,6 +1,6 @@
 [project]
 name = "infermatrix-copilot"
-version = "0.2.0"
+dynamic = ["version"]
 description = "InferMatrixCopilot — playbook-driven repo-maintenance agent (engine substrate, targets, adapters, conversational CLI)"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,8 @@ dev = ["pytest>=8.0"]
 mcp = ["mcp>=1.8,<2"]
 # Knowledge service (signing, verdict envelopes).
 kb = ["cryptography>=42"]
+# Signature verification and compatibility checks for managed installations.
+updater = ["cryptography>=42", "packaging>=24"]
 
 [project.scripts]
 infermatrix-copilot = "infermatrix_copilot.cli:main"
@@ -28,11 +30,18 @@ infermatrix-copilot-mcp = "infermatrix_copilot.thin_mcp_server:main"
 infermatrix-copilot-workflow-mcp = "infermatrix_copilot.mcp_server:main"
 infermatrix-rfc = "infermatrix_copilot.rfc_service.cli:main"
 infermatrix-feedback = "infermatrix_copilot.knowledge_service.feedback_server_cli:main"
+infermatrix-copilot-launcher = "infermatrix_copilot.upgrade.launcher:main"
 imx-omni-pytest = "infermatrix_copilot.rebase_engine.module_pytest:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/infermatrix_copilot/__init__.py"
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/infermatrix_copilot"]
@@ -44,6 +53,10 @@ packages = ["src/infermatrix_copilot"]
 "skills" = "infermatrix_copilot/_runtime/skills"
 "plugins/infermatrix-copilot/skills" = "infermatrix_copilot/_runtime/host_skills"
 "doc/features/rfc-service.md" = "infermatrix_copilot/_runtime/docs/rfc-service.md"
+"doc/knowledge" = "infermatrix_copilot/_runtime/doc/knowledge"
+"tools" = "infermatrix_copilot/_runtime/tools"
+"release/trusted-keys.json" = "infermatrix_copilot/_runtime/trusted-keys.json"
+"release/workflow-tools.json" = "infermatrix_copilot/_runtime/workflow-tools.json"
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

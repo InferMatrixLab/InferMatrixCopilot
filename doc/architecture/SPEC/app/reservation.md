@@ -1,6 +1,6 @@
 # app/reservation.py — durable run reservation
 
-<!-- verified-against: 2026-09-26 -->
+<!-- verified-against: 2026-10-30 -->
 
 `RunReservation` owns run ID generation and containment, explicit checkout
 authorization, request persistence, initial queued status, and idempotent
@@ -18,3 +18,11 @@ request again before executing it.
 Polling may request `must_exist=False` to report a valid but unknown ID;
 execution requires an existing directory. `RunService` calls this service
 directly, and `Copilot` preserves its old reservation methods as delegates.
+
+## Managed runtime pin (2026-10-30)
+
+A new reservation writes `release.json` before publishing its queued status.
+It records the release identity, immutable release directory and physical venv
+interpreter without resolving its Python symlink. Reclaimed/idempotent
+reservations retain the existing pin. Runtime identity is independent of the
+knowledge snapshot pin and never starts an updater.

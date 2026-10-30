@@ -1,6 +1,6 @@
 # app/core.py —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-10-30 -->
 
 `Copilot` is the headless workflow application. It resolves a TaskSpec,
 delegates reviewer verdict policy to `review.plan_gate`, confirms when needed,
@@ -51,3 +51,17 @@ run（`_contained_run_dir` 拒绝越界路径）；`--repo/--playbook/--task-par
 `workflow_execution._interrupted` 已经写下 `interrupted`，`128 + signal` 的
 退出码不得被这里改标成 `failed`（那会让 reconciler 把一个可恢复的 run 当作
 失败收尾）。
+
+## Managed runtime identity (2026-10-30)
+
+New CLI and reserved runs record their runtime before execution. Resume selects
+one exact run, then delegates to its pinned physical interpreter while retaining
+repo/playbook/parameter assertions and rerun checkpoints. Delegated parameters
+use lossless JSON; the original runtime validates the saved task. Missing pinned
+runtimes block execution instead of substituting current code.
+
+Execution acquires the per-run lock before the shared checkout/PR lock, passes
+the held run lock to WorkflowExecution, and releases both after the lifecycle.
+The worker holds the shared lock, so restarting its MCP parent does not permit
+a second release to modify the same checkout/PR concurrently. Signal-driven
+interrupted terminal states retain their existing ownership rules.

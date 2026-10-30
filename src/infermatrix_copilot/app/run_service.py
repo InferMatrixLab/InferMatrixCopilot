@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import threading
 import uuid
 from collections import deque
@@ -26,6 +25,7 @@ from .request_policy import (
     enforce_quality_review_policy, enforce_strict_review_policy,
 )
 from ..task_spec import READ_ONLY_KINDS, TaskSpec
+from ..upgrade.runtime import release_command
 from .core import Copilot
 from .reservation import RunReservation
 
@@ -282,8 +282,9 @@ class RunService:
                 "--execute-strict-reserved"
                 if strict_compat else "--execute-reserved"
             )
+            command = release_command(run_dir, [execute_arg, run_id], env)
             proc = subprocess.Popen(
-                [sys.executable, "-m", "infermatrix_copilot", execute_arg, run_id],
+                command,
                 stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 cwd=str(self.run_root), env=env,
                 **popen_kwargs,

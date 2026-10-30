@@ -17,6 +17,7 @@ from .. import idempotency as idem
 from .. import run_status as rs
 from ..config import Settings
 from ..task_spec import TaskSpec
+from ..upgrade.runtime import pin_run_release
 from .request_policy import authorize_repo_path
 
 
@@ -105,6 +106,7 @@ class RunReservation:
         run_dir.mkdir(parents=True, exist_ok=True)
         req = run_dir / "request.json"
         req.write_text(json.dumps(spec.model_dump(), indent=2), encoding="utf-8")
+        pin_run_release(run_dir)
         try:  # least-privilege perms; advisory only against same-user tampering
             os.chmod(req, 0o600)
         except OSError:

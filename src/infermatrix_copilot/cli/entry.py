@@ -6,11 +6,14 @@ the wiring that turns argv/stdin into calls on it.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from typing import TYPE_CHECKING
 
-from ..intent import parse_intents
-from .copilot import Copilot
 from .utils import parse_task_params
+
+if TYPE_CHECKING:
+    from .copilot import Copilot
 
 
 def _handle_line(copilot: Copilot, line: str, assume_yes: bool,
@@ -39,6 +42,8 @@ def _handle_line(copilot: Copilot, line: str, assume_yes: bool,
         return None
     if line == "/resume":
         return copilot.resume_last()
+
+    from ..intent import parse_intents
 
     results = parse_intents(line, llm=copilot.llm,
                             default_repo=copilot.settings.default_repo,
@@ -83,14 +88,28 @@ def _write_invocation_record(inv_dir, inv_id: str, copilot, rc: int) -> None:
         pass
 
 
+def _resume_params(raw: str) -> dict:
+    """Decode lossless identity assertions passed by a pinned-run delegate."""
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("resume assertions must be a JSON object")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Parses argv and dispatches: --resume / --playbook /
     --prompt run one-shot and return their exit code; otherwise start the
     interactive interface — the conversational chat REPL when an LLM is
     configured (and not --no-chat), else the plain command REPL. `argv` defaults
     to sys.argv. Returns the process exit code."""
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "upgrade":
+        from ..upgrade.cli import main as upgrade_main
+
+        return upgrade_main(raw[1:])
     parser = argparse.ArgumentParser(prog="infermatrix-copilot",
-                                     description="Conversational repo-maintenance copilot")
+                                     description="Conversational repo-maintenance copilot",
+                                     epilog="Automatic upgrades: infermatrix-copilot upgrade --help")
     parser.add_argument("command", nargs="?",
                         choices=["doctor", "migrate-knowledge", "rfc", "learning"],
                         help="doctor: preflight diagnostics with exact "
@@ -121,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="RUN_ID",
                         help="resume RUN_ID, or the most recent run when omitted; "
                              "repo/playbook/task params assert its saved identity")
+    parser.add_argument("--resume-params-json", type=_resume_params,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--rerun-from", metavar="STEP_ID",
                         help="with --resume: execute this playbook step and "
                              "every later step again instead of replaying "
@@ -148,7 +169,6 @@ def main(argv: list[str] | None = None) -> int:
                         help=argparse.SUPPRESS)
     parser.add_argument("--execute-strict-reserved", metavar="RUN_ID",
                         help=argparse.SUPPRESS)
-    raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "learning":
         from ..knowledge_service.learning_cli import main as learning_main
 
@@ -166,6 +186,11 @@ def main(argv: list[str] | None = None) -> int:
 
         return improve_main(raw[1:])
     args = parser.parse_args(argv)
+    if args.resume_params_json is not None:
+        if args.resume is None:
+            parser.error("--resume-params-json requires --resume and a JSON object")
+        if args.task_param:
+            parser.error("--resume-params-json cannot be combined with --task-param")
 
     if args.command == "doctor":  # diagnostics only — no Copilot/LLM spin-up
         from .doctor import run_doctor
@@ -215,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
     _tracing.init(inv_id, inv_dir / f"{inv_id}.trace.jsonl")
     os.environ["IMX_INVOCATION_ID"] = inv_id  # visible to the run subprocess/task
 
+    from .copilot import Copilot
+
     copilot = Copilot()
 
     if args.execute_reserved:
@@ -222,9 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute_strict_reserved:
         return copilot.execute_strict_reserved(args.execute_strict_reserved)
     if args.resume is not None:
+        params = (args.resume_params_json if args.resume_params_json is not None
+                  else parse_task_params(args.task_param))
         return copilot.resume_last(args.resume, repo=args.repo,
-                                   playbook=args.playbook or "",
-                                   params=parse_task_params(args.task_param),
+                                   playbook=args.playbook or "", params=params,
                                    rerun_from=args.rerun_from or "")
     if args.rerun_from:
         parser.error("--rerun-from requires --resume")

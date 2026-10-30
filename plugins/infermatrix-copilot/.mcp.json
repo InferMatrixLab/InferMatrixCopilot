@@ -5,8 +5,9 @@
       "command": "uvx",
       "args": [
         "--from",
-        "infermatrix-copilot[mcp] @ git+https://github.com/JiusiServe/InferMatrixCopilot.git@main",
-        "infermatrix-copilot-mcp"
+        "infermatrix-copilot[mcp,kb,updater] @ git+https://github.com/JiusiServe/InferMatrixCopilot.git@main",
+        "infermatrix-copilot-launcher",
+        "mcp"
       ]
     }
   }
