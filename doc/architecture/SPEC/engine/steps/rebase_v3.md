@@ -1,6 +1,6 @@
 # engine/steps/rebase_v3.py —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-10-30 -->
 
 `LOC ~2204 · step 库（v3 rebase 装配层） · refactor-status: oversized`
 
@@ -132,7 +132,9 @@ harness 会话通过 MCP tool bridge 拿到同一套工具面，plan gate 在派
   `upstream_commit` 重新确保 scratch。
 - baseline venv（`ensure_baseline_venv`）：硬链接克隆 campaign venv 并换入
   baseline commit 的 wheel，让"omni main 对上次对齐的 wheel 是否也失败"可问；
-  任何失败返回 None，保留保守的回归判定。
+  使用发布 wheel（若配置 URL）或非 editable 安装，删除临时源码后再验证导入；
+  克隆的 console/activation 脚本通过原子替换改为 baseline 路径，不能写穿硬链接
+  修改 campaign。缓存复用也必须通过导入检查。任何失败返回 None，保留保守的回归判定。
 
 ## 操作者重跑与本地超时预算（2026-10-29）
 
@@ -142,9 +144,14 @@ harness 会话通过 MCP tool bridge 拿到同一套工具面，plan gate 在派
   `run_test_loop`：记录过的 timeout/watchdog infra 再跑一次，已通过的 job 不重跑。
   普通 resume 下 infra 仍然粘滞。
 - `rebase.testing.local_timeout_multiplier`（默认 1，须为 >= 1 的数，否则 BLOCKED）
-  只放大本地 `TestJob.timeout_sec`；构建出的 manifest 保留 CI 的
+  放大本地 `TestJob.timeout_sec` 和命令行首的直接 `timeout DURATION`；构建出的 manifest 保留 CI 的
   `timeout_in_minutes`（shell golden 不变）。vllm-omni 取 3：Ready 的 20 分钟 CPU
   Simple step 在共享 rebase 主机上通过 53–88% 用例、零失败时就被杀。
+- 本地已配置虚拟环境时，将行首 `uv pip install --system` 改为
+  `uv pip install --python "$VIRTUAL_ENV/bin/python"`。候选与基线各自使用
+  `_target_test_env` 选定的虚拟环境；不修改 CI manifest，也不向系统 Python 安装依赖。
+- API drift guard 覆盖输出处理器、请求状态及 profiler 基类；除参数名外还检查位置参数容量，
+  防止将上游可按位置传递的可选参数改成仅关键字参数后仍误报兼容。
 
 ## 信号中断的模块：BLOCKED 收口、resume 重跑（2026-10-28）
 

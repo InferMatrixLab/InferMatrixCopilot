@@ -56,6 +56,9 @@ INHERITANCE_MAP = [
     ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner", "vllm_omni.worker.gpu_ar_model_runner", "GPUARModelRunner"),
     ("vllm.v1.core.sched.scheduler", "Scheduler", "vllm_omni.core.sched.omni_ar_scheduler", "OmniARScheduler"),
     ("vllm.v1.core.sched.scheduler", "Scheduler", "vllm_omni.core.sched.omni_generation_scheduler", "OmniGenerationScheduler"),
+    ("vllm.v1.engine.output_processor", "RequestState", "vllm_omni.outputs.output_processor", "OmniRequestState"),
+    ("vllm.v1.engine.output_processor", "OutputProcessor", "vllm_omni.outputs.output_processor", "MultimodalOutputProcessor"),
+    ("vllm.profiler.wrapper", "WorkerProfiler", "vllm_omni.profiler.omni_torch_profiler", "OmniTorchProfilerWrapper"),
 ]
 
 
@@ -276,9 +279,17 @@ def _check_inheritance() -> list[str]:
                 ):
                     continue
                 missing.append(pname)
-            if missing:
+            positional_kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            base_positional = [p.name for p in base_sig.parameters.values() if p.kind in positional_kinds]
+            omni_positional = [p.name for p in omni_sig.parameters.values() if p.kind in positional_kinds]
+            omni_has_var_positional = any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in omni_sig.parameters.values()
+            )
+            lost_positional = [] if omni_has_var_positional else base_positional[len(omni_positional):]
+            if missing or lost_positional:
                 msg = (
-                    f"MISMATCH {omni_cls_name}.{name}(): missing params {missing}\n"
+                    f"MISMATCH {omni_cls_name}.{name}(): missing params {missing}; "
+                    f"incompatible positional params {lost_positional}\n"
                     f"  Base : {base_sig}\n"
                     f"  Omni : {omni_sig}"
                 )
