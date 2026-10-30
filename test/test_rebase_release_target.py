@@ -437,3 +437,92 @@ def test_baseline_venv_builds_and_installs_baseline_wheel(tmp_path):
                                run=run, clone=clone)
     assert out == tmp_path / ("venv-baseline-" + "a" * 12)
     assert any("worktree" in c and "remove" in c for c in calls)
+
+
+def test_hardlinked_baseline_launchers_use_clone_without_modifying_target(tmp_path):
+    import venv
+
+    from infermatrix_copilot.rebase_engine.wheel import _clone_tree_hardlinked, _relocate_venv_scripts
+
+    target, baseline = tmp_path / "venv", tmp_path / "venv-baseline"
+    venv.EnvBuilder(with_pip=False).create(target)
+    launcher = target / "bin" / "runtime-probe"
+    original = f"#!{target}/bin/python\nimport sys\nprint(sys.prefix)\n"
+    launcher.write_text(original)
+    launcher.chmod(0o755)
+    assert _clone_tree_hardlinked(target, baseline)
+    _relocate_venv_scripts(target, baseline)  # Cached reuse must be idempotent.
+    result = subprocess.run([str(baseline / "bin" / launcher.name)],
+                            capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == str(baseline)
+    assert launcher.read_text() == original
+    assert str(target) in (target / "bin" / "activate").read_text()
+    assert str(baseline) in (baseline / "bin" / "activate").read_text()
+
+
+def test_baseline_package_survives_temporary_source_removal(tmp_path):
+    import shutil
+    import venv
+
+    from infermatrix_copilot.rebase_engine import wheel
+
+    target = tmp_path / "target"
+    venv.EnvBuilder(with_pip=False).create(target)
+    (tmp_path / ".git").mkdir()
+
+    def run(cmd, *, cwd=None, env=None, timeout=600):
+        if cmd[0] == "git":
+            source = tmp_path / ("target-baseline-" + "a" * 12 + "-src")
+            if "add" in cmd:
+                (source / "fixture").mkdir(parents=True)
+                (source / "fixture" / "__init__.py").write_text("VALUE = 'baseline'\n")
+            else:
+                shutil.rmtree(source)
+            return 0, "", ""
+        if cmd[:3] == ["fixture-uv", "pip", "uninstall"]:
+            return 0, "", ""
+        if cmd[:3] == ["fixture-uv", "pip", "install"]:
+            python = cmd[cmd.index("--python") + 1]
+            site = subprocess.check_output(
+                [python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                text=True).strip()
+            # Simulate editable/non-editable installation without network or a
+            # build backend. The former becomes unimportable after git cleanup.
+            from pathlib import Path
+            if "-e" in cmd:
+                (Path(site) / "fixture.pth").write_text(str(cwd) + "\n")
+            else:
+                shutil.copytree(cwd / "fixture", Path(site) / "fixture")
+            return 0, "", ""
+        return wheel._run(cmd, cwd=cwd, env=env, timeout=timeout)
+
+    spec = WheelSpec(package="fixture", variant="cpu", arch="x86_64",
+                     index_url_template="https://example.invalid/{commit}")
+    baseline = wheel.ensure_baseline_venv(target, spec, tmp_path, "a" * 40,
+                                           uv="fixture-uv", run=run)
+    assert baseline is not None
+    assert not (tmp_path / (baseline.name + "-src")).exists()
+    result = subprocess.run([str(baseline / "bin/python"), "-c",
+                             "import fixture; print(fixture.VALUE)"],
+                            cwd=tmp_path, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "baseline"
+
+
+def test_cached_baseline_with_matching_metadata_but_missing_code_is_rejected(tmp_path):
+    from infermatrix_copilot.rebase_engine import wheel
+
+    target = tmp_path / "target"
+    baseline = tmp_path / ("target-baseline-" + "a" * 12)
+    baseline.mkdir()
+    (baseline / "pyvenv.cfg").write_text("home=/usr\n")
+    (tmp_path / ".git").mkdir()
+
+    def run(cmd, **kwargs):
+        if len(cmd) > 3 and cmd[-1] == "fixture":
+            return 0, "1.0+gaaaaaaaaa\n", ""
+        return 1, "", "missing fixture source"
+
+    result = wheel.ensure_baseline_venv(target, _install_spec(), tmp_path,
+                                       "a" * 40, run=run,
+                                       clone=lambda src, dst: False)
+    assert result is None
