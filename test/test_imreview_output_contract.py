@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from infermatrix_copilot.engine.steps.review.prompts import _REVIEW_SYSTEM
+
 
 ROOT = Path(__file__).resolve().parents[1]
 IMREVIEW_PROMPTS = (
@@ -73,3 +75,29 @@ def test_imreview_preserves_eval_and_offline_context_modes(
     assert "feedback status `disabled`" in prompt
     assert "pass `unavailable` and report that validation gap" in prompt
     assert "local/worktree reviews, pass `not_applicable`" in prompt
+
+
+@pytest.mark.parametrize("prompt_path", IMREVIEW_PROMPTS)
+def test_imreview_requires_semantic_analogue_census(prompt_path: Path) -> None:
+    prompt = " ".join(prompt_path.read_text(encoding="utf-8").split())
+
+    assert "semantic-analogue census" in prompt
+    assert "Describe the changed path as dataflow without its new symbol names" in prompt
+    assert "framework registries, base classes, common layers" in prompt
+    assert "sibling models/backends, and callers" in prompt
+    assert "transport, layout, aligned side tensors, lifecycle, and hook boundary" in prompt
+    assert "`REUSE`, `EXTEND`, or `NEW`" in prompt
+    assert "cross-rank communication versus local batching" in prompt
+
+
+def test_strict_review_requires_semantic_sibling_contrast() -> None:
+    prompt = " ".join(_REVIEW_SYSTEM.split())
+
+    assert "Semantic sibling contrast" in prompt
+    assert "describe the changed dataflow without its new symbol names" in prompt
+    assert "framework registries, base classes, common layers" in prompt
+    assert "sibling models/backends, and callers" in prompt
+    assert "cross-rank communication vs local batching" in prompt
+    assert "transport, layout, aligned side tensors, lifecycle, and hook boundaries" in prompt
+    assert "CONCRETE REUSE/EXTEND/shared-owner proposal" in prompt
+    assert "record NEW when the contracts or owner boundaries differ materially" in prompt

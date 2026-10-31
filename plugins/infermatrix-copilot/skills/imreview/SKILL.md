@@ -42,6 +42,17 @@ and record the skipped validation as an explicit verification gap in the final
 report.
 Stop when every changed semantic path has a supported finding or an explicit
 no-issue conclusion; do not add searches only for confidence.
+When the diff adds or expands an alternate `forward`, plan, dispatcher,
+packing/sharding path, fallback, or model/backend-local execution path, perform
+one bounded semantic-analogue census before closing the source review. Describe
+the changed path as dataflow without its new symbol names, then search framework
+registries, base classes, common layers, sibling models/backends, and callers for
+the same before/after contract. Compare the nearest analogue's transport,
+layout, aligned side tensors, lifecycle, and hook boundary. Record whether the
+right decision is `REUSE`, `EXTEND`, or `NEW`; emit an architecture finding only
+when a concrete shared contract and owner boundary exist. Different transport
+mechanisms, such as cross-rank communication versus local batching, do not by
+themselves make two otherwise equivalent execution lifecycles unrelated.
 After source review independently verifies and freezes its candidate findings,
 fetch into the shared evidence packet at most the latest 20 PR conversation
 comments, latest 20 review summaries, and 50 thread-aware inline review threads
