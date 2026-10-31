@@ -1,7 +1,7 @@
 ---
 title: "Model Executor"
 created: 2026-07-10
-updated: 2026-10-06
+updated: 2026-10-09
 type: index
 tags: [vllm-omni, components, model-executor]
 sources: []
@@ -38,12 +38,13 @@ sources: []
 |---|---|
 | Breeze ROCm RNG fallback、CUDA generator registration或depth-layer Triton autotune | [Breeze平台合同](rules-breeze-rocm.md) |
 | 理解共享职责和阶段边界 | [architecture](architecture.md) |
+| sparse 路由、generation batch/zero-token、sampler 与 capture 的七方面实现深度 | [GPU runner 源码深度](feature-depth-runner-correctness.md) |
 | 根据 PR 描述直达 stage config、runner preprocess、stage runtime、bridge/batch 或 loader 的规则组与第一批源码 | [rules 与代码地图](rules.md) |
-| runtime info、跨 stage payload、batch 与 request RNG 合同 | [跨 stage bridge 与 batch 合同](rules-bridge-batch.md) |
+| runtime info、payload ownership/浅拷贝、sparse singleton 边界、batch 与 request RNG 合同 | [跨 stage bridge 与 batch 合同](rules-bridge-batch.md) |
 | loader 的 dtype/config 获取、fused shard 与多模块 checkpoint 载入 | [loader 合同](rules-loader-contract.md) |
 | shared image example envelope 与 model_extras 参数声明 | [image task envelope 合同](rules-image-task-envelope.md) |
 | Omni 输出类型、字段/复制合同与V2 native routed-expert auxiliary output | [输出类型合同](rules-output-contract.md)   新增核对：EXEC-7c、EXEC-7d。 |
-| 采样循环不变量、热路径缓存、AR 音频侧路、preprocess phase/one-token prefill | [运行时热路径合同](rules-runtime-hot-paths.md) |
+| 采样循环不变量、热路径缓存、AR 音频、sparse 协议/持续错误日志、sampler capability、preprocess phase/one-token prefill | [运行时热路径合同](rules-runtime-hot-paths.md) |
 
 | NPU runner、ROCm 分页注意力、NPU 模型补丁 | [平台后端合同](rules-platform-backends.md)   新增核对：EXEC-10f、EXEC-10f2。 |
 

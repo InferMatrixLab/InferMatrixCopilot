@@ -1,7 +1,7 @@
 ---
 title: "运行时热路径合同"
 created: 2026-09-04
-updated: 2026-09-08
+updated: 2026-10-09
 type: rule
 tags: [vllm-omni, components, model-executor]
 sources: ["PR #4765", "PR #5068", "PR #5174", "PR #5666", vllm_omni/worker/, "PR #5452", "vllm_omni/worker/sparse_audio.py", "vllm_omni/worker/sampling_utils.py", "PR #5048", "PR #6424", "PR #6454", vllm_omni/data_entry_keys.py, "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py", "vllm_omni/model_executor/models/cosyvoice3/code2wav_core/hifigan.py", "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py", "PR #6458", "PR #6317", "PR #7136"]
@@ -45,16 +45,16 @@ confidence: high
 ## EXEC-11c — sparse 音频 marker 必须执行协议校验并在非法声明时 fail closed
 
 - 触发：修改共享 AR 音频输出、sparse multimodal routing、`meta.sparse_audio`/`meta.req_id` producer 或 consumer。
-- 强制：marker 只接受 list of strings 或 bare string，并用同一 literal truthy set 判定；nested 与 flattened encoding 必须同时解析，冲突、重复 id、不可用 id 或非法 carrier 必须记录并在 audio 路由 fail closed；任何 subset producer（包括 VoxCPM2 dense 分支）都必须声明按 `meta.req_id` 对齐。
-- 禁止：对 tensor/ndarray/number marker 做元素读取或归一化、把非法 sparse declaration 降级为 dense、静默抹掉 nested marker，或发送未声明 alignment 的 subset 音频列表。
-- 验收：覆盖 legal list/string、invalid audio/non-audio、unusable `req_id`、nested marker without id、nested/flat conflict、duplicate id、合法 sparse routing 与 VoxCPM2 coalesce/plain producer；并验证一次性 classifier error、rate-limited fail-closed error 和无 D2H 读取。 ^[PR #5452]
+- 强制：marker 只接受 list of strings 或 bare string，用同一 `1/true/yes/on`（大小写不敏感）集合判定，`None` 表示缺失；nested 与 flattened encoding 必须独立解析，冲突、重复 id、不可用 id 或非法 carrier 必须记录。协议异常由 `resolve_sparse_mm_routing` 在模块内吸收：audio 返回 `([], {}, True)`，非 audio 保留原 downstream/dense 路由。任何 subset producer 都必须声明按 `meta.req_id` 对齐，模型特有的发射分支见对应 owner。
+- 禁止：对 tensor/ndarray/number marker 做元素读取或归一化、把非法 audio sparse declaration 降级为 dense、静默抹掉任一 encoding，或发送未声明 alignment 的 subset 音频列表；不得把协议异常的局部吸收外推为整个 runner 的 per-request 失败隔离。
+- 验收：覆盖 legal list/string、invalid audio/non-audio、unusable `req_id`、双向 mixed encoding、nested/flat conflict、duplicate id 与合法 sparse routing。classifier 按 offender 去重，audio routing 后果首次立即记录、持续错误每 60 秒可再次记录并携带 suppressed 次数；用模拟时钟和并发调用断言计数准确、状态加锁、日志在锁外，不能用进程级一次性日志隐藏持续 outage。确认非法 device marker 无 D2H 读取。 ^[PR #5452]
 
 ## EXEC-11d — model sampler fallback 与 penalty padding 必须保持显式合同
 
 - 触发：模型声明 `prefer_model_sampler`，修改 runner 的 model sampler fallback，或调整 prompt ids 与 logits vocab 的 penalty 处理。
-- 强制：`model.sample()` 返回非 `None` 时直接采用；返回 `None` 必须回退默认 sampler 并通过 `warning_once` 保持可见；prompt padding 必须 clamp 到 `logits_vocab`，保留 upstream 的 padding bin 语义；新增 declarer 必须经过精确 assignment inventory 同意。
+- 强制：仅在没有 speculative metadata、logits 非 `None`、`model.sample` 可调用且 `prefer_model_sampler` 为真时走模型 sampler（capability 缺省为 False）；返回非 `None` 时直接采用，返回 `None` 回退默认 sampler 并通过 `warning_once` 保持可见；prompt padding 必须 clamp 到 `logits_vocab`，保留 upstream 的 padding bin 语义。新增 declarer 必须经过精确 assignment inventory 同意，条件赋值仍需审查可能为真的分支。
 - 禁止：把合法的 `None` fallback 当作采样失败、无日志静默吞掉意外 fallthrough，或 clamp 到 `logits_vocab - 1` 使 padding 被计作最后一个真实 token。
-- 验收：覆盖真实 declarer 的 None/非 None sampler、重复调用仅一次 warning、inventory 增删、padding 对 penalty mask 无影响，以及较窄 logits vocab 下未 clamp 会失败的边界。 ^[PR #5452]
+- 验收：覆盖真实 declarer 的 None/非 None sampler、重复调用仅一次 warning 与 speculative 路径；inventory 覆盖增删、注释/getattr/比较不算声明、显式 `= False` opt-out 与条件赋值，rebase 后按实际源码刷新集合。padding 测试必须调用生产 clamp helper 再断言 upstream bin-count mask，不能在测试内重写 clamp；覆盖 `vocab-1` 污染与未 clamp 越界。 ^[PR #5452]
 
 ## EXEC-11e — 逐请求 logits mask 必须由 live history 与 batch identity 守住窗口
 
