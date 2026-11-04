@@ -1,7 +1,7 @@
 ---
 title: "VoxCPM2（单 stage AR + 模型内扩散侧路,48 kHz）"
 created: 2026-07-21
-updated: 2026-10-06
+updated: 2026-10-09
 type: index
 tags: [vllm-omni, models]
 sources: [vllm_omni/model_executor/models/voxcpm2/, vllm_omni/deploy/voxcpm2.yaml, vllm_omni/worker/gpu_ar_model_runner.py]
@@ -66,6 +66,6 @@ sources: [vllm_omni/model_executor/models/voxcpm2/, vllm_omni/deploy/voxcpm2.yam
   评审"统一改用 gpu_memory_utilization"类清理时本家族是刻意例外。
 - 语义验收见 [model-validation](../../review/guides/model-validation.md)。
 
-- [rules](rules.md)：VOXCPM2-2a 的请求噪声隔离与 VOXCPM2-3a 的 LocDiT 参数/solver 边界。
+- [rules](rules.md)：VOXCPM2-2a 请求噪声、VOXCPM2-3a LocDiT 参数，以及 VOXCPM2-4a dense/plain/coalesce 的 subset 音频顺序与验证边界。
 
 - [NPU estimator exact graphs 与延迟平台注册](rules-npu-graphs.md)
