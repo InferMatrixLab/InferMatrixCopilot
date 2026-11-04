@@ -1,10 +1,10 @@
 ---
 title: "通用设计审查规则"
 created: 2026-07-30
-updated: 2026-09-10
+updated: 2026-10-27
 type: rule
 tags: [general, review]
-sources: ["InferMatrixCopilot Issue #17", "InferMatrixCopilot Issue #24", "vllm-project/vllm-omni PR #5394", "zuiho-kai/claude-workflow-starter@c217fc6", "owner review-rule request 2026-09-10", "JiusiServe/omni-reviewbot PR #56", "JiusiServe/omni-reviewbot PR #57"]
+sources: ["InferMatrixCopilot Issue #17", "InferMatrixCopilot Issue #24", "vllm-project/vllm-omni PR #5394", "vllm-project/vllm-omni PR #6711", "zuiho-kai/claude-workflow-starter@c217fc6", "owner review-rule request 2026-09-10", "JiusiServe/omni-reviewbot PR #56", "JiusiServe/omni-reviewbot PR #57"]
 confidence: high
 ---
 
@@ -77,6 +77,25 @@ confidence: high
   后继续无上限等待“完整结果”。
 - 验收：10 分钟内给用户 actionable findings 或明确的 `partial review`；更深验证作为
   后续可选任务，不阻塞本轮答复。 ^[InferMatrixCopilot Issue #24]
+
+### REV-2d — 新执行路径必须按语义枚举同类抽象
+
+- 触发：PR 新增或扩张 alternate `forward`、plan、dispatcher、packing/sharding、fallback，
+  或在单个 model/backend 内复制一条现有执行阶段；尤其是新路径仍遵循“拆分输入 →
+  局部计算 → 在全局算子边界恢复逻辑输入 → 恢复输出布局”的数据流。
+- 强制：先用不含新类名或函数名的语言写出数据变换、状态 owner 和必须保持全局语义的
+  算子边界；再从 framework registry、基类、公共 layer、相邻 model/backend 和调用方
+  搜索相同前后置合同的实现。比较最近 analogue 的 transport、layout、side tensor、
+  lifecycle 与 hook 边界，明确哪些机制可进入共享 owner、哪些语义必须留在当前模型，
+  最终记录 `REUSE / EXTEND / NEW` 结论及证据。
+- 禁止：只搜索 PR 新增的 symbol 或只阅读 changed files；把名字不同、一个跨 rank 而
+  另一个在本地 batch 执行直接当成无关；反过来也不能仅凭流程相似就要求共用实现，
+  必须证明共享合同和 owner 边界真实存在。
+- 验收：审查记录至少包含概念化数据流、搜索过的共享 surface、最近同类实现、共同点与
+  必须保留的差异。若新路径跨 transformer/block/attention 等多层复制原路径，finding
+  落在最早引入平行控制流的 changed line，并给出可执行的 `REUSE / EXTEND / MOVE`
+  方向；确认独立实现合理时也记录 `NEW` 理由，不强行开单。
+  ^[vllm-project/vllm-omni PR #6711]
 
 ## 测试证据
 
