@@ -99,6 +99,7 @@ def _no_real_run_roots(tmp_path, monkeypatch):
     the real ~/.infermatrix-copilot/runs. Feedback tests also never write a
     user's ledger or contact a configured team collector unless opted in."""
     monkeypatch.setenv("KB_RUN_ROOTS", str(tmp_path / "no-runs"))
+    monkeypatch.setenv("KNOWLEDGE_TRACE_ROOT", str(tmp_path / "knowledge-traces"))
     monkeypatch.setenv("KNOWLEDGE_LEARNING_STATE_DIR", str(tmp_path / "learning-state"))
     monkeypatch.setenv("KNOWLEDGE_FEEDBACK_URL", "")
     monkeypatch.setenv("KNOWLEDGE_FEEDBACK_TOKEN", "")

@@ -1,6 +1,6 @@
 # trace_store.py —— 规范
 
-<!-- verified-against: 2026-10-05 -->
+<!-- verified-against: 2026-11-04 -->
 
 `LOC ~500 · trace/1：Copilot 与 RB 共用的模型调用/工具调用/判定/结果记录 · refactor-status: stable`
 
@@ -8,7 +8,7 @@
 - `TraceStore(root)`：追加式 `records/<日期>.jsonl`（事实来源）+ 内容寻址 blob
   （`blobs/<aa>/<sha256>.gz`，gzip，读取时复核哈希）+ SQLite 索引 `index.db`
   （按 kind、run、仓库、变更集、PR、规则 ID、角色、模型、结果查询；`rebuild_index` 可从 JSONL 重建）。
-- 记录（`schema: trace/1`）：`kind` ∈ `model_call`/`tool_call`/`decision`/`outcome`/`replay`；`context`（run_id、
+- 记录（`schema: trace/1`）：`kind` ∈ `model_call`/`tool_call`/`decision`/`outcome`/`replay`/`knowledge_event`；`context`（run_id、
   playbook、step、repo、changeset_id、pr、rule_ids、workflow、unit_id、item、fingerprint、of…）、`model`（role、provider、model、effort、served_model）、
   `usage`、`seconds`、`inputs`/`outputs`（只存 blob 引用，从不内联正文）、`result`、`error`、`env`
   （copilot 版本与 SHA）。`outcome` 是事后金标（merged、closed_unmerged、head_changed、rule_retired）。
@@ -50,3 +50,13 @@
 重建到 schema 0 + 旧代码位置式插入、只读比较、两处 choke point 的采集、声明与指纹、执行器上下文、CLI 门）；
 `test_trace_store.py`（schema 与去重 blob、索引与重建、脱敏、网关记录成功与失败调用、回放、导出的判定/结果
 关联与校准集泄漏过滤、SDK 导出、知识服务的 decision/outcome 记录、派发前输入留档、原生事件及中断保留）。
+
+## 2026-11-04 knowledge_event
+
+`trace/1` 允许 `kind=knowledge_event`，`result` 包含
+`schema=knowledge-use/1` 的共享知识使用协议。session、retrieval、content、
+evidence、assessment、gap 和 finish 事件沿用脱敏 blob、追加 JSONL 与派生索引；
+run/step/repository/rule 等现有查询列保持可用，不触发索引迁移。会话级排序、
+引用与幂等校验属于 `knowledge_trace/`，TraceStore 只拥有通用持久化。
+新 kind 不得被当作模型调用、事后 outcome 或训练样本。协议与验证见
+[knowledge_trace.md](knowledge_trace.md) 及 `test/test_knowledge_trace.py`。

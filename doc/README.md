@@ -35,6 +35,7 @@
 | 文档 | 状态 |
 |---|---|
 | [`features/provider-registry.md`](features/provider-registry.md) | 已实现——五种后端的统一注册表 |
+| [`features/knowledge-use-trace.md`](features/knowledge-use-trace.md) | 知识检索、内容提供、规则检查与证据的逐步追踪 |
 | [`features/strict-review-deep-engine.md`](features/strict-review-deep-engine.md) | 已实现（默认开） |
 | [`features/review-recall.md`](features/review-recall.md) | 已实现（默认开）——v14/v15 召回攻坚 |
 | [`features/auto-run.md`](features/auto-run.md) | **draft，未实现**——GitHub 事件触发 |

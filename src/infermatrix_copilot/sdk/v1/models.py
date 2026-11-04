@@ -10,6 +10,7 @@ DIRECT_API_VERSION = "1.1.0"
 STRICT_API_VERSION = "1.4.0"  # StrictRuntimeConfig.max_workers
 QUALITY_API_VERSION = "1.0.0"
 KNOWLEDGE_API_VERSION = "1.1.0"
+KNOWLEDGE_TRACE_API_VERSION = "1.0.0"
 
 
 class _Serializable:
@@ -78,6 +79,7 @@ class DocumentPage(_Serializable):
     next_offset: int | None
     review_context_id: str = ""
     knowledge_feedback: dict[str, Any] = field(default_factory=dict)
+    knowledge_trace: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = super().to_dict()
@@ -209,6 +211,11 @@ class Capabilities(_Serializable):
     max_strict_workers: int
     knowledge_maintenance_protocol_version: int = 1
     supports_knowledge_containment: bool = True
+    supports_knowledge_usage_trace: bool = True
+    knowledge_trace_api_version: str = KNOWLEDGE_TRACE_API_VERSION
+    knowledge_trace_boundaries: tuple[str, ...] = (
+        "provider_response", "host_context", "model_request",
+    )
 
 
 @dataclass(frozen=True)
@@ -274,6 +281,7 @@ class DirectReviewPlan(_Serializable):
     untested_public_api: dict[str, Any] = field(default_factory=dict)
     related_knowledge: dict[str, Any] = field(default_factory=dict)
     knowledge_feedback: dict[str, Any] = field(default_factory=dict)
+    knowledge_trace: dict[str, Any] = field(default_factory=dict)
 
 FeedbackStatus = Literal[
     "checked", "disabled", "unavailable", "not_applicable"

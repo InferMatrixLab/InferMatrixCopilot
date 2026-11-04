@@ -77,7 +77,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 SCHEMA = "trace/1"
-KINDS = ("model_call", "tool_call", "decision", "outcome", "replay")
+KINDS = ("model_call", "tool_call", "decision", "outcome", "replay", "knowledge_event")
 SCHEMA_VERSION = 2
 _CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar("trace_context", default={})
 _STORE: contextvars.ContextVar["TraceStore | None"] = contextvars.ContextVar("trace_store", default=None)

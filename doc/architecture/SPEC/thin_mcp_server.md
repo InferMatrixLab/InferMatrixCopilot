@@ -1,6 +1,6 @@
 # thin_mcp_server.py —— 规范
 
-<!-- verified-against: 2026-10-30 -->
+<!-- verified-against: 2026-11-04 -->
 
 `LOC ~490 · 默认 MCP：Direct 门面 + Strict 入口 · refactor-status: ok`
 
@@ -172,3 +172,21 @@ Skill 与物理引用路径；不兼容协议拒绝执行。写知识的工作�
 authoring checkout，不能修改安装制品。`get_update_status()` 仅读取当前、活动、
 待安装版本和升级状态，不下载、不启动 updater。贡献入口同时支持 wheel 内的
 `_runtime/doc/knowledge/`。升级与进程固定契约见 [upgrade.md](upgrade.md)。
+
+## 2026-11-04 知识使用追踪
+
+Direct review 返回可选 `knowledge_trace` 元数据；`doc_read`、`doc_search`
+及自适应上下文工具携带 trace/context 时使用原固定知识视图并记录实际交付，
+不可用的上下文明示失败。自适应工具仅观测 budget 后 `model_content` 的正文，
+不重复解析 `documents` 作为全文，也不改变反馈、用户协议、containment 或
+累计预算服务的授权。已授权跨仓库交付只产生追踪范围缺口。
+
+四个增量工具是 `start_knowledge_trace`、`record_knowledge_usage`、
+`finish_knowledge_trace` 和 `get_knowledge_trace`，统一委托公开
+`KnowledgeTraceClient`。宿主回执属于 `host_context` 声明，不能假冒
+`provider_response` 或捕获的工具证据；证据、assessment 和幂等重试由共享
+协议校验。读取/报告可在进程重启后恢复，带 repository 的调用校验会话归属。
+`best_effort` 故障独立报告 degraded，`required` 阻止后续受控工作；Direct
+完成校验与追踪完成状态分别返回。相关宿主步骤见随 release 提供的 imreview
+工作流。验证见 `test/test_thin_mcp_server.py` 与
+`test/test_knowledge_trace_direct.py`。

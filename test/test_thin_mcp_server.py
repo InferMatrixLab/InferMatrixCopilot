@@ -143,6 +143,10 @@ def test_direct_entrypoints_do_not_resolve_repo(monkeypatch):
         "knowledge_feedback_report",
         "knowledge_feedback_sync",
         "knowledge_agreement",
+        "start_knowledge_trace",
+        "record_knowledge_usage",
+        "finish_knowledge_trace",
+        "get_knowledge_trace",
     }
 
     review = mcp.tools["review"](

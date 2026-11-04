@@ -29,6 +29,7 @@ from .knowledge import (
     _retrieve_skills,
 )
 from .utils import _build_evidence, _coerce_output, _permissions_view, _to_step_result
+from .knowledge_trace import StepKnowledgeTrace, get_knowledge_trace
 
 
 async def run_agent_step(
@@ -87,6 +88,25 @@ async def run_agent_step(
                                 if hasattr(ctx.llm, "for_target") else ctx.llm)
     contract = {**BASE_OUTPUT_SCHEMA, **(output_extension or {})}
     capped, refs = _build_evidence(ctx, evidence)
+    try:
+        run_knowledge_trace = get_knowledge_trace(ctx)
+    except RuntimeError as exc:
+        return StepResult(False, FailureKind.BLOCKED, str(exc)), {}
+    knowledge_trace = (StepKnowledgeTrace(run_knowledge_trace, step_name)
+                       if run_knowledge_trace is not None else None)
+    if knowledge_trace is not None:
+        contract["knowledge_assessments"] = (
+            "OPTIONAL list (may omit): {knowledge_ref_id and exposure_ids: exact IDs from the trace reference map, "
+            "or document_id: knowledge-relative page path, "
+            "rule_id: exact rule heading ID if applicable, applicability: "
+            "applicable|not_applicable|unknown, verification: supported|contradicted|unresolved, "
+            "rationale: brief checkable reason, check: concrete check when applicable, "
+            "evidence_ids: list of input.<evidence-name> or tool.<tool_use_id> actually observed, "
+            "decision_ids: optional finding:<zero-based-index> or finding object ID}. Assess only rules you examined; "
+            "supported/contradicted requires evidence. Do not report internal deliberation.")
+        knowledge_trace.evidence.update({"input." + name: {
+            "kind": "source", "input_name": name, "content": content}
+            for name, content in capped.items()})
 
     query = " ".join(str(x) for x in [
         spec.get("kind", ""), step_name,
@@ -94,11 +114,16 @@ async def run_agent_step(
         *list(evidence.keys())[:5]])
     skills, store = _retrieve_skills(ctx, query)
     memories = _retrieve_memories(ctx, query)
-    knowledge = _knowledge_tools(store, ctx)
+    if knowledge_trace is not None:
+        knowledge_trace.external_context([{"name": s["name"]} for s in skills],
+                                         "skill_injection", query)
+        knowledge_trace.external_context([{"summary": m} for m in memories],
+                                         "memory_injection", query)
+    knowledge = _knowledge_tools(store, ctx, knowledge_trace)
 
     adapter = _resolve_adapter(ctx)
     all_extra = {**knowledge, **_repo_map_tool(ctx, adapter),
-                 **_repo_docs_tool(ctx, adapter), **(extra_tools or {})}
+                 **_repo_docs_tool(ctx, adapter, knowledge_trace), **(extra_tools or {})}
     # Briefing = GENERAL knowledge (shared, cross-repo) + this repo's
     # REPO-SPECIFIC slice — both from the shared knowledge base. Deeper docs are
     # pulled on demand via the doc tools (all_extra above).
@@ -122,10 +147,12 @@ async def run_agent_step(
                     kroot, ctx.settings.knowledge_general_docs,
                     header="General knowledge (cross-repo; open deeper "
                            "docs with doc_read / doc_search):",
-                    warnings=briefing_warnings))
+                    warnings=briefing_warnings,
+                    on_document=knowledge_trace.briefing_document if knowledge_trace else None))
             if adapter is not None:
                 parts.append(adapter.briefing(
-                    kroot, warnings=briefing_warnings, mode=tier))
+                    kroot, warnings=briefing_warnings, mode=tier,
+                    on_document=knowledge_trace.briefing_document if knowledge_trace else None))
             briefing = "\n\n".join(p for p in parts if p)
             for warning in briefing_warnings:
                 ctx.trace.record("knowledge_warning", step=step_name,
@@ -202,8 +229,15 @@ async def run_agent_step(
     prompt = dispatch_ctx.render()
     if guidance:
         prompt += f"\n\n## STEP GUIDANCE\n{guidance}"
-    if harness_member is not None or (target.kind == "harness"
-                                      and llm_override is None):
+    harness_backend = harness_member is not None or (target.kind == "harness" and llm_override is None)
+    if knowledge_trace is not None:
+        if harness_backend:
+            knowledge_trace.gap("harness_model_requests_unobserved",
+                                detail="Prompt handoff observed; native file reads and internal model requests are unknown.")
+            knowledge_trace.observe([{"content": prompt}], boundary="host_context")
+        else:
+            step_llm = knowledge_trace.wrap_llm(step_llm)
+    if harness_backend:
         # Harness backend (doc/features/provider-registry.md): the vendor CLI owns
         # the tool loop for this whole step — same prompt bundle and output
         # contract, builtin tools served back through the MCP bridge under
@@ -228,6 +262,8 @@ async def run_agent_step(
     output = _coerce_output(outcome.text, ctx, contract)
     if output is not None:
         output.setdefault("_tools_used", outcome.tools_used[:40])
+        if knowledge_trace is not None:
+            knowledge_trace.assessments(output)
     ctx.trace.record(
         "agent_output", step=step_name, ok=output is not None,
         tool_calls=outcome.tool_calls, tools_used=outcome.tools_used[:30],

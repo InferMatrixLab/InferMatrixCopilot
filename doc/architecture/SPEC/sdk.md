@@ -1,6 +1,6 @@
 # sdk/ —— 规范
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-11-04 -->
 
 
 `Python SDK v1 · 跨仓库唯一 typed 边界 · refactor-status: ok`
@@ -217,3 +217,27 @@ Direct 1.1 / Strict 1.3 accept typed `CarriedFinding` inputs (unique IDs, source
 Opt-in protocol 1 exports `knowledge_maintenance_status`, `knowledge_usage_record`, `knowledge_availability_check`, `knowledge_publication_guard` and `knowledge_policy_install`. DirectClient and StrictRuntimeConfig accept explicit maintenance configuration. Usage accepts an exact privately issued provider context; arbitrary caller hashes cannot mint provenance. Retrieved and actually injected units are separate from conservative Strict snapshot scope. Current generation is checked at Direct validation and Strict polling; held Strict results retain the original result with top-level state `held`. Hosts hold the publication guard around final admissibility and the external write; the installer drains that same lock before signed policy publication and ACK. ACK includes actual current knowledge snapshot/tree and corrected-content observations, separately from protocol readiness. No service private key crosses this SDK boundary.
 
 Direct plan receipts bind a provider-private durable delivery session. Adaptive follow-up read/search/related deliveries and continuations after expansion join the same session before returning; legacy `read_document(review_context_id=...)` pages join their original review's session as well. `validate` and the generic final `knowledge_availability_check` resolve all delivered dependencies, including when the host reuses its initial receipt after another SDK instance resumes an adaptive session. Caller-supplied session IDs cannot create that binding. Enforced document reads require the existing provider-issued `review_context_id` and include it in `DocumentPage.to_dict()` so identical pages in concurrent reviews retain separate provenance. The optional field is omitted when empty; disabled standalone reads retain compatibility. SDK retrieval does not claim model injection; the host records actual injection separately.
+
+## 2026-11-04 知识使用追踪
+
+`sdk.v1.KnowledgeTraceClient` 为惰性公共导出，提供 `start_session`、
+`record_events`（`record_usage` 别名）、`finish_session` 和 `get_report`。
+宿主只能提交 host-context 回执、host-reported 证据、assessment 与缺口；回执
+引用既有 exposure，不能改写 provider 内容、哈希或规则身份。批量提交有界且
+可幂等重试，所有引用仍经共享协议校验。导入公共 SDK 不初始化追踪存储。
+
+`Capabilities` 声明知识追踪支持与协议版本。`DirectReviewPlan`、`DocumentRef`
+和 `DocumentPage` 增加默认可空的追踪/引用元数据，旧客户端可忽略。相同计划
+请求复用其 trace；新的 `review_id` 开始新的执行尝试。后续携带 trace/context
+的读取绑定原冻结 view，失效时明确拒绝，不能回退当前快照。trace ID 不授予
+读取权限。存储故障持续反映在 capture/finish 状态，不能在恢复后隐去缺口。
+
+legacy plan 记录最终返回的 quick map、related prose 和 SDK excerpt；自适应
+plan/read/search/related 仅从经过累计预算的 `model_content` 获取实际提供片段，
+不为追踪重复读取 `documents` 引用或额外返回 excerpt。检索记录保留 repo、
+source pins 和上下文会话；continuation 的源区间保持未知。已由上下文服务授权
+的跨仓库内容继续提供，单仓库追踪记录 `context_cross_repository_unobserved`
+而不扩大追踪范围。原反馈、用户协议和 containment 签发/校验顺序保持不变。
+服务返回仅证明 `provider_response`，宿主另报 `host_context` 才证明其交付声明。
+验证见 `test/test_knowledge_trace_direct.py`、
+`test/test_knowledge_trace_adaptive.py`；协议详见 [knowledge_trace.md](knowledge_trace.md)。

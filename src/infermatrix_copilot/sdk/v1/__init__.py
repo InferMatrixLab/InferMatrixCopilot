@@ -7,9 +7,11 @@ from ...knowledge_service.containment import (
     ContainmentError, knowledge_maintenance_status, knowledge_usage_record,
     knowledge_availability_check, knowledge_publication_guard, knowledge_policy_install,
 )
+from .knowledge_trace import KnowledgeTraceClient
 from .models import (
     DIRECT_API_VERSION,
     KNOWLEDGE_API_VERSION,
+    KNOWLEDGE_TRACE_API_VERSION,
     QUALITY_API_VERSION,
     SDK_API_VERSION,
     STRICT_API_VERSION,
@@ -66,6 +68,8 @@ __all__ = [
     "SourceRef",
     "DIRECT_API_VERSION",
     "KNOWLEDGE_API_VERSION",
+    "KNOWLEDGE_TRACE_API_VERSION",
+    "KnowledgeTraceClient",
     "QUALITY_API_VERSION",
     "SDK_API_VERSION",
     "STRICT_API_VERSION",

@@ -152,13 +152,17 @@ def _retrieve_memories(ctx: StepContext, query: str) -> list[str]:
     return hits[:3]
 
 
-def _knowledge_tools(store: "_ScopedKnowledge", ctx: StepContext) -> dict[str, ToolDef]:
+def _knowledge_tools(store: "_ScopedKnowledge", ctx: StepContext,
+                     knowledge_trace=None) -> dict[str, ToolDef]:
     """Read-only knowledge tools + governed skill-candidate proposals."""
 
     def skill_search(query: str, **_: Any) -> str:
         """Tool: return up to 5 matching skills rendered as name + description +
         body head, or a `(no matching skills)` sentinel."""
         hits = store.find(query=query, k=5)
+        if knowledge_trace is not None:
+            knowledge_trace.external_context(
+                [{"name": s.name} for s in hits], "skill_search", query=query)
         if not hits:
             return "(no matching skills)"
         return "\n\n".join(f"# {s.name}\n{s.description}\n{s.body[:1500]}"
@@ -168,6 +172,9 @@ def _knowledge_tools(store: "_ScopedKnowledge", ctx: StepContext) -> dict[str, T
         """Tool: return the debug-memory hits for `query` as newline-joined
         lines, or a `(no matching debug memories)` sentinel."""
         hits = _retrieve_memories(ctx, query)
+        if knowledge_trace is not None:
+            knowledge_trace.external_context(
+                [{"summary": h} for h in hits], "memory_search", query=query)
         return "\n".join(hits) or "(no matching debug memories)"
 
     def skill_update_candidate(name: str, description: str, body: str,
@@ -250,7 +257,7 @@ def _repo_map_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
          "required": ["query"]}, repo_map)}
 
 
-def _repo_docs_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
+def _repo_docs_tool(ctx: StepContext, adapter, knowledge_trace=None) -> dict[str, ToolDef]:
     """Shared read/search tools plus bounded implementation context.
 
     General docs are readable; related prose is selected only from the active
@@ -291,30 +298,53 @@ def _repo_docs_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
         session_id = adaptive.open_session(selector, source_pin=head,
                                           review_id=ctx.run_dir.name, budget=budget)["session_id"]
 
+    def adaptive_result(packet: dict, mechanism: str, query: str = "") -> str:
+        # The budgeted model packet owns the delivered bytes. Its document
+        # references contain metadata only; reading the pages again here would
+        # falsely attribute unbudgeted content to the model.
+        if knowledge_trace is not None:
+            knowledge_trace.adaptive_packet(packet, mechanism, query=query)
+        return json.dumps(packet, ensure_ascii=False)
+
     def doc_search(query: str, repository: str | None = None, **_: Any) -> str:
         """Tool: grep the knowledge base's markdown for `query`; return
         knowledge-relative `path:line:text` matches (capped), or a sentinel."""
         try:
             if adaptive is not None:
-                return json.dumps(adaptive.search(session_id, query, repository=repository), ensure_ascii=False)
+                return adaptive_result(adaptive.search(session_id, query, repository=repository),
+                                       "doc_search", query)
             hits = docs.search(query)
         except KnowledgeDocsError as exc:
+            if knowledge_trace is not None:
+                knowledge_trace.gap("doc_search_refused", detail=str(exc))
             return f"refused: {exc}"
-        return "\n".join(
+        result = "\n".join(
             f"{h['path']}:{h['line']}:{h['text']}" for h in hits
         ) or "(no matching docs)"
+        if knowledge_trace is not None:
+            knowledge_trace.tool_result("doc_search", {"hits": hits, "query": query}, result)
+        return result
 
     def doc_read(path: str, offset: int = 0, repository: str | None = None, **_: Any) -> str:
         """Tool: read a knowledge-base doc by its knowledge-relative path
         (windowed 24k chars; page with offset). Refuses paths escaping the base."""
         try:
             if adaptive is not None:
-                return json.dumps(adaptive.read(session_id, path, offset=offset, repository=repository), ensure_ascii=False)
+                return adaptive_result(adaptive.read(session_id, path, offset=offset, repository=repository),
+                                       "doc_read")
             page = docs.read(path, offset=offset)
         except FileNotFoundError:
+            if knowledge_trace is not None:
+                knowledge_trace.gap("doc_read_missing", document_id=path)
             return f"(no such doc: {path})"
         except KnowledgeDocsError as exc:
+            if knowledge_trace is not None:
+                knowledge_trace.gap("doc_read_refused", detail=str(exc))
             return f"refused: {exc}"
+        if knowledge_trace is not None:
+            knowledge_trace.tool_result("doc_read", {
+                "path": page["path"], "offset": offset,
+                "truncated": page["next_offset"] is not None}, page["content"])
         window = page["content"]
         if page["next_offset"] is not None:
             window += (f"\n...[truncated — call doc_read again with "
@@ -330,9 +360,15 @@ def _repo_docs_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
                                  model_content_sha256=packet["model_content_sha256"],
                                  model_content=packet["model_content"], documents=packet["documents"],
                                  consumed_tokens=packet["consumed_tokens"], token_accounting=packet["token_accounting"])
-                return json.dumps(packet, ensure_ascii=False)
-            return json.dumps(docs.related(changed_files, query=query), ensure_ascii=False)
+                return adaptive_result(packet, "doc_related", query)
+            related = docs.related(changed_files, query=query)
+            result = json.dumps(related, ensure_ascii=False)
+            if knowledge_trace is not None:
+                knowledge_trace.tool_result("doc_related", {**related, "query": query}, result)
+            return result
         except KnowledgeDocsError as exc:
+            if knowledge_trace is not None:
+                knowledge_trace.gap("doc_related_refused", detail=str(exc))
             return json.dumps({"status": "refused", "reason": str(exc), "documents": []})
 
     s = {"type": "string"}
@@ -364,7 +400,8 @@ def _repo_docs_tool(ctx: StepContext, adapter) -> dict[str, ToolDef]:
             if adapter is not None:
                 paths += list((adapter.manifest.get("knowledge") or {}).get("briefing_docs") or [])
             rows = [{"path": path} for path in dict.fromkeys(paths) if (view.root / path).is_file()]
-            return json.dumps(adaptive.inject(session_id, rows, purpose="general-and-owner-briefing"), ensure_ascii=False)
+            return adaptive_result(adaptive.inject(session_id, rows, purpose="general-and-owner-briefing"),
+                                   "briefing")
 
         def context_expand(target_tokens: int, reason: str, **_: Any) -> str:
             return json.dumps(adaptive.expand(session_id, target_tokens=target_tokens, reason=reason), ensure_ascii=False)

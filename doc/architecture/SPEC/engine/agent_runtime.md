@@ -1,6 +1,6 @@
 # engine/agent_runtime/ —— 规范
 
-<!-- verified-against: 2026-10-06 -->
+<!-- verified-against: 2026-11-04 -->
 
 `LOC ~1690（7 个文件） · 引擎（受治理的 agent 运行时） · refactor-status: ok`
 
@@ -119,3 +119,26 @@ cheap-seat 与按 pass 路由、MoA harness 成员、考古工具）。有两条
 ## 自进化接入（2026-10-04）
 
 影子 agent 使用严格只读 scope，知识检索与 repo map 受读根约束，拒绝知识写入工具。API 与 harness 调用均记录 trace/1；工作流的采集和配置指纹由执行器绑定，普通生产运行保持既有工具能力。
+
+## 2026-11-04 知识使用追踪
+
+`knowledge_trace.py` 是 Strict 到共享 `knowledge_trace/` 协议的唯一桥接：
+每次执行尝试建立一份会话，并行步骤和 MoA 成员保留完整的限定 step ID。
+`dispatch` 增加可选 `knowledge_assessments`，把规则、具体检查、证据和 finding
+关联；缺失声明保持未评估。每次模型调用的证据 ID 独立，重复 step 不覆盖旧证据。
+
+文档工具与 briefing 先记录检索，再排队候选内容；runner 在最终请求组装和
+裁剪后确认实际存在的片段，才记录 `model_request` 提供边界。自适应服务返回的
+`documents` 只作引用；`adaptive.packet_fragments` 仅解析实际 `model_content`
+中完整、哈希一致的 provider 围栏，不再读取源文档。保留 repo、source pins 和
+上下文会话元数据；continuation 或变换片段的源区间未知，预算截断明确保留。
+已授权的跨仓库自适应内容保持原执行行为，由单仓库追踪记录
+`context_cross_repository_unobserved` 缺口，不扩大追踪权限。累计预算、反馈回执、
+containment 与用户协议门继续由原知识上下文服务拥有。
+
+API 模式可以观测模型请求；harness 模式记录提供给外部 CLI 的 prompt 边界，
+外部 CLI 的原生读取和内部请求不能据此宣称已观测。skill/debug memory 保留
+检索身份并说明其缺少 curated-document 来源。`required` 采集失败阻止后续受控
+工作，`best_effort` 保持执行并标为 degraded；终结时写 JSON/Markdown 报告。
+验证见 `test/test_knowledge_trace_strict.py`、
+`test/test_knowledge_trace_adaptive_strict.py`。

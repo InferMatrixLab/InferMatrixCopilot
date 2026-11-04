@@ -1,6 +1,6 @@
 # cli/ —— 规范
 
-<!-- verified-against: 2026-10-30 -->
+<!-- verified-against: 2026-11-04 -->
 
 `LOC ~1420（6 个文件） · 接口 + 编排门面 · refactor-status: ok`
 
@@ -141,3 +141,12 @@ RFC 子命令原样转发与共享入口：`test_rfc_integration.py`；服务契
 保留原始 run，不自动重放已经完成的任务。托管安装的执行还在 worker 内持有
 跨进程 checkout/PR 锁，以覆盖不同 MCP 进程和 release；运行时固定与控制面契约见
 [upgrade.md](upgrade.md)。
+
+## 2026-11-04 知识使用追踪
+
+`infermatrix-copilot knowledge-trace …` 在通用 argparse、Copilot 和模型构造前
+分派到 `knowledge_trace.cli.main`。`show` 支持原始事件分页；`export` 读取全部
+事件页后输出 JSON 或 Markdown；`query --repo … --rule …` 返回有界事件摘要。
+`--root` 指定追踪运行目录；读取已有记录不受采集模式 `off` 限制。该入口不读取
+产品知识来补造历史记录，也不调用模型或发布结果。验证见
+`test/test_knowledge_trace_cli.py`。

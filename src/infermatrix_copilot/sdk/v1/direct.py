@@ -8,6 +8,7 @@ import json
 import re
 import threading
 import uuid
+from copy import deepcopy
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -42,6 +43,25 @@ _EXCERPT_BYTES = 64 * 1024
 _DEFAULT_CONTEXT_LIMIT = 256
 _FULL_SHA = re.compile(r"[0-9a-fA-F]{40}")
 _CONTEXT_ID = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _quick_map_rule_ids(content: str, source_content: str) -> list[str]:
+    """Resolve explicit map references against actual heading IDs in the page.
+
+    Maps sometimes abbreviate adjacent IDs (``SCHED-1a/1b``). Only expansions
+    that exist as actual source sections are accepted; prose never invents IDs.
+    """
+    from ...knowledge_trace import extract_rule_sections
+
+    known = {section["rule_id"] for section in extract_rule_sections(source_content)}
+    found = set()
+    for match in re.finditer(r"(?<![\w-])([A-Z][A-Z0-9_]*(?:-[A-Z0-9_]+)*-)(\d+[a-z]*)(?![\w-])((?:\s*/\s*\d+[a-z]*)*)(?![\w-])", content):
+        prefix, first, suffix = match.groups()
+        for number in [first, *re.findall(r"\d+[a-z]*", suffix)]:
+            rule_id = prefix + number
+            if rule_id in known:
+                found.add(rule_id)
+    return sorted(found)
 
 
 def _distribution_version() -> str:
@@ -129,6 +149,8 @@ class _IssuedContext:
     knowledge_usage: dict | None = None
     task_id: str = ""
     repository: str = ""
+    trace_id: str = ""
+    trace_metadata: Any = None
 
 
 class DirectClient:
@@ -136,24 +158,29 @@ class DirectClient:
 
     Completion validation is intentionally bound to plans issued by this
     client instance.  The registry is bounded so a long-running review host
-    cannot grow memory without limit.
+    cannot grow memory without limit. Repeating an identical review context
+    reuses its trace; use a new review_id for a new attempt.
     """
 
     def __init__(self, *, max_issued_contexts: int = _DEFAULT_CONTEXT_LIMIT,
                  knowledge_context_path: str | Path | None = None,
                  allowed_knowledge_repositories: tuple[str, ...] = (),
-                 knowledge_maintenance: dict | None = None) -> None:
+                 knowledge_maintenance: dict | None = None,
+                 trace_root: str | Path | None = None, trace_mode: str | None = None) -> None:
         if max_issued_contexts < 1:
             raise InvalidRequestError("max_issued_contexts must be >= 1")
         self._adapters = adapters_root()
         self._max_issued_contexts = int(max_issued_contexts)
         self._issued_contexts: OrderedDict[str, _IssuedContext] = OrderedDict()
-        self._context_lock = threading.Lock()
+        self._context_lock = threading.RLock()
         self._knowledge_context_path = Path(knowledge_context_path) if knowledge_context_path else \
             Path.home() / ".infermatrix-copilot" / "knowledge-context.sqlite"
         self._knowledge_context_services: dict[str, Any] = {}
         self._allowed_knowledge_repositories = tuple(allowed_knowledge_repositories)
         self._knowledge_maintenance = knowledge_maintenance
+        from .knowledge_trace import KnowledgeTraceClient
+
+        self.knowledge_trace = KnowledgeTraceClient(root=trace_root, mode=trace_mode)
 
     @staticmethod
     def _view():
@@ -273,6 +300,8 @@ class DirectClient:
         review_context_id: str = "",
         task_id: str = "",
         repository: str = "",
+        trace_id: str = "",
+        step_id: str = "document.read",
     ) -> DocumentPage:
         """Read one knowledge document page.
 
@@ -289,6 +318,7 @@ class DirectClient:
                 "offset must be >= 0 and max_bytes must be within 1..65536"
             )
         view = None
+        issued = None
         context_id = str(review_context_id).strip().casefold()
         if configuration()["enabled"] and not context_id:
             raise ContainmentError("enforced Direct document reads require a provider-issued review_context_id")
@@ -300,11 +330,24 @@ class DirectClient:
                     "review_context_id was not issued by this DirectClient"
                 )
             view = issued.knowledge_view
+            if trace_id and trace_id != issued.trace_id:
+                raise InvalidRequestError("trace_id does not match the issued review context")
+            trace_id = issued.trace_id
+        elif trace_id:
+            raise InvalidRequestError("traced document reads require review_context_id")
         else:
             view = self._view()
-        data = self._served_bytes(self._document_path(document_id, view))
+        try:
+            if issued:
+                self._check_document_scope(document_id, issued.repository)
+            data = self._served_bytes(self._document_path(document_id, view))
+        except Exception:
+            if trace_id:
+                self.knowledge_trace.record_gap(trace_id, "document_read_failed")
+            raise
         page = data[offset:offset + max_bytes]
         next_offset = offset + len(page) if offset + len(page) < len(data) else None
+        trace_metadata = {}
         result = DocumentPage(
             document_id=document_id,
             sha256=_sha256(data),
@@ -312,6 +355,7 @@ class DirectClient:
             content=page.decode("utf-8", errors="replace"),
             next_offset=next_offset,
             review_context_id=context_id if configuration()["enabled"] else "",
+            knowledge_trace=trace_metadata,
         )
         session = issued.knowledge_usage.get("delivery_session") if context_id and issued.knowledge_usage else None
         if configuration()["enabled"] and not session:
@@ -353,6 +397,21 @@ class DirectClient:
                         repository, ([{"path": document_id, "content": result.content}]
                                      if PurePosixPath(document_id).suffix.casefold() == ".md" else [])))
         result = replace(result, knowledge_feedback=feedback)
+        trace_metadata = {}
+        if trace_id and self.knowledge_trace.enabled:
+            trace_metadata = self._provide(
+                trace_id, step_id=step_id, document_id=document_id, content=page.decode("utf-8", errors="replace"),
+                boundary="provider_response", representation="full_document" if offset == 0 and next_offset is None else "excerpt", offset=offset,
+                offset_unit="utf8_bytes", source_length=len(page), truncated=next_offset is not None,
+                snapshot=view.public_snapshot, document_sha256=_sha256(data),
+            )
+            if self.knowledge_trace.is_degraded(trace_id):
+                with self._context_lock:
+                    current = self._issued_contexts.get(context_id)
+                    if current is not None:
+                        self._issued_contexts[context_id] = replace(current, trace_metadata={
+                            **(current.trace_metadata or {}), "status": "degraded"})
+        result = replace(result, knowledge_trace=trace_metadata)
         _issue_usage(result.to_dict(), view=view, session_id=session)
         return result
 
@@ -402,7 +461,8 @@ class DirectClient:
         status = service.open_session(alias, source_pin=request.expected_head_sha.casefold(),
                                       review_id=request.review_id, budget=budget)
         self._knowledge_context_services[status["session_id"]] = service
-        return status
+        metadata = self._trace_adaptive(status["session_id"])
+        return {**status, "knowledge_trace": metadata} if metadata else status
 
     def _knowledge_context(self, session_id: str):
         service = self._knowledge_context_services.get(session_id)
@@ -462,29 +522,122 @@ class DirectClient:
 
         packet["knowledge_feedback"] = self._feedback(
             service.view, request.review_id, alias, model_content_documents(content))
+        packet = self._trace_context_packet(session_id, packet, step_id="review.plan",
+                                            mechanism="adaptive_review", query=request.title)
         usage = _issue_usage(packet, view=service.view, session_id=session_id)
+        metadata = packet.get("knowledge_trace", {})
         self._remember_context(context_id, request.expected_head_sha.casefold(),
                                tuple(row.to_dict() for row in request.carried_findings), service.view, usage,
-                               task_id=request.review_id, repository=alias)
+                               task_id=request.review_id, repository=alias,
+                               trace_id=metadata.get("trace_id", ""), trace_metadata=metadata)
         return packet
 
     def read_knowledge_context(self, session_id: str, document_id: str, *, offset: int = 0,
                                repository: str | None = None) -> dict:
-        return self._knowledge_context(session_id).read(session_id, document_id, offset=offset, repository=repository)
+        packet = self._knowledge_context(session_id).read(session_id, document_id, offset=offset, repository=repository)
+        return self._trace_context_packet(session_id, packet, step_id="knowledge.read", mechanism="adaptive_read")
 
     def search_knowledge_context(self, session_id: str, query: str, *, repository: str | None = None) -> dict:
-        return self._knowledge_context(session_id).search(session_id, query, repository=repository)
+        packet = self._knowledge_context(session_id).search(session_id, query, repository=repository)
+        return self._trace_context_packet(session_id, packet, step_id="knowledge.search", mechanism="adaptive_search", query=query)
 
     def related_knowledge_context(self, session_id: str, changed_files: list[str], *, query: str = "",
                                   repository: str | None = None) -> dict:
-        return self._knowledge_context(session_id).related(session_id, changed_files, query=query, repository=repository)
+        packet = self._knowledge_context(session_id).related(session_id, changed_files, query=query, repository=repository)
+        return self._trace_context_packet(session_id, packet, step_id="knowledge.related", mechanism="adaptive_related", query=query)
 
     def expand_knowledge_context(self, session_id: str, *, target_tokens: int, reason: str) -> dict:
         return self._knowledge_context(session_id).expand(session_id, target_tokens=target_tokens, reason=reason)
 
+    def _trace_adaptive(self, session_id: str, packet: dict | None = None, *,
+                        step_id: str = "knowledge.context", mechanism: str = "adaptive_context",
+                        query: str = "") -> dict:
+        """Observe the exact budgeted packet without re-reading or selecting knowledge."""
+        if not self.knowledge_trace.enabled:
+            return {}
+        service = self._knowledge_context(session_id)
+        status = service.status(session_id)
+        identity = status["identity"]
+        repository = identity["repository"]["knowledge_slice"].removeprefix("repos/")
+        trace_id = "kt-adaptive-" + session_id
+        try:
+            session = self.knowledge_trace.start_session(
+                repository, mode="direct", trace_id=trace_id,
+                run_id=identity["review_id"],
+                source_revision=identity["source_pin"],
+                knowledge_snapshot=service.view.public_snapshot,
+                resource_revision=self._revision(service.view.root),
+                instrumentation={"provider": "observed", "host_context": "unknown", "applications": "host_reported",
+                                 "adaptive_context_session_id": session_id},
+            )
+            if session.get("status") == "degraded":
+                return session
+            exposures = []
+            if packet is not None:
+                from ...knowledge_trace.adaptive import packet_fragments
+                from ...knowledge_trace.references import document_scope
+
+                fragments = packet_fragments(packet)
+                entries = []
+                for fragment in fragments:
+                    path = fragment["document_id"]
+                    try:
+                        document_scope(path, repository)
+                    except ValueError:
+                        # The context service already authorized this delivery.
+                        # A single-repository trace must not extend that authority
+                        # or prevent a permitted cross-repository context read.
+                        self.knowledge_trace.record_gap(trace_id, "context_cross_repository_unobserved")
+                        continue
+                    entries.append({"document_id": path, "repo_id": fragment.get("repo_id", ""),
+                                    "source_pins": fragment.get("source_pins", []),
+                                    "partial": fragment.get("partial", False),
+                                    "continuation": fragment.get("continuation", False), "session_id": session_id})
+                    provided = self._provide(
+                        trace_id, step_id=step_id, document_id=path,
+                        content=fragment["content"], boundary="provider_response",
+                        representation=fragment.get("representation", "excerpt"),
+                        offset=fragment.get("offset"), source_length=fragment.get("source_length"),
+                        offset_unit=fragment.get("offset_unit", "unicode_codepoints"),
+                        truncated=bool(fragment.get("truncated") or fragment.get("partial")),
+                        snapshot=service.view.public_snapshot,
+                    )
+                    exposures.append({"document_id": path, "source_pins": fragment.get("source_pins", []),
+                                      "repo_id": fragment.get("repo_id", ""), **provided})
+                result = self.knowledge_trace.capture(
+                    "retrieve", trace_id, step_id=step_id, entries=entries,
+                    mechanism=mechanism, query=query,
+                    status=packet.get("status", "ready" if entries else "no_match"),
+                )
+                if result.get("status") == "degraded":
+                    return result
+            return {"trace_id": trace_id,
+                    "status": "degraded" if self.knowledge_trace.is_degraded(trace_id) else "ready",
+                    "exposures": exposures, "host_context": "unconfirmed", "applications": "not_reported"}
+        except Exception as exc:
+            self.knowledge_trace.mark_degraded(trace_id)
+            if self.knowledge_trace.mode == "required":
+                raise
+            return {"trace_id": trace_id, "status": "degraded", "error": str(exc)}
+
+    def _trace_context_packet(self, session_id: str, packet: dict, *, step_id: str,
+                              mechanism: str, query: str = "") -> dict:
+        metadata = self._trace_adaptive(session_id, packet, step_id=step_id, mechanism=mechanism, query=query)
+        if not metadata:
+            return packet
+        result = {**packet, "knowledge_trace": metadata}
+        if result.get("documents"):
+            # Containment issuance binds the exact returned payload. Trace
+            # metadata is part of that object, while the model content and
+            # its cumulative context budget remain unchanged.
+            service = self._knowledge_context(session_id)
+            with configured(self._knowledge_maintenance):
+                _issue_usage(result, view=service.view, session_id=session_id)
+        return result
+
     def _remember_context(
         self, context_id: str, expected_head_sha: str, carried=(), view=None, usage=None,
-        *, task_id: str = "", repository: str = "",
+        *, task_id: str = "", repository: str = "", trace_id: str = "", trace_metadata=None,
     ) -> None:
         view = view if view is not None else self._view()
         from ...direct_routing import _normalize_repo
@@ -498,6 +651,8 @@ class DirectClient:
                 knowledge_usage=usage,
                 task_id=task_id,
                 repository=repository,
+                trace_id=trace_id,
+                trace_metadata=deepcopy(trace_metadata),
             )
             self._issued_contexts.move_to_end(context_id)
             while len(self._issued_contexts) > self._max_issued_contexts:
@@ -611,10 +766,136 @@ class DirectClient:
                           "content": row["document"]["excerpt"]}
                          for row in related.get("documents", []) if row.get("document"))
         plan = replace(plan, knowledge_feedback=self._feedback(view, request.review_id, alias, documents))
-        usage = _issue_usage(plan.to_dict(), view=view, session_id=review_context_id.removeprefix("sha256:"))
-        self._remember_context(review_context_id, expected_head, carried, view, usage,
-                               task_id=request.review_id, repository=alias)
+        # A review_context_id identifies this client's attempt, including its
+        # review_id. Retrying the same plan must never redirect its reads or
+        # completion to a different trace. Serialize publication of that binding.
+        with self._context_lock:
+            issued = self._issued_contexts.get(review_context_id)
+            trace_metadata = deepcopy(issued.trace_metadata) if issued is not None else self._trace_plan(plan, request, view)
+            trace_metadata = trace_metadata or {}
+            plan = replace(plan, knowledge_trace=trace_metadata)
+            usage = _issue_usage(plan.to_dict(), view=view, session_id=review_context_id.removeprefix("sha256:"))
+            self._remember_context(
+                review_context_id, expected_head, carried, view, repository=alias, usage=usage, task_id=request.review_id,
+                trace_id=str(trace_metadata.get("trace_id") or ""), trace_metadata=trace_metadata,
+            )
         return plan
+
+    @staticmethod
+    def _check_document_scope(document_id: str, repository: str) -> None:
+        value = str(document_id).replace("\\", "/")
+        if value in {"AGENTS.md", "README.md", "repos/_index.md"}:
+            return
+        if value.startswith("general/") or value.startswith(f"repos/{repository}/"):
+            return
+        raise DocumentNotFoundError("document is outside the review repository knowledge scope")
+
+    def _provide(self, trace_id: str, **kwargs) -> dict:
+        try:
+            event = self.knowledge_trace.capture("provide", trace_id, **kwargs)
+            if event.get("status") in {"degraded", "off"}:
+                return {"trace_id": trace_id, **event}
+            result = event.get("result", {})
+            return {"trace_id": trace_id, "status": "degraded" if self.knowledge_trace.is_degraded(trace_id) else "ready", **{
+                name: result[name] for name in ("exposure_id", "knowledge_ref_id") if name in result
+            }}
+        except Exception as exc:
+            if self.knowledge_trace.mode == "required":
+                raise
+            self.knowledge_trace.mark_degraded(trace_id)
+            return {"trace_id": trace_id, "status": "degraded", "error": str(exc)}
+
+    def _trace_plan(self, plan: DirectReviewPlan, request: DirectReviewRequest, view) -> dict:
+        if not self.knowledge_trace.enabled:
+            return {}
+        trace_id = ""
+        try:
+            session = self.knowledge_trace.start_session(
+                self._request_values(request, view=view)[0], mode="direct", run_id=request.review_id,
+                review_context_id=plan.review_context_id,
+                source_revision=plan.expected_head_sha,
+                knowledge_snapshot=plan.knowledge_snapshot,
+                resource_revision=plan.resource_revision,
+                instrumentation={"provider": "observed", "host_context": "unknown", "applications": "host_reported"},
+            )
+            trace_id = str(session.get("trace_id") or "")
+            if not trace_id or session.get("status") == "degraded":
+                return session
+            entries = [{"document_id": route.document.document_id, "owner": route.owner,
+                        "reason": route.reason, "rank": rank}
+                       for rank, route in enumerate(plan.knowledge_routes, 1)]
+            retrieved = self.knowledge_trace.capture("retrieve", trace_id, step_id="review.plan", entries=entries,
+                                           mechanism="direct_routing", query=request.title,
+                                           status="ready" if entries else "no_match")
+            if retrieved.get("status") == "degraded":
+                return retrieved
+            self.knowledge_trace.capture("retrieve", trace_id, step_id="review.plan", mechanism="mandatory_review_guides",
+                              entries=[{"document_id": doc.document_id, "reason": "mandatory_review_guide"}
+                                       for doc in plan.mandatory_review_guides])
+            self.knowledge_trace.capture("retrieve", trace_id, step_id="review.plan", mechanism="navigation",
+                              entries=[{"document_id": doc.document_id, "reason": "knowledge_navigation"}
+                                       for doc in [plan.knowledge_entry, *plan.document_maps]])
+            related_entries = [{"document_id": doc["path"], "reason": doc.get("match_reason", ""),
+                                "matched_files": doc.get("matched_files", []), "rank": rank}
+                               for rank, doc in enumerate(plan.related_knowledge.get("documents", []), 1)]
+            self.knowledge_trace.capture("retrieve", trace_id, step_id="review.plan", mechanism="related_knowledge",
+                              entries=related_entries, query=request.title,
+                              status="ready" if related_entries else "no_match")
+            exposures = []
+            documents = []
+            def visit(value):
+                if isinstance(value, dict):
+                    if {"document_id", "sha256", "excerpt"}.issubset(value):
+                        documents.append(value)
+                    else:
+                        for item in value.values():
+                            visit(item)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        visit(item)
+            visit(plan.to_dict())
+            seen = set()
+            def provide(document_id, content, representation, truncated=False, sha256="", rule_ids=None):
+                key = (document_id, content, representation)
+                if key in seen:
+                    return
+                seen.add(key)
+                source_data = self._served_bytes(self._document_path(document_id, view))
+                source_content = source_data.decode("utf-8", errors="replace")
+                if representation in {"quick_map", "related_excerpt"}:
+                    position = source_content.find(content)
+                    offset = position if content and position >= 0 and source_content.find(content, position + 1) < 0 else None
+                    offset_unit, source_length = "unicode_codepoints", None
+                else:
+                    offset, offset_unit = 0, "utf8_bytes"
+                    source_length = min(len(source_data), _EXCERPT_BYTES)
+                info = self._provide(trace_id, step_id="review.plan", document_id=document_id,
+                                     content=content, boundary="provider_response",
+                                     representation=representation, truncated=truncated, offset=offset,
+                                     offset_unit=offset_unit, source_length=source_length,
+                                     snapshot=view.public_snapshot, document_sha256=sha256, rule_ids=rule_ids)
+                exposures.append({"document_id": document_id, "representation": representation, **info})
+            for document in documents:
+                provide(document["document_id"], document["excerpt"], "excerpt" if document.get("truncated") else "full_document",
+                        document.get("truncated", False), document["sha256"])
+            for route in plan.knowledge_routes:
+                if route.quick_map:
+                    provide(route.document.document_id, route.quick_map, "quick_map",
+                            route.quick_map_status == "truncated", route.document.sha256,
+                            _quick_map_rule_ids(route.quick_map, self._served_bytes(
+                                self._document_path(route.document.document_id, view)).decode("utf-8", errors="replace")))
+            for document in plan.related_knowledge.get("documents", []):
+                if document.get("content"):
+                    provide(document["path"], document["content"], "related_excerpt",
+                            bool(document.get("more_available")), document.get("document", {}).get("sha256", ""))
+            status = "degraded" if self.knowledge_trace.is_degraded(trace_id) or any(item.get("status") == "degraded" for item in exposures) else "ready"
+            return {"trace_id": trace_id, "status": status, "exposures": exposures,
+                    "host_context": "unconfirmed", "applications": "not_reported"}
+        except Exception as exc:
+            self.knowledge_trace.mark_degraded(trace_id)
+            if self.knowledge_trace.mode == "required":
+                raise
+            return {"trace_id": trace_id, "status": "degraded", "error": str(exc)}
 
     @with_containment
     def validate(
@@ -685,6 +966,19 @@ class DirectClient:
         # provider and SDK guards.
         unique_missing = tuple(dict.fromkeys(missing))
         complete = not unique_missing and bool(details.get("publish_ready"))
+        if issued and issued.trace_id:
+            try:
+                if complete:
+                    self.knowledge_trace.finish_session(issued.trace_id, "complete", repository=issued.repository)
+                trace_report = self.knowledge_trace.get_report(issued.trace_id, repository=issued.repository)
+                details["knowledge_trace"] = {"trace_id": issued.trace_id,
+                                               "status": trace_report.get("trace_status", trace_report.get("status", "partial")),
+                                               "session_status": trace_report.get("session", {}).get("status", "unknown"),
+                                               "counts": trace_report.get("counts", {})}
+            except Exception as exc:
+                if self.knowledge_trace.mode == "required":
+                    raise
+                details["knowledge_trace"] = {"trace_id": issued.trace_id, "status": "degraded", "error": str(exc)}
         return DirectCompletionDecision(
             protocol_version=DIRECT_API_VERSION,
             review_context_id=context_id,
