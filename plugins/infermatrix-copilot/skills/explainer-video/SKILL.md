@@ -10,7 +10,7 @@ The video is a deterministic web page. `renderAt(t)` draws the exact frame for t
 ```mermaid
 flowchart LR
   A[narration.json] -->|tts.py| B[audio/*.mp3 + timeline.json]
-  B --> C[stage/timeline.js]
+  B -->|render.py count| C[stage/timeline.js]
   C --> D[stage: renderAt t]
   D -->|render.py stills| E[QA frames]
   D -->|render.py seg K| F[segs/seg_KK.mp4]
@@ -77,9 +77,11 @@ Requires `ffmpeg` and `ffprobe` on PATH.
 
 ```bash
 python tts.py .
+python render.py . count
 ```
 
 - Writes `build/audio/<scene>_<i>.mp3` and `build/timeline.json`, and prints each scene's start and length.
+- After each TTS run, `render.py . count` exports the current timeline and configured FPS to `stage/timeline.js` for browser preview, and prints the segment count. Run both commands again after narration or timing changes.
 - Existing MP3 files are reused only when their adjacent JSON metadata matches `say`, `voice` and `rate`. Changing any of these, or using an older cache without metadata, regenerates that line. Caption-only edits reuse the audio.
 - For a strict total, shorten narration first, then use modest `atempo` adjustment only if speech stays clear. Measure the fitted audio with `ffprobe`, retain lead/tail space, and require every line to end within its scene. The supplied `tts.py` uses narration-driven lengths; fixed-budget timing needs a project-local adaptation, not just smaller `min_len` values. Update audio cues, captions and JS animation timings together.
 - When adding, reordering or lengthening shots, update the full timeline, transitions, captions and narration cues, then remix continuous music and ducking against the new cues. Deliver the complete revised video when requested.
@@ -89,7 +91,7 @@ python tts.py .
 
 ## 4. Preview and QA before the full render
 
-1. Open `stage/index.html` in a browser for live playback, or `index.html?t=12.5` to freeze one moment. A short animated preview can establish composition and motion for a substantial structural change; apply only the approval gate established in §1.
+1. After both commands in §3, open `stage/index.html` in a browser for live playback, or `index.html?t=12.5` to freeze one moment. A short animated preview can establish composition and motion for a substantial structural change; apply only the approval gate established in §1.
 2. Capture stills at the busiest moments of each scene:
    `python render.py . stills 3.2 12.5 24 ...` → `build/still_*.png`.
 3. Read every still. Check, in this order: caption overlapping content, text cut off or wrapped badly, elements crossing each other (lines through numbers, labels on nodes), and wrong facts.

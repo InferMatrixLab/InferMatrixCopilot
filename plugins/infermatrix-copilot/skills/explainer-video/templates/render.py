@@ -151,7 +151,7 @@ def mix(pj: Project, silent: Path) -> None:
         args += ["-i", str(pj.music)]
         m = len(lines) + 1
         parts += [
-            f"{vins}amix=inputs={len(lines)}:normalize=0,asplit=2[voice][sc]",
+            f"{vins}amix=inputs={len(lines)}:normalize=0,apad=whole_dur={total},asplit=2[voice][sc]",
             f"[{m}:a]atrim=0:{total},asetpts=PTS-STARTPTS,volume={gain:.2f}dB,"
             f"afade=t=in:d=2,afade=t=out:st={total - 3:.3f}:d=3[bed]",
             # voice above threshold pushes the bed down ~10 dB; 400 ms release avoids pumping between lines
