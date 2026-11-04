@@ -89,7 +89,7 @@ _VOCAB_CEILINGS = {
     # thin MCP server: tool defaults + instructions prose. The routing table
     # that once shared this entry (52 in direct_routing.py) moved to
     # knowledge/repos/<repo>/_routes.yaml.
-    "thin_mcp_server.py": 8,
+    "thin_mcp_server.py": 2,  # tool defaults share the canonical fallback constant
 }
 
 
