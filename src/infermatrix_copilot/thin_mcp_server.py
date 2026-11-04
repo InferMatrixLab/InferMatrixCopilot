@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import threading
+from collections import OrderedDict
 import signal
 import sqlite3
 import sys
@@ -41,6 +45,7 @@ _PR_URL = re.compile(
     re.IGNORECASE,
 )
 _PR_NUMBER = re.compile(r"^(?:pr\s*#?\s*)?(\d+)$", re.IGNORECASE)
+_DEFAULT_KNOWLEDGE_REPO = "vllm-omni"
 def __getattr__(name: str):
     # formerly an import-time constant; now the knowledge root of the current view
     if name == "_KNOWLEDGE":
@@ -275,10 +280,92 @@ def build_mcp(
     context_client = DirectClient(knowledge_context_path=core.settings.run_root / "knowledge-context.sqlite",
                                  allowed_knowledge_repositories=core.settings.allowed_knowledge_repositories)
 
+    from .sdk.v1.models import SDKError
+    from .knowledge_trace import KnowledgeTraceError
+
+    trace_client = context_client.knowledge_trace
+    trace_views: OrderedDict[str, tuple[str, KnowledgeView]] = OrderedDict()
+    trace_lock = threading.Lock()
+
+    def trace_guard(fn):
+        try:
+            return _guard(fn)
+        except (SDKError, KnowledgeTraceError) as exc:
+            return {"error": str(exc)}
+
+    def pin_trace(trace_id: str, selected_repo: str) -> tuple[dict, KnowledgeView]:
+        report = trace_client.get_report(trace_id, repository=selected_repo)
+        with trace_lock:
+            pinned = trace_views.get(trace_id)
+        if pinned is not None:
+            return report, pinned[1]
+        # A restarted provider may reuse the current tree only when its full
+        # identity matches. A different active snapshot never replaces the
+        # unavailable tree silently.
+        from .sdk.v1.direct import _resource_revision
+        from .sdk._resources import adapters_root
+        view = KnowledgeView.current()
+        session = report.get("session", {})
+        revision = _resource_revision(str(view.root), str(adapters_root()))
+        if (session.get("knowledge_snapshot") != view.public_snapshot
+                or session.get("resource_revision") != revision):
+            raise ValueError("trace knowledge snapshot is unavailable; start a new trace")
+        remember_trace(trace_id, selected_repo, view)
+        return report, view
+
+    def remember_trace(trace_id: str, selected_repo: str, view: KnowledgeView) -> None:
+        with trace_lock:
+            trace_views[trace_id] = (selected_repo, view)
+            trace_views.move_to_end(trace_id)
+            while len(trace_views) > 256:
+                trace_views.popitem(last=False)
+
+    def begin_trace(selected_repo: str, view: KnowledgeView, *, source_revision="", review_context_id="", run_id="") -> dict:
+        from .sdk.v1.direct import _resource_revision
+        from .sdk._resources import adapters_root
+        result = trace_client.start_session(
+            selected_repo, mode="direct", run_id=run_id,
+            source_revision=source_revision, review_context_id=review_context_id,
+            knowledge_snapshot=view.public_snapshot,
+            resource_revision=_resource_revision(str(view.root), str(adapters_root())),
+            instrumentation={"provider": "observed", "host_context": "unknown", "applications": "host_reported"},
+        )
+        if result.get("trace_id"):
+            remember_trace(result["trace_id"], selected_repo, view)
+        return result
+
+    def exposure(trace_id: str, view: KnowledgeView, *, step_id: str, path: str, content: str,
+                 representation: str, offset=None, truncated=False) -> dict:
+        from .knowledge_service.lifecycle import visible_text
+        served = visible_text(view.path(path).read_text(encoding="utf-8", errors="replace"))
+        if offset is None:
+            position = served.find(content)
+            offset = position if content and position >= 0 and served.find(content, position + 1) < 0 else None
+        from .sdk.v1.direct import _quick_map_rule_ids
+        rule_ids = _quick_map_rule_ids(content, served) if representation == "quick_map" else None
+        event = trace_client.capture("provide", trace_id, step_id=step_id, document_id=path, content=content,
+            boundary="provider_response", representation=representation,
+            offset=offset, offset_unit="unicode_codepoints", truncated=truncated,
+            snapshot=view.public_snapshot, rule_ids=rule_ids,
+            document_sha256="sha256:" + hashlib.sha256(served.encode("utf-8")).hexdigest(),
+        )
+        if event.get("status") == "degraded":
+            raise OSError(event.get("error", "knowledge trace storage is unavailable"))
+        result = event.get("result", {})
+        return {key: result[key] for key in ("exposure_id", "knowledge_ref_id") if key in result}
+
+    def trace_failure(trace_id: str, exc: Exception) -> dict:
+        trace_client.mark_degraded(trace_id)
+        if trace_client.mode == "required":
+            raise exc
+        return {"trace_id": trace_id, "status": "degraded", "error": str(exc)}
+
     # Approval-gating hosts (codex asks per-call approval for tools without
     # hints, and cancels them outright in headless runs) read these
     # annotations, so they must stay truthful: `review` reserves run state
-    # and its Strict child reaches the network; everything else only reads.
+    # and its Strict child reaches the network. Explicit trace tools write
+    # local records; document operations only read knowledge and append audit
+    # records when their optional trace context is supplied.
     read_only = ToolAnnotations(
         readOnlyHint=True, idempotentHint=True, openWorldHint=False)
     mcp = FastMCP(
@@ -370,7 +457,7 @@ def build_mcp(
         openWorldHint=True))
     def review(
         target: str,
-        repo: str = "vllm-omni",
+        repo: str = _DEFAULT_KNOWLEDGE_REPO,
         mode: str = "direct",
         post: bool = False,
         review_depth: str = "",
@@ -383,6 +470,7 @@ def build_mcp(
         diff: str = "",
         knowledge_profile: str = "legacy",
         task_id: str = "",
+        trace_id: str = "",
     ) -> dict:
         """Begin a Direct or Strict review.
 
@@ -396,7 +484,7 @@ def build_mcp(
         ``"truncated"`` (only part of one) — must be opened, and the budget grants a
         read for each. Strict runs the packaged PR-review
         workflow and accepts an optional local checkout through ``repo_path``.
-        ``expected_head_sha`` (Strict only) pins the review to one snapshot: pass
+        ``expected_head_sha`` pins the review to one source snapshot: pass
         the full 40-hex head you observed, and the run stops as stale rather than
         reviewing a different commit if the PR moved in between.
         ``diff`` (Direct only, optional) is the frozen unified diff; with it the
@@ -420,6 +508,8 @@ def build_mcp(
                 raise ValueError("mode must be 'direct' or 'strict'")
             if selected_mode == "direct":
                 if knowledge_profile == "adaptive":
+                    if trace_id:
+                        raise ValueError("adaptive traces are bound to their context session; omit trace_id")
                     from .sdk.v1.models import ChangedPath, DirectReviewRequest, RepositoryRef
                     request = DirectReviewRequest(task_id or idempotency_key or f"direct:{target}:{uuid.uuid4().hex}", RepositoryRef(repo),
                                                   0, expected_head_sha, title, body,
@@ -427,15 +517,73 @@ def build_mcp(
                     return _model_context_delivery(context_client.plan_adaptive(request))
                 if knowledge_profile != "legacy":
                     raise ValueError("knowledge_profile must be legacy or adaptive")
+                selected_repo = _normalize_repo(repo)
+                if expected_head_sha and not re.fullmatch(r"[0-9a-fA-F]{40}", expected_head_sha):
+                    raise ValueError("expected_head_sha must be exactly 40 hexadecimal characters")
                 view = KnowledgeView.current()
-                return _legacy_plan_delivery(direct_review_plan(
-                    repo,
-                    title=title,
-                    body=body,
-                    changed_files=changed_files,
-                    diff=diff,
-                    view=view,
+                active_trace = trace_id
+                if active_trace:
+                    report, view = pin_trace(active_trace, selected_repo)
+                    source = report.get("session", {}).get("source_revision", "")
+                    if expected_head_sha and source != expected_head_sha.casefold():
+                        raise ValueError("expected_head_sha does not match the trace session")
+                result = _legacy_plan_delivery(direct_review_plan(
+                    repo, title=title, body=body, changed_files=changed_files, diff=diff, view=view,
                 ), task_id=task_id or idempotency_key, repository=repo, view=view)
+                if trace_client.enabled and selected_repo in _supported_repos():
+                    try:
+                        if not active_trace:
+                            context = hashlib.sha256(json.dumps({
+                                "target": target, "repo": selected_repo, "head": expected_head_sha,
+                                "title": title, "body": body, "changed_files": changed_files,
+                                "snapshot": view.public_snapshot,
+                            }, sort_keys=True).encode("utf-8")).hexdigest()
+                            session = begin_trace(selected_repo, view, source_revision=expected_head_sha.casefold(),
+                                                  review_context_id="sha256:" + context)
+                            active_trace = session.get("trace_id", "")
+                            if session.get("status") == "degraded":
+                                result["knowledge_trace"] = session
+                                return result
+                        if active_trace:
+                            routes = result.get("knowledge_routes") or []
+                            entries = [{"document_id": view.relative(route["path"]),
+                                        "reason": route.get("reason", ""), "owner": route.get("owner", ""), "rank": rank}
+                                       for rank, route in enumerate(routes, 1)]
+                            retrieved = trace_client.capture("retrieve", active_trace, step_id="review.plan", entries=entries,
+                                                                       mechanism="direct_routing", query=title,
+                                                                       status="ready" if entries else "no_match")
+                            if retrieved.get("status") == "degraded":
+                                result["knowledge_trace"] = retrieved
+                                return result
+                            trace_client.capture("retrieve", active_trace, step_id="review.plan", mechanism="mandatory_review_guides",
+                                entries=[{"document_id": view.relative(path), "reason": "mandatory_review_guide"}
+                                         for path in result.get("mandatory_review_guides", [])])
+                            trace_client.capture("retrieve", active_trace, step_id="review.plan", mechanism="navigation",
+                                entries=[{"document_id": view.relative(result["knowledge_entry"]), "reason": "knowledge_navigation"}])
+                            related_entries = [{"document_id": doc["path"], "reason": doc.get("match_reason", ""),
+                                                "matched_files": doc.get("matched_files", []), "rank": rank}
+                                               for rank, doc in enumerate(result.get("related_knowledge", {}).get("documents", []), 1)]
+                            trace_client.capture("retrieve", active_trace, step_id="review.plan", mechanism="related_knowledge",
+                                entries=related_entries, query=title, status="ready" if related_entries else "no_match")
+                            provided = []
+                            for route in routes:
+                                if route.get("quick_map"):
+                                    provided.append({"document_id": view.relative(route["path"]),
+                                        **exposure(active_trace, view, step_id="review.plan", path=view.relative(route["path"]),
+                                                   content=route["quick_map"], representation="quick_map",
+                                                   truncated=route.get("quick_map_status") == "truncated")})
+                            for document in result.get("related_knowledge", {}).get("documents", []):
+                                provided.append({"document_id": document["path"],
+                                    **exposure(active_trace, view, step_id="review.plan", path=document["path"],
+                                               content=document["content"], representation="related_excerpt",
+                                               truncated=bool(document.get("more_available")))})
+                            result["knowledge_trace"] = {"trace_id": active_trace, "status": "degraded" if trace_client.is_degraded(active_trace) else "ready", "exposures": provided,
+                                                         "host_context": "unconfirmed", "applications": "not_reported"}
+                        else:
+                            result["knowledge_trace"] = session
+                    except Exception as exc:
+                        result["knowledge_trace"] = trace_failure(active_trace, exc)
+                return result
 
             if post:
                 # Refused at the surface as well as in the policy, so the
@@ -473,7 +621,7 @@ def build_mcp(
                 },
             }
 
-        return _guard(run)
+        return trace_guard(run)
 
     @mcp.tool(annotations=read_only)
     def validate_direct_review(
@@ -485,6 +633,8 @@ def build_mcp(
         existing_feedback_status: str = "",
         finding_dispositions: list[dict[str, str]] | None = None,
         knowledge_usage: dict | None = None,
+        trace_id: str = "",
+        repo: str = _DEFAULT_KNOWLEDGE_REPO,
     ) -> dict:
         """Validate the Direct completion gate before the only final comment.
 
@@ -514,6 +664,23 @@ def build_mcp(
             finding_dispositions=finding_dispositions,
             knowledge_usage=knowledge_usage,
         )
+        if trace_id:
+            try:
+                report = trace_client.get_report(trace_id, repository=_normalize_repo(repo))
+                source = report.get("session", {}).get("source_revision", "")
+                if source and source != evidence_head_sha.casefold():
+                    result["review_complete"] = False
+                    result["publish_ready"] = False
+                    result["status"] = "partial_review"
+                    result.setdefault("missing", []).append("evidence_head_sha does not match the trace session")
+                if result.get("publish_ready"):
+                    trace_client.finish_session(trace_id, "complete", repository=_normalize_repo(repo))
+                    report = trace_client.get_report(trace_id, repository=_normalize_repo(repo))
+                result["knowledge_trace"] = {"trace_id": trace_id, "status": report.get("trace_status", report.get("status", "partial")),
+                                             "session_status": report.get("session", {}).get("status", "unknown"),
+                                             "counts": report.get("counts", {})}
+            except Exception as exc:
+                result["knowledge_trace"] = trace_failure(trace_id, exc)
         result.setdefault("diagnostics", {})["timing_ms"] = {
             "validate_direct_review": int(
                 (time.perf_counter() - started) * 1000
@@ -552,17 +719,19 @@ def build_mcp(
         return _guard(run)
 
     @mcp.tool(annotations=read_only)
-    def update_knowledge(repo: str = "vllm-omni") -> dict:
+    def update_knowledge(repo: str = _DEFAULT_KNOWLEDGE_REPO) -> dict:
         """Return the knowledge contribution entrypoint for the host to follow."""
         return _guard(lambda: {"knowledge_entry": _contributing_entry()})
 
     @mcp.tool(annotations=read_only)
     def doc_search(
         query: str,
-        repo: str = "vllm-omni",
+        repo: str = _DEFAULT_KNOWLEDGE_REPO,
         limit: int = 20,
         knowledge_usage: dict | None = None,
         task_id: str = "",
+        trace_id: str = "",
+        step_id: str = "knowledge.search",
     ) -> dict:
         """Search knowledge; enforced reads require the review plan's knowledge_usage receipt."""
         def run() -> dict:
@@ -578,8 +747,40 @@ def build_mcp(
                         f"Supported: {supported}."
                     )
                 }
-            matches = _docs(selected_repo, view).search(query, limit=limit)
+            if trace_id:
+                _report, trace_view = pin_trace(trace_id, selected_repo)
+                if session and (trace_view.root != view.root or trace_view.public_snapshot != view.public_snapshot):
+                    raise ValueError("trace snapshot does not match the containment delivery context")
+                view = trace_view
+            try:
+                matches = _docs(selected_repo, view).search(query, limit=limit)
+            except Exception:
+                if trace_id:
+                    trace_client.record_gap(trace_id, "document_search_failed")
+                raise
+            delivery = _raw_document_delivery({"repo": selected_repo, "query": query, "matches": matches},
+                                              knowledge_usage, session, view, task_id)
+            metadata = {}
+            if trace_id:
+                try:
+                    trace_client.capture("retrieve", trace_id, step_id=step_id, entries=[
+                        {"document_id": hit["path"], "line": hit["line"], "rank": rank}
+                        for rank, hit in enumerate(matches, 1)], mechanism="doc_search", query=query,
+                        status="ready" if matches else "no_match")
+                    provided = []
+                    from .knowledge_service.lifecycle import visible_text
+                    for hit in matches:
+                        lines = visible_text(view.path(hit["path"]).read_text(encoding="utf-8", errors="replace")).splitlines(keepends=True)
+                        start = sum(len(line) for line in lines[:hit["line"] - 1])
+                        provided.append({"document_id": hit["path"], **exposure(
+                            trace_id, view, step_id=step_id, path=hit["path"], content=hit["text"],
+                            representation="search_hit", offset=start, truncated=True)})
+                    metadata = {"knowledge_trace": {"trace_id": trace_id, "status": "degraded" if trace_client.is_degraded(trace_id) else "ready", "exposures": provided}}
+                except Exception as exc:
+                    metadata = {"knowledge_trace": trace_failure(trace_id, exc)}
             result = {
+                **delivery,
+                **metadata,
                 "query": query,
                 "repo": selected_repo,
                 "matches": matches,
@@ -589,17 +790,19 @@ def build_mcp(
                     "knowledge_entry."
                 )} if not matches else {}),
             }
-            return _raw_document_delivery(result, knowledge_usage, session, view, task_id)
+            return result
 
-        return _guard(run)
+        return trace_guard(run)
 
     @mcp.tool(annotations=read_only)
     def doc_read(
         path: str,
-        repo: str = "vllm-omni",
+        repo: str = _DEFAULT_KNOWLEDGE_REPO,
         offset: int = 0,
         knowledge_usage: dict | None = None,
         task_id: str = "",
+        trace_id: str = "",
+        step_id: str = "knowledge.read",
     ) -> dict:
         """Read a doc_search page; enforced reads require the review plan's knowledge_usage receipt."""
         def run() -> dict:
@@ -607,14 +810,58 @@ def build_mcp(
             session, view = _usage_session_view(knowledge_usage)
             view = view or KnowledgeView.current()
             selected_repo = _normalize_repo(repo, view)
-            result = {
-                "repo": selected_repo,
-                **_docs(selected_repo, view).read(path, offset=offset),
-            }
-            return _raw_document_delivery(result, knowledge_usage, session, view, task_id)
+            if trace_id:
+                _report, trace_view = pin_trace(trace_id, selected_repo)
+                if session and (trace_view.root != view.root or trace_view.public_snapshot != view.public_snapshot):
+                    raise ValueError("trace snapshot does not match the containment delivery context")
+                view = trace_view
+            try:
+                result = {"repo": selected_repo, **_docs(selected_repo, view).read(path, offset=offset)}
+            except Exception:
+                if trace_id:
+                    trace_client.record_gap(trace_id, "document_read_failed")
+                raise
+            result = _raw_document_delivery(result, knowledge_usage, session, view, task_id)
+            if trace_id:
+                try:
+                    result["knowledge_trace"] = {"trace_id": trace_id, "status": "degraded" if trace_client.is_degraded(trace_id) else "ready", **exposure(
+                        trace_id, view, step_id=step_id, path=result["path"], content=result["content"],
+                        representation="full_document" if offset == 0 and result.get("next_offset") is None else "excerpt",
+                        offset=offset, truncated=result.get("next_offset") is not None)}
+                except Exception as exc:
+                    result["knowledge_trace"] = trace_failure(trace_id, exc)
+            return result
 
-        return _guard(run)
+        return trace_guard(run)
 
+    local_write = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+
+    @mcp.tool(annotations=local_write)
+    def start_knowledge_trace(repo: str = _DEFAULT_KNOWLEDGE_REPO, run_id: str = "", source_revision: str = "") -> dict:
+        """Start local knowledge-use recording pinned to the current knowledge snapshot."""
+        def run():
+            selected_repo = _normalize_repo(repo)
+            if selected_repo not in _supported_repos():
+                raise ValueError("unsupported knowledge repository")
+            if source_revision and not re.fullmatch(r"[0-9a-fA-F]{40}", source_revision):
+                raise ValueError("source_revision must be a full 40-hex head SHA")
+            return begin_trace(selected_repo, KnowledgeView.current(), source_revision=source_revision.casefold(), run_id=run_id)
+        return trace_guard(run)
+
+    @mcp.tool(annotations=local_write)
+    def record_knowledge_usage(trace_id: str, events: list[dict], repo: str = _DEFAULT_KNOWLEDGE_REPO, idempotency_key: str = "") -> dict:
+        """Record host context receipts, evidence and explicit rule assessments locally."""
+        return trace_guard(lambda: trace_client.record_events(trace_id, events, repository=_normalize_repo(repo), idempotency_key=idempotency_key))
+
+    @mcp.tool(annotations=local_write)
+    def finish_knowledge_trace(trace_id: str, status: str = "complete", repo: str = _DEFAULT_KNOWLEDGE_REPO) -> dict:
+        """Finish a local trace; this does not publish a review or certify its reasoning."""
+        return trace_guard(lambda: trace_client.finish_session(trace_id, status, repository=_normalize_repo(repo)))
+
+    @mcp.tool(annotations=read_only)
+    def get_knowledge_trace(trace_id: str, repo: str = _DEFAULT_KNOWLEDGE_REPO, cursor: str = "", limit: int = 100) -> dict:
+        """Read the deterministic per-step report, including missing receipts and evidence."""
+        return trace_guard(lambda: trace_client.get_report(trace_id, repository=_normalize_repo(repo), cursor=cursor or None, limit=limit))
     @mcp.tool(annotations=ToolAnnotations(
         title="Inspect or revoke the knowledge learning agreement", readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))

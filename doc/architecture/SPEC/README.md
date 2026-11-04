@@ -68,7 +68,7 @@
 | 跨切 | `review/{diff_summary,triggers,reviewer}` `memory/{debug_memory,skills}` `run_trace` `notify` `metrics` |
 | 后端 | `providers/{registry,base,claude_code,codex,cursor,deepseek,zcode,audit,harness_llm}` `tool_bridge` |
 | MCP 面 | `thin_mcp_server` `mcp_server` `mcp_policy` `run_status` `knowledge_docs` `__main__` |
-| 共享服务 | `kb_service` `rfc_service`（包规范覆盖各自实现模块） |
+| 共享服务 | `kb_service` `rfc_service` `knowledge_trace`（包规范覆盖各自实现模块） |
 
 平凡的 `__init__.py` 再导出文件不单独出规范
 （`engine/steps/__init__` 例外，因为它定义了 `register_builtin_steps`）。

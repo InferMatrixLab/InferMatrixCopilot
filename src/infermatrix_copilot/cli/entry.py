@@ -103,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     configured (and not --no-chat), else the plain command REPL. `argv` defaults
     to sys.argv. Returns the process exit code."""
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "knowledge-trace":
+        from ..knowledge_trace.cli import main as knowledge_trace_main
+
+        return knowledge_trace_main(raw[1:])
     if raw and raw[0] == "upgrade":
         from ..upgrade.cli import main as upgrade_main
 

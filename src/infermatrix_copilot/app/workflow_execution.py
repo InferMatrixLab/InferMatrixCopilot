@@ -135,6 +135,7 @@ class WorkflowExecution:
             # cancelled through the same finalizers, and the run is left
             # resumable and marked `interrupted` — never `running`.
             restore = install_run_signal_handlers(run_dir, run_dir.name)
+            outcome = None
             try:
                 outcome = asyncio.run(
                     run_guarded(executor.run(playbook, state), run_dir))
@@ -145,6 +146,11 @@ class WorkflowExecution:
                 return self._interrupted(run_dir, trace, req)
             finally:
                 restore()
+                from ..engine.agent_runtime.knowledge_trace import finish_knowledge_trace
+
+                finish_knowledge_trace(
+                    state, "complete" if outcome is not None and outcome.status == "done"
+                    and shutdown_requested() is None else "interrupted")
             req = shutdown_requested()
             if req is not None:
                 # the cooperative path: a step noticed the request and

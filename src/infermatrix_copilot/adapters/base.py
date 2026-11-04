@@ -13,6 +13,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -70,13 +71,16 @@ def _without_frontmatter(text: str) -> str:
 
 def render_briefing_docs(root: Path | str, docs: list[str], *, header: str = "",
                          cap: int = _BRIEFING_CAP,
-                         warnings: list[str] | None = None) -> str:
+                         warnings: list[str] | None = None,
+                         on_document: Callable[..., None] | None = None) -> str:
     """Concatenate the `docs` (paths relative to `root`) into one capped briefing
     slice, prefixed by `header`. Missing docs are skipped (never fatal); page
     frontmatter is stripped. Returns "" when none exist. Shared by the general
     and repo-specific briefing layers so both render identically."""
     root = Path(root).resolve()
     parts: list[str] = []
+    sources: list[str] = []
+    offsets: list[int] = []
     for rel in docs:
         p = (root / rel).resolve()
         try:
@@ -90,10 +94,20 @@ def render_briefing_docs(root: Path | str, docs: list[str], *, header: str = "",
                 warnings.append(f"briefing document missing or not Markdown: {rel}")
             continue
         text = visible_text(p.read_text(encoding="utf-8", errors="replace"))
-        parts.append(_without_frontmatter(text).strip())
+        visible_body = _without_frontmatter(text)
+        parts.append(visible_body.strip())
+        offsets.append(len(text) - len(visible_body) + len(visible_body) - len(visible_body.lstrip()))
+        sources.append(p.relative_to(root).as_posix())
     if not parts:
         return ""
     body = ((header + "\n\n") if header else "") + "\n\n---\n\n".join(parts)
+    if on_document is not None:
+        position = len(header) + 2 if header else 0
+        for rel, text, offset in zip(sources, parts, offsets):
+            included = text[:max(0, cap - position)]
+            on_document(document_id=rel, content=included,
+                        truncated=len(included) < len(text), offset=offset)
+            position += len(text) + len("\n\n---\n\n")
     if len(body) > cap:
         body = (body[:cap]
                 + f"\n\n...[briefing capped at {cap} chars — use doc_read for the "
@@ -227,7 +241,8 @@ class RepoAdapter:
 
     def briefing(self, knowledge_root: Path | None = None,
                  warnings: list[str] | None = None,
-                 mode: str = "eco") -> str:
+                 mode: str = "eco",
+                 on_document: Callable[..., None] | None = None) -> str:
         """The repo's always-on prompt slice — the REPO-SPECIFIC part only. Reads
         this adapter's `knowledge.briefing_docs` (its `repos/<repo>/` hard-gate
         rules + navigation index) from the SHARED `knowledge_root` (the vendored
@@ -273,12 +288,12 @@ class RepoAdapter:
                     knowledge_root, docs,
                     header=(f"Repo-specific knowledge (source: {kn.get('source', '')}; "
                             "open the linked deeper docs with doc_read / doc_search):"),
-                    warnings=warnings))
+                    warnings=warnings, on_document=on_document))
             if extra_docs:
                 parts.append(render_briefing_docs(
                     knowledge_root, extra_docs,
                     header="Extended review knowledge router:",
-                    warnings=warnings))
+                    warnings=warnings, on_document=on_document))
             body = "\n\n".join(part for part in parts if part)
             if body:
                 return body

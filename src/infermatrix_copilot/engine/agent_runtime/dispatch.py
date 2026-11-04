@@ -58,7 +58,7 @@ class AgentDispatchContext:
         treats it as data, not instructions. Returns the single prompt string."""
         parts = [
             "## OUTPUT CONTRACT\nYour FINAL message must be a single JSON object "
-            "with exactly these fields:\n"
+            "with these fields (fields marked OPTIONAL may be omitted):\n"
             + json.dumps(self.output_contract, ensure_ascii=False, indent=1),
             "## PERMISSIONS\n" + json.dumps(self.permissions,
                                             ensure_ascii=False, indent=1),

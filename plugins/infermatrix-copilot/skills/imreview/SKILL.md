@@ -9,8 +9,8 @@ Immediately update the host conversation with the pinned head SHA, current CI
 status, mergeability, and any early findings before reading knowledge, searching
 source, or running tests. Within 60 seconds, do this. Then call
 InferMatrixCopilot `review` once
-with `mode="direct"` plus the
-collected `title`, `body`, and `changed_files`. Use the embedded `quick_map` in
+with `mode="direct"`, the selected `repo`, plus the
+collected `title`, `body`, `changed_files`, and pinned `expected_head_sha`. Use the embedded `quick_map` in
 each returned `knowledge_routes` item and the bounded prose in `related_knowledge`.
 That prose includes source pins and explicit missing facets; verify claims at the
 PR head, and treat inferred tradeoffs as background. Do not open the full route file
@@ -65,6 +65,37 @@ classify `subtraction_signal`. Use `none` without a
 minimality proof when the diff does not add or expand a helper, class, fallback,
 compatibility branch, or public behavior. Use `triggered` for those changes and
 only then provide subtraction evidence.
+When the response includes `knowledge_trace.trace_id`, retain it for this review.
+Pass that `trace_id`, the selected `repo`, and a stable `step_id` to subsequent
+`doc_read`/`doc_search` calls; pass `trace_id` and `repo` to
+`validate_direct_review` so completion also closes the trace. When the knowledge
+usage tools are available, batch `record_knowledge_usage` once per meaningful
+step: acknowledge only exposures actually supplied to your context using
+`content_provided` with `source_exposure_id` and boundary `host_context`, then
+record only rules you explicitly checked using `assessment_recorded` with the
+provided document/rule identity, applicability, verification, concise rationale,
+check, and evidence IDs. Register the referenced source/test evidence in the same
+batch, bound to the pinned head and actual validation environment. Reuse the
+existing evidence packet; do not add source reads or re-evaluate every returned
+rule just for telemetry. Missing evidence stays unresolved, quick-map references
+do not prove the full rule was read, and unavailable capture stays unknown.
+The batch uses this shape; replace placeholders with this review's actual
+references and evidence, omit `rule_id` when the page has no explicit rule ID,
+and choose a verification status supported by the evidence:
+
+```json
+[
+  {"event_type":"content_provided","step_id":"review.source","exposure":{"source_exposure_id":"<returned exposure ID>","boundary":"host_context"}},
+  {"event_type":"evidence_registered","step_id":"review.source","evidence":{"evidence_id":"source-check-1","kind":"source","path":"<repository-relative source path>","source_revision":"<pinned head SHA>","summary":"<actual observed behavior>"}},
+  {"event_type":"assessment_recorded","step_id":"review.source","assessment":{"document_id":"<provided knowledge path>","rule_id":"<explicit rule ID>","exposure_ids":["<returned exposure ID>"],"applicability":"applicable","verification":"unresolved","rationale":"<why the rule applies>","check":"<check actually performed>","evidence_ids":["source-check-1"]}}
+]
+```
+
+Submit these batches with `trace_id`, the trace's selected `repo`, and an
+idempotency key unique to that step's batch **before completion validation**
+closes the session. A terminal partial/blocked attempt calls `finish_knowledge_trace`
+with `status="interrupted"` after validation; leave it running if continuing the
+same attempt. Ordinary successful validation closes it automatically.
 Format each actionable finding like a normal GitHub inline review comment:
 identify the exact path and line/hunk, then explain the concrete triggering
 input or call path, the observed behavior, why it matters, and the smallest

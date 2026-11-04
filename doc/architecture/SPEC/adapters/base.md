@@ -1,6 +1,6 @@
 # adapters/base.py —— 规范
 
-<!-- verified-against: 2026-09-28 -->
+<!-- verified-against: 2026-11-04 -->
 
 `LOC ~423 · 边缘（仓库知识） · refactor-status: ok`
 
@@ -64,3 +64,11 @@
 
 ## 2026-09-28 knowledge_lifecycle
 `knowledge_lifecycle` 加入 `HIGH_RISK_SECTIONS`：知识服务的开关与 `auto_merge` 切换只能经人工审阅修改。
+
+## 2026-11-04 逐文档 briefing 观测
+
+`render_briefing_docs(..., on_document=None)` 和 `RepoAdapter.briefing` 接受可选
+回调，报告实际经过 visible-text、frontmatter 去除、首尾空白去除和 briefing
+上限后保留的文档片段、相对文档 ID、源偏移与截断状态。零长度片段不代表
+模型获得正文；后续请求级裁剪仍由 agent runtime 核实。未传回调时渲染行为不变。
+回调不另读知识、不增加 briefing 预算，也不改变 manifest 写入门。

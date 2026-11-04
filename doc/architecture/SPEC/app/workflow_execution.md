@@ -1,6 +1,6 @@
 # app/workflow_execution.py — workflow execution boundary
 
-<!-- verified-against: 2026-10-29 -->
+<!-- verified-against: 2026-11-04 -->
 
 `WorkflowExecution` runs an already selected playbook with the caller's
 current LLM dependency. It rechecks the repository context before starting,
@@ -36,3 +36,12 @@ not belong in this module.
 `Copilot._execute` remains the compatibility entry point and records
 `last_run_dir`/`last_blocked_reason` from the returned result. Existing run
 state keys, traces, exit codes, and checkpoint behavior stay stable.
+
+Knowledge-use tracing is finalized in the same execution `finally` boundary,
+after restoring signal handlers. An existing session receives `complete` only
+when the executor returned `done` without shutdown; other exits receive
+`interrupted`. Finalization writes `KNOWLEDGE_TRACE.json` and
+`KNOWLEDGE_TRACE.md` through the agent-runtime owner. No session is created
+merely to finalize a workflow, and run finalizers, interruption handling and
+lock ownership retain their existing behavior. Required-mode trace failures
+propagate rather than allowing an audit-complete result.
