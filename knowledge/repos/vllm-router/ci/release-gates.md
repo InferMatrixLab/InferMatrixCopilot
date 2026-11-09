@@ -77,10 +77,10 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
 | # | 要求 | 类型 | 说明 |
 |---|---|---|---|
 | 1 | 目标 commit 的 L2 merge 全绿，最近一轮 L3 nightly 无失败 | Gate | L2 有 xGMI smoke（GSM8K limit 20，基线 0.38 允许 −0.03）与 RDMA `SMOKE_ONLY`；L3 有 P/D 全量 GSM8K（HTTP 与 gRPC）、ROCm xGMI/RDMA 的 read true/false 矩阵、gRPC prefix-KV perf、L1 encode perf。证据给 Buildkite build 链接，L1 只证明 PR 自身，不能替代 |
-| 2 | 单元测试覆盖率达到开工会确定的当期目标 | Guide | 覆盖率先在迭代开工会定成具体目标（数值 + 统计范围），发布时用 CI 产出的 `coverage.xml` 对照；CI 不设固定阈值，没定目标按 N/A 记录 |
+| 2 | 单元测试覆盖率达到开工会确定的当期目标 | Guide | 目标在迭代开工会定成具体数值和统计范围。Python 覆盖率以 router 的覆盖率看板为准，CI 上传的 `coverage.xml` 是它的数据源；Rust 覆盖率目前没有现成工具，若纳入目标必须提前自建收集方式，见下方说明。没定目标按 N/A 记录 |
 | 3 | 性能场景无回退，按各场景自己的口径举证 | Guide | 不设统一百分比，见下面“性能与覆盖率怎么举证” |
 | 4 | 需求完成率 > 85% | Gate | 按当期需求清单核对，本仓库无自动化 |
-| 5 | 剩余 DI < 30 | Gate | 按 [DI 计算说明](../../../general/bug/guides/di-calculation.md) 逐条定级后累加；定级口径见下方说明 |
+| 5 | 剩余 DI < 30 | Gate | 按 [DI 计算说明](../../../general/bug/guides/di-calculation.md) 计算：不按天数累加，达到 SLO 升一级后取新级别的基础 DI；定级口径见下方说明 |
 | 6 | 无未关闭 critical issue，剩余 bug 均有 assignee | Gate | critical 由同一套 issue 分级口径判定；本仓库无自动化 |
 
 ### 性能与覆盖率怎么举证
@@ -94,10 +94,13 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
   与 `encode_reuse.p50` 在 L1 on/off 之间的差异。CPU overhead 用同机 `cargo bench` 的 baseline
   对比。pytest 只校验每个 wave 的统计完整，跨后端验收要人工判读 `results/` 里的 `wave.summary`，
   不能声称 CI 已经断言 SLO。
-- **覆盖率目标来自开工会，不来自 CI。** 先把当期目标写进迭代记录（Python 单测范围是
-  `-m "ready and cpu"` 的 `coverage.xml`；如果当期还要求 Rust 覆盖，需另行说明工具和范围），
-  发布时逐项对照；目标缺失时该项只能记 N/A 并注明原因。
-- **DI 需要先有分级。** 公式要求每条未关闭 issue 先定 critical / high / medium / low；
+- **覆盖率目标来自开工会，数值以看板为准。** 当期目标要写进迭代记录（数值 + 统计范围），
+  发布时直接引用 router 覆盖率看板的数值，不再自己解析 `coverage.xml`。看板目前只覆盖 Python
+  单测（`-m "ready and cpu"`）；Rust 覆盖率还没有现成框架或工具，如果当期目标包含 Rust，必须
+  在开工会前确定自建收集方式（工具、命令、上报口径）并写进记录，否则本期只按 Python 覆盖率
+  举证。目标缺失时该项只能记 N/A 并注明原因。
+- **DI 需要先有分级。** [DI 计算说明](../../../general/bug/guides/di-calculation.md) 要求每条未关闭
+  issue 先定 critical / high / medium / low，并按“达到 SLO 升一级”计算，不再按天数累加。
   本仓库 bug 模板只打 `bug` label，没有 severity 字段，因此发布前要先确认 router 与 agent-infer
   的 issue 分级策略并对齐到同一口径（用 label 或发布记录逐条定级）。口径未确认时 DI 记 N/A，
   不能拿 issue 数量代替。
@@ -136,6 +139,6 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
 发布说明或 checklist 逐项给出，缺一项按未通过处理：
 
 - 是否通过（Pass / Fail / N/A），硬门禁与政策门禁分开列。
-- 证据链接（Buildkite build、`coverage.xml`、各场景性能 `wave.summary`、开工会记录的覆盖率目标、DI 定级记录、issue 列表）。
+- 证据链接（Buildkite build、覆盖率看板快照与开工会目标、各场景性能 `wave.summary`、DI 定级记录、issue 列表）。
 - 发布产物核对表（tag / PyPI 版本 / Docker tag / GitHub Release 是否都存在）。
 - Guide 项写明当期 Guide 版本或链接；Docker 与 GitHub Release 是否发布单独列出。
