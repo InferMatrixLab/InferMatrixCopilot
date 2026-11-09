@@ -25,12 +25,12 @@ upstream:
   kind: fork_tracking
   repo_path: ${VLLM_UPSTREAM_REPO}
   remote: origin
-  # v0.33.0 alignment campaign (2026-10-28): vLLM cut releases/v0.33.0 on
-  # 2026-10-26 (tip 4135590ffe = v0.33.0rc0, cu130 wheel published), so the
-  # wheel pick and commit assignment target the release branch, not main.
-  # Pinned to the rc0 commit by the launcher's force_upstream_commit; re-pin
-  # to the tag commit once v0.33.0 final is tagged.
-  target_branch: releases/v0.33.0
+  # v0.34.0 preparation campaign (2026-11-09): vLLM has not cut a
+  # releases/v0.34.0 branch yet, so the wheel pick and commit assignment
+  # target main (tip 1648e80a6a, 2026-11-09). vllm-omni main 725c1c9ac is
+  # aligned to vLLM v0.33.0 final (4ba787ec99). Flip to the release branch
+  # once vLLM cuts it, as the v0.33.0 campaign did.
+  target_branch: main
 
 # Repo-specific slice of the SHARED, human-curated knowledge base (the vendored
 # community docs at the repo-root `knowledge/` = settings.knowledge_dir;
