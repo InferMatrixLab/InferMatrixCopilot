@@ -124,3 +124,27 @@ def test_shipped_afd_adapter_parses_and_resolves_alias(monkeypatch, tmp_path):
     assert reg.resolve(name="afd-plugin").name == "afd_plugin"
     assert reg.resolve(name="vllm-project/afd-plugin").name == "afd_plugin"
     assert reg.resolve(repo_path=str(tmp_path)).name == "afd_plugin"
+
+
+def test_shipped_vllm_router_adapter_injects_priority_rules():
+    from infermatrix_copilot.config import _REPO_ROOT
+
+    p = load_adapter(_REPO_ROOT / "adapters" / "vllm_router")
+    assert p.name == "vllm_router"
+    assert p.manifest["repo"]["full_name"] == "vllm-project/router"
+    assert p.manifest["knowledge"]["repo_subdir"] == "repos/vllm-router"
+    assert p.manifest["push"]["allowed"] is False
+    assert p.matches_name("vllm-router")
+    assert p.matches_name("vllm-project/router")
+    assert p.repo_path == ""
+
+    briefing = p.briefing(_REPO_ROOT / "knowledge")
+    assert "直接无法调度" in briefing
+    assert "https://github.com/vllm-project/router/issues/468" in briefing
+    assert "https://github.com/vllm-project/router/issues/453" in briefing
+    assert "power_of_two" in briefing
+    assert "仍标致命" in briefing
+
+    reg = AdapterRegistry(_REPO_ROOT / "adapters")
+    assert reg.resolve(name="vllm_router").name == "vllm_router"
+    assert reg.resolve(name="vllm-project/router").name == "vllm_router"
