@@ -1,0 +1,30 @@
+# Points InferMatrixCopilot at the vllm-project/router issue-priority rules.
+# Source modules and a checkout pin are not declared here.
+name: vllm_router
+status: active
+created_by: human
+schema_version: 1
+capabilities: []
+
+repo:
+  path: ${VLLM_ROUTER_REPO}
+  full_name: vllm-project/router
+  aliases:
+  - vllm-router
+  - vllm_router
+  - router
+  - vllm-project/router
+  default_branch: main
+
+knowledge:
+  source: vllm-project/router
+  repo_subdir: repos/vllm-router
+  briefing_docs:
+  - repos/vllm-router/bug/rules.md
+  - repos/vllm-router/_index.md
+
+push:
+  default_remote: origin
+  protected_branches:
+  - main
+  allowed: false
