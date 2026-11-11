@@ -451,3 +451,51 @@ def test_known_failure_events_have_typed_safe_recovery_without_raw_text(tmp_path
         transport.complete(system="PRIVATE_SYSTEM_PROMPT", messages=[])
     assert exc.value.code == code and exc.value.retryable is retryable
     assert "PRIVATE" not in str(exc.value) and "SECRET" not in str(exc.value)
+
+
+def test_workspace_mcp_trust_digest_golden():
+    """The pre-seeded trust record's declarationDigest must equal what
+    zcode 0.17.1 computes over the project-scope server declaration
+    (golden measured live: echo-tools session, tool-call round-trip)."""
+    session = Path("/tmp/zcode-trust-test")
+    server = {"type": "stdio", "timeoutMs": 600000,
+              "command": "/usr/bin/python3",
+              "args": ["/tmp/zcode-trust-test/echo_mcp.py"]}
+    digest = ZCodeTransport._trust_declaration_digest(session, "echo-tools",
+                                                      server)
+    assert digest == ("f5f218c5e9d36908b100ef3a0bb57f3be12b19d4"
+                      "fc3f271d5a27e0e82f3ba633")
+
+
+def test_workspace_mcp_trust_seed_is_idempotent_and_prunes_dead_sessions(
+        tmp_path, monkeypatch):
+    """One record per (server, digest); sessions whose dir vanished are
+    pruned so the host-global store cannot grow without bound."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session = tmp_path / "imc-zcode-session-x"
+    (session / ".zcode").mkdir(parents=True)
+    server = {"type": "stdio", "timeoutMs": 7200000, "command": "/usr/bin/x",
+              "args": ["-m", "infermatrix_copilot.tool_bridge"],
+              "env": {"A": "1"}}
+    ZCodeTransport._seed_workspace_mcp_trust(session, "infermatrix-tools",
+                                             server)
+    ZCodeTransport._seed_workspace_mcp_trust(session, "infermatrix-tools",
+                                             server)
+    store = json.loads((tmp_path / ".zcode" / "security"
+                        / "workspace-mcp-trust-v1.json").read_text())
+    assert store["schemaVersion"] == 1
+    assert len(store["records"]) == 1
+    rec = store["records"][0]
+    assert rec["serverName"] == "infermatrix-tools"
+    assert rec["declarationDigest"] == \
+        ZCodeTransport._trust_declaration_digest(session, "infermatrix-tools",
+                                                 server)
+    # a dead session's record is pruned on the next seed, others survive
+    dead = tmp_path / "imc-zcode-session-dead"  # never created on disk
+    ZCodeTransport._seed_workspace_mcp_trust(dead, "infermatrix-tools", server)
+    store = json.loads((tmp_path / ".zcode" / "security"
+                        / "workspace-mcp-trust-v1.json").read_text())
+    names = [(r["serverName"], r["workspaceIdentity"])
+             for r in store["records"]]
+    assert ("infermatrix-tools", str(dead)) not in names
+    assert ("infermatrix-tools", str(session)) in names
