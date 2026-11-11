@@ -1,7 +1,7 @@
 ---
 title: "Cosmos3 规则"
 created: 2026-07-20
-updated: 2026-10-23
+updated: 2026-11-11
 type: rule
 tags: [vllm-omni, models, diffusion]
 sources: ["PR #4657", "PR #5001", "PR #5634", "PR #6049", docs/features/session_state_manager.md, recipes/cosmos3/Cosmos3-Nano.md, vllm_omni/diffusion/models/cosmos3/, vllm_omni/model_extras/cosmos3.py, vllm_omni/model_extras/registry.py, vllm_omni/experimental/world_models/adapters/state_cosmos3_adapter.py, vllm_omni/platforms/rocm/platform.py, tests/diffusion/models/cosmos3/test_session_memory_equivalence.py, tests/diffusion/models/cosmos3/test_cosmos3_pipeline.py, "PR #6107", "PR #5614", "PR #6325", "PR #6913", "PR #6920", "PR #7427", "PR #7971", "PR #7592", "PR #5712", "PR #9304"]
@@ -195,8 +195,8 @@ confidence: high
 ## VLLM-OMNI-PR9304-EDGE-PP-OWNERSHIP — Edge 权重校验必须从活模块读取 PP 归属
 
 - 触发：修改 `vllm_omni/diffusion/models/cosmos3/transformer_cosmos3_edge.py` 的 `validate_loaded_weights` 或 `_weight_marker_is_pp_missing`，或在仓库模型代码中引入上游 `is_pp_missing_parameter` 的权重归属判定。
-- 强制：marker 是否被跳过必须由本 rank 的活模块决定：`language_model.*` 直接 `isinstance(self.language_model, PPMissingLayer)`；`gen_layers.{i}.*` 检查对应 GEN slot 模块本身（UND backbone 是单一模块、只在第一个 PP stage；每个 GEN slot 是独立模块）；其余 marker 不跳过，本 rank 拥有的 marker 缺失仍必须报错。机制事实：上游 `is_pp_missing_parameter` 把缺失层名缓存在按 `id(model)` 键控且从不清理的 `_model_to_pp_missing_layer_names`，对象 id 复用会让陈旧空缓存把活 `PPMissingLayer` 报为已加载（AMD CI build 14498 即因此漏报 `gen_layers.1`）。上游 vLLM 保持不动，也不得 vendoring 该 helper。
+- 强制：marker 是否被跳过必须由本 rank 的活模块决定：`language_model.*` 直接 `isinstance(self.language_model, PPMissingLayer)`；`gen_layers.{i}.*` 检查对应 GEN slot 模块本身（UND backbone 是单一模块、只在第一个 PP stage；每个 GEN slot 是独立模块）；其余 marker 不跳过，本 rank 拥有的 marker 缺失仍必须报错。机制事实：上游 `is_pp_missing_parameter` 把缺失层名缓存在按 `id(model)` 键控且从不清理的 `_model_to_pp_missing_layer_names`，对象 id 复用会让陈旧空缓存把活 `PPMissingLayer` 误判为本 rank 拥有的实际层，继而对不属于本 rank 的 `gen_layers.1` marker 误报缺少必需权重；[上游 base-fail/head-pass 证据](https://github.com/vllm-project/vllm-omni/pull/9304#issuecomment-6369776059) 给出了该 `ValueError`。上游 vLLM 保持不动，也不得 vendoring 该 helper。
 - 禁止：以该 id 键控缓存的返回值决定 marker 归属；在测试中真实写入该进程级全局缓存来构造失败（同一失败会泄漏进后续测试）；借修复放宽本 rank 拥有 layer 的必需 marker。
-- 验收：测试以 `monkeypatch.setattr(model_utils, "get_pp_missing_layer_names", lambda _model: [])` 模拟陈旧缓存查找，断言 PP-missing marker 被跳过、`relu2` 等必需 marker 缺失时 `validate_loaded_weights` 仍 fail，且未污染全局缓存；PR 的通过证据是本地 CPU 运行（需预载 cosmos3 包命名空间绕过 API server import），AMD CI 未复跑，不得据此声称真实多 stage PP parity。^[PR #9304]
+- 验收：测试以 `monkeypatch.setattr(model_utils, "get_pp_missing_layer_names", lambda _model: [])` 模拟陈旧缓存查找，断言 PP-missing marker 被跳过、`relu2` 等必需 marker 缺失时 `validate_loaded_weights` 仍 fail，且未污染全局缓存；验收必须核对当前 head 的 CI 和后续讨论，不能把较早的本地 CPU 证据（需预载 cosmos3 包命名空间绕过 API server import）当作最终状态。[后续维护者报告](https://github.com/vllm-project/vllm-omni/pull/9304#issuecomment-6371457488) 记录 AMD build #14506 的两个目标测试所在 shard 通过，整体仍因无关 Wan 测试失败；这是维护者报告的 CI 证据，不能据此声称真实多 stage PP parity。^[PR #9304]
 
 <!-- kb:rule status=active since=v0.30.0 -->

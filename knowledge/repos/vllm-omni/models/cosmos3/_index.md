@@ -1,7 +1,7 @@
 ---
 title: "Cosmos3"
 created: 2026-07-20
-updated: 2026-10-06
+updated: 2026-11-11
 type: index
 tags: [vllm-omni, models, diffusion]
 sources: ["PR #4657", "PR #5001", "PR #5634", "PR #6920", docs/features/session_state_manager.md, recipes/cosmos3/Cosmos3-Nano.md, vllm_omni/diffusion/models/cosmos3/, vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py, vllm_omni/experimental/world_models/adapters/state_cosmos3_adapter.py, vllm_omni/platforms/rocm/platform.py, tests/diffusion/models/cosmos3/test_cosmos3_pipeline.py]
@@ -55,7 +55,7 @@ request 的 denoise 生命周期内使用，不提供跨请求记忆或并发安
 
 ## 什么时候查这里
 
-- 审查 Cosmos3 Edge/Distilled scheduler、RNG、guidance、offload、distributed-VAE multi-chunk transfer 或 capability claim。
+- 审查 Cosmos3 Edge/Distilled scheduler、RNG、guidance、offload、distributed-VAE multi-chunk transfer、PP 权重归属与 stale-cache 缺重误报，或 capability claim。
 - 同一问题影响多个 diffusion 模型时返回 [Diffusion rules](../../components/diffusion/rules.md)。
 
 sampling state FP32 与 transformer dtype boundary：COSMOS-8a；沿本目录 rules 审查入口核对。
