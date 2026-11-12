@@ -1,7 +1,7 @@
 ---
 title: "Model Executor"
 created: 2026-07-10
-updated: 2026-10-06
+updated: 2026-11-12
 type: index
 tags: [vllm-omni, components, model-executor]
 sources: []
@@ -74,3 +74,5 @@ sources: []
 - [模型执行器 — Qwen2.5-Omni talker 终止 conditioning 规则](rules-qwen25-talker-eos.md)
 - [Drama 3 量化配置规则](rules-drama3-quant.md)
 - [模型执行器 — GPU 显存预算规则](rules-gpu-memory-budget.md)
+
+- [模型侧惰性编译统计](rules-compile-stats.md) — 直接 `torch.compile` 的首次执行、warmup 与 block-local cache 计数。
