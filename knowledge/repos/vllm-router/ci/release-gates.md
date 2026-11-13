@@ -1,7 +1,7 @@
 ---
 title: "vLLM-Router 发布规范"
 created: 2026-11-06
-updated: 2026-11-09
+updated: 2026-11-13
 type: guide
 tags: [vllm-router, ci]
 sources: [.buildkite/release-pipeline.yml, .buildkite/scripts/build-wheel.sh, .buildkite/scripts/publish-release-images.sh, .buildkite/scripts/cleanup-nightly-router-builds.sh, .buildkite/README.md, docker/Dockerfile.router, pyproject.toml, Cargo.toml, py_src/vllm_router/version.py, docs/benchmarks/router_overhead.md, tests/python/e2e/perf/grpc/README.md, tests/python/e2e/perf/l1_encode/README.md, tests/python/e2e/pd_disagg_vllm/test_lm_eval_accuracy.py, .github/ISSUE_TEMPLATE/200-bug-report.yml, "vllm-project/router@ddf78218cffdb6361579d3babd69a90ba6d63aaa", "https://github.com/vllm-project/router/releases/tag/v0.1.17"]
@@ -130,7 +130,9 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
 - 用 tag 列表判断发布状态：`v0.1.11`、`v0.1.13`、`v0.1.14` 没有任何产物，`v0.1.16.1` 只有镜像。
 - 用 nightly 的绿测替代发版证据：nightly 覆盖面最广，但它不阻塞 PR、也不校验 tag 与版本文件，
   过期一轮的 nightly 结果不能当本次 tag 的门禁证据。
-- 只验证 x86_64：PyPI 与镜像都要求两个架构各自构建并 smoke。
+- 只验证 x86_64：PyPI 的两个架构都要构建并做 wheel smoke；二进制 smoke 只跑 x86_64。
+  Docker 两个架构都构建并推送，但此 pin 的发布流水线没有镜像 smoke 步骤，不能把构建或
+  manifest 发布成功当成镜像运行验证。镜像运行证据需另行提供。
 - 声明 macOS/Windows wheel：构建只在 manylinux_2_28 上做，一个 abi3 wheel 覆盖多个 Python 版本，
   不是跨平台承诺。
 
