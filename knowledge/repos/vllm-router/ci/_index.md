@@ -1,7 +1,7 @@
 ---
 title: "vLLM-Router CI"
 created: 2026-11-06
-updated: 2026-11-09
+updated: 2026-11-13
 type: index
 tags: [vllm-router, ci]
 sources: [.buildkite/README.md, .buildkite/pipeline.yml, .buildkite/test-ready.yml, .buildkite/test-merge.yml, .buildkite/test-nightly.yml, .buildkite/release-pipeline.yml, .buildkite/ci_mirror_hardwares.yml, .buildkite/scripts/build-ci-image.sh, pytest.ini, tests/python/helpers/mark.py, "vllm-project/router@ddf78218cffdb6361579d3babd69a90ba6d63aaa"]
@@ -54,4 +54,4 @@ UI/API 加 `RUN_ROCM_RDMA=1`。
 
 | 遇到什么 | 查看哪里 | 说明 |
 |---|---|---|
-| 发版门禁、tag/版本一致性、PyPI 与 Docker 发布顺序、发布产物核对 | [发布规范](release-gates.md) | 硬门禁与质量门槛分栏，含常见失败模式 |
+| 发版门禁、tag/版本一致性、PyPI 与 Docker 发布顺序、发布产物核对 | [发布规范](release-gates.md) | 硬门禁与质量门槛分栏，区分 wheel smoke 与镜像运行证据，含常见失败模式 |
