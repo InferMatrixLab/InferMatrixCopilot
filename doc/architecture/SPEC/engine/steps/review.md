@@ -1,6 +1,6 @@
 # engine/steps/review/ —— 规范
 
-<!-- verified-against: 2026-10-04 -->
+<!-- verified-against: 2026-11-14 -->
 
 `patch gate + PR review + quality（9 个源文件） · step 库（评审） · refactor-status: ok`
 
@@ -17,7 +17,7 @@ agent、评审结果的有界精炼、评测调优过的 prompt 数据和确定�
 - `__init__.py` —— import `patch_gate`、`quality` 和 `steps` 以触发各自的
   `@step` 注册副作用；再导出公开契约（见下）。无逻辑。
 - `prompts.py` —— 由评测得出的 prompt 数据：`_REVIEW_SYSTEM`、`_REVIEW_LENSES`、
-  `_REVIEW_MERGE`。约 120 行文本，**移出控制流之外**。
+  `_REVIEW_MERGE`。prompt 文本**移出控制流之外**。
 - `utils.py` —— 确定性、无 LLM 的 helper：`_sweep_targets`、`_render_review_md`、
   `_SEVERITY_ORDER`。
 - `patch_gate.py` —— `review.patch_gate`（validation/read）：捕获已提交的
@@ -79,7 +79,7 @@ agent、评审结果的有界精炼、评测调优过的 prompt 数据和确定�
   与"没配"和"守卫在履职"是三件事（见 `review/planner.md` 的 5 种 cause）。
 - 评审：领域 checklist 由 adapter 的 `knowledge.review_checklist` 或 profile 的
   `review.md` 扩展，**注入上限 8k 字符**（页面写满上限时新增门禁会被静默截断）；`_sweep_targets` 以
-  `repo.language` 为键，**诚实降级**；裁决自洽（任何 ≥minor 的评论 ⇒ REQUEST CHANGES）；
+  `repo.language` 为键，**诚实降级**；裁决遵循下述校准规则；
   确定性的按严重度排序的评论上限。
 - prompt 是仓库中立的（**A5**）。
 - 质量 step **fail-closed**：枚举/JSON/模型不可用即 BLOCKED；
@@ -138,3 +138,20 @@ Direct 1.1 / Strict 1.3 accept typed `CarriedFinding` inputs (unique IDs, source
 ## 自进化接入（2026-10-04）
 
 影子评审继承严格工具 scope；PR 文件、基础版本与历史工具只能读取冻结仓库，涉及生产写入的步骤由执行器拒绝。
+
+
+## Cancellation-owner evidence contract
+
+The shared cancellation guidance reaches both drafting (`_REVIEW_SYSTEM`) and
+per-comment verification (`_VERIFY_GUIDANCE`). A cleanup finding must trace the
+actual task/cancel-scope owner and relevant dependency version, distinguishing
+one asyncio task cancellation from repeated cancellation and level-triggered
+AnyIO/Trio scope cancellation. A yielding `finally` alone is not evidence that
+cleanup is interrupted. A sibling safeguard is a candidate for investigation,
+not a defect without the same obligation and a reachable adverse effect.
+Reachable repeated/scope-cancellation defects remain actionable; an unknown
+owner remains unverified rather than being promoted to a confirmed failure.
+
+`test_review_cancellation_contract.py` checks shared prompt delivery and
+single-cancel, repeated-cancel and scope-cancel semantic controls. Those offline
+checks do not measure model compliance or establish a precision/recall gain.
