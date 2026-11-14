@@ -1,6 +1,6 @@
 # engine/agent_runtime/ —— 规范
 
-<!-- verified-against: 2026-11-04 -->
+<!-- verified-against: 2026-11-14 -->
 
 `LOC ~1690（7 个文件） · 引擎（受治理的 agent 运行时） · refactor-status: ok`
 
@@ -142,3 +142,20 @@ API 模式可以观测模型请求；harness 模式记录提供给外部 CLI 的
 工作，`best_effort` 保持执行并标为 degraded；终结时写 JSON/Markdown 报告。
 验证见 `test/test_knowledge_trace_strict.py`、
 `test/test_knowledge_trace_adaptive_strict.py`。
+
+
+## Evidence archive identity
+
+Oversized input evidence is archived by logical name plus SHA-256 of its UTF-8
+content. References returned to an agent must keep denoting that exact content
+when another concurrent or later step uses the same logical name for different
+text. Identical text under the same name may reuse the same path. Atomic
+replacement remains required, and configured per-name caps and capped prompt
+text are unchanged. Consumers follow the returned reference rather than
+constructing a fixed `evidence/<name>.txt` path. More distinct evidence produces
+more archive files within the existing run directory and retention lifecycle.
+
+Offline peer-verification tests exercise the actual evidence builder with
+oversized per-candidate lists, alongside small/equal/changed-content and
+concurrent archive controls. These are evidence-isolation checks, not a model
+quality evaluation.

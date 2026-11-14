@@ -158,4 +158,8 @@ verifiers do not share their returned verdicts, so the guidance is not a hard
 guarantee that duplicate or contradictory findings will be eliminated.
 `test_review_peer_evidence.py` checks evidence projection, input nonmutation,
 existing explicit repair/removal behavior and disabled-verifier behavior with a
-scripted runner. It does not measure model quality.
+scripted runner. Oversized peer and own-comment evidence must retain stable
+full-content references across the verifier fan-out; the runtime archives by
+name and content hash. Tests exercise the real evidence builder after all
+competing writes, plus concurrent same/different-content and cap controls.
+These tests do not measure model quality.

@@ -7,6 +7,7 @@ live here instead of inflating the orchestration files (`runner`, `ensemble`).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 
@@ -37,9 +38,12 @@ def _build_evidence(ctx: StepContext, evidence: dict[str, str],
         text = str(text or "")
         if len(text) > cap:
             ev_dir.mkdir(parents=True, exist_ok=True)
-            path = ev_dir / f"{name}.txt"
-            # concurrent lenses archive the same evidence — write atomically
-            tmp = ev_dir / f".{name}.{threading.get_ident()}.tmp"
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            path = ev_dir / f"{name}.{digest}.txt"
+            # Parallel steps may use the same name for DIFFERENT evidence.
+            # Content-address the final reference as well as writing atomically;
+            # a later verifier must not replace an earlier verifier\'s full text.
+            tmp = ev_dir / f".{name}.{digest}.{threading.get_ident()}.tmp"
             tmp.write_text(text, encoding="utf-8")
             tmp.replace(path)
             refs[name] = str(path)
