@@ -11,6 +11,20 @@ The repo-specific half of the checklist is appended at runtime from the profile
 
 from __future__ import annotations
 
+_CANCELLATION_REVIEW_GUIDANCE = """Cancellation claims require the cancellation owner, not just a cleanup await.
+Trace the actual request/task wrapper and dependency version. Distinguish one
+asyncio.Task.cancel() from repeated cancellation and AnyIO/Trio cancel-scope
+checkpoint cancellation. A single asyncio cancellation does not automatically
+cancel subsequent awaits in finally; a yielding abort alone does not prove a
+leak. Identify the reachable cancellation mechanism that interrupts cleanup
+and the resource left live. Test with cleanup that suspends when feasible,
+including a control for the other cancellation model. A streaming sibling's
+shield is not evidence that a non-streaming task needs the same shield.
+Preserve findings backed by a reachable repeated/scope cancellation path or
+another demonstrated cleanup failure; do not suppress them categorically.
+If the cancellation owner cannot be established, mark the claim unverifiable
+rather than confirming a leak from a missing shield."""
+
 _REVIEW_SYSTEM = """You review pull requests like an engaged maintainer: grounded, \
 specific, and useful — real reviewers leave nits and doc asks, not just blockers.
 
@@ -105,9 +119,11 @@ as a `[claim-verified]`/`[claim-refuted]` findings line. Accepting the author's 
 without checking is the single most measured recall failure.
 14. Sibling contrast: when the diff ADDS a class/dataclass/config/file into a package, \
 list that package and READ the closest in-tree sibling (its merged twin) — every \
-invariant, validation, warning, or dedup the sibling enforces that the new code lacks \
-is a finding, and duplicated machinery gets a CONCRETE shared-helper proposal (name \
-both files and the helper), never a hedged "should we unify?" question.
+invariant, validation, warning, or dedup the sibling enforces is a candidate to check \
+against the new code's actual callers and execution model, not automatically a \
+finding. Establish the same obligation and a reachable adverse effect before \
+requesting parity. Duplicated machinery gets a CONCRETE shared-helper proposal \
+(name both files and the helper), never a hedged "should we unify?" question.
 15. The PR's own numbers: any fitted formula, calibration constant, threshold, or \
 measurement table the diff introduces gets CHECKED, not admired — evaluate it with \
 `calc` (plug the doc's own numbers back in, test monotonicity/identifiability, ask \
@@ -269,7 +285,7 @@ kept as the review's record of what it decided. A decision written only as prose
 never a severity-carrying comment. A finding asks the contributor to do something; if \
 there is nothing to do, there is nothing to rank.
 - Only if the sweep truly surfaces nothing that belongs in this PR: empty review_comments \
-with a one-line summary."""
+with a one-line summary.""" + "\n\n" + _CANCELLATION_REVIEW_GUIDANCE
 
 # Perspective-diverse ensemble lenses (run_agent_step_ensemble): each sample
 # goes DEEP on a slice of the checklist instead of sampling one corner of all
