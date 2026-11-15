@@ -71,6 +71,32 @@ def test_direct_plan_is_typed_complete_and_path_free():
         assert document["sha256"].startswith("sha256:")
 
 
+def test_direct_plan_carries_negative_claim_tracing_guidance():
+    # Prompt delivery only: no model is asked to apply these instructions.
+    from infermatrix_copilot.direct_routing import DIRECT_REVIEW_CHECKLIST
+
+    plan = DirectClient().plan(
+        _request("vllm-omni", "vllm_omni/core/sched/scheduler.py")
+    )
+    checklist = plan.to_dict()["first_review_checklist"]
+    assert tuple(checklist) == DIRECT_REVIEW_CHECKLIST
+    caller = next((item for item in checklist if "Before claiming an input" in item), "")
+    for evidence in ("concrete production caller", "subclass overrides",
+                     "explicit keywords", "**kwargs", "super()", "consumer",
+                     "decisive caller/callee locations", "frozen head"):
+        assert evidence in caller
+    cleanup = next((item for item in checklist if "For cleanup claims" in item), "")
+    for evidence in ("actual callee", "standard-library/dependency code",
+                     "version and platform", "success and exception paths",
+                     "owns each side effect", "duplicates unregister",
+                     "non-idempotent"):
+        assert evidence in cleanup
+    limits = next((item for item in checklist if "keep that claim unresolved" in item), "")
+    for evidence in ("available tools", "exact evidence gap", "sparse source",
+                     "Preserve independently demonstrated reachable defects"):
+        assert evidence in limits
+
+
 def test_second_adapter_routes_from_packaged_adapter_registry():
     plan = DirectClient().plan(
         _request("afd-plugin", "afd_plugin/compat/vllm.py")
@@ -467,3 +493,4 @@ def test_strict_reservation_carries_evidence_through_policy(settings):
     from infermatrix_copilot.mcp_policy import enforce_mcp_policy
     spec = enforce_mcp_policy(payload, allowed_repos=["vllm-omni"])
     assert spec.params["carried_findings"] == [_carried().to_dict()]
+
