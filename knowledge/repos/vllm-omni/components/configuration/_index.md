@@ -1,7 +1,7 @@
 ---
 title: "vLLM-Omni Configuration"
 created: 2026-07-16
-updated: 2026-10-06
+updated: 2026-11-12
 type: index
 tags: [vllm-omni, components, config]
 sources: ["claude-workflow-starter-private@296ea45", vllm_omni/config/]
@@ -62,4 +62,4 @@ sources: ["claude-workflow-starter-private@296ea45", vllm_omni/config/]
 - [Thinker prefix cache deploy 默认值](rules-thinker-prefix-cache.md)
 - [vLLM-Omni 配置：环境变量清单与测试同步规则](rules-environment-variables.md)
 - [vllm-omni 配置 · engine args 评审规则](rules-engine-args.md)
-- [Torch Compile Hash 稳定性与模型侧编译日志规则](rules-compile-hash.md)
+- [Torch Compile Hash 稳定性规则](rules-compile-hash.md)
