@@ -59,7 +59,9 @@ def test_evidence_capped_and_archived(settings, trace, tmp_path):
     assert result.ok
     prompt = llm.calls[0]["messages"][0]["content"]
     assert "chars omitted" in prompt and "TAIL_MARKER" in prompt
-    archived = tmp_path / "run" / "evidence" / "big_item.txt"
+    archives = list((tmp_path / "run" / "evidence").glob("big_item.*.txt"))
+    assert len(archives) == 1
+    archived = archives[0]
     assert archived.exists() and archived.read_text() == big
     assert str(archived) in prompt  # agent told where the full text lives
 

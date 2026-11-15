@@ -355,7 +355,20 @@ In order, with the minimum tool calls (your budget is small):
    affected consumer, and a problem contingent on hypothetical future code
    changes, are not actionable. Check rejected_comments before reopening
    a concern; identify new evidence that defeats its rejection.
-4. Severity: major requires a real defect in the changed code or a required
+4. Cross-comment consistency: `sibling_draft_comments` are this review's own
+   UNPUBLISHED candidates, not statements by the PR author or maintainers.
+   Compare their claims with this candidate. A correction to our own draft is
+   not work for the contributor: repair this comment's false premise or
+   return not_actionable for a correction-only/duplicate candidate. Preserve
+   the real underlying defect once, with the supported rationale. Do not
+   attribute our draft's mistakes to the PR or report mutually exclusive
+   claims as independently confirmed. Sibling assertions are hypotheses,
+   never evidence; verify disagreements against the PR-time source.
+   For CI-coverage claims, inspect directory/glob collection, markers and
+   uploader gates. A filename grep with no hits does not prove a test is
+   uncollected. Distinguish lane selection from whether that lane actually
+   ran and passed on this head.
+5. Severity: major requires a real defect in the changed code or a required
    update the diff lacks; "consider adding X" polish is minor at most.
 
 Verdicts:
@@ -416,6 +429,12 @@ async def _verify_comments(ctx: StepContext, output: dict,
                 evidence={"pr_diff": diff_ev,
                           "draft_comment": json.dumps(
                               probe, ensure_ascii=False),
+                          "sibling_draft_comments": json.dumps(
+                              [{k: sibling[k] for k in
+                                ("file", "line", "severity", "comment", "disposition")
+                                if k in sibling}
+                               for j, sibling in enumerate(comments) if j != i],
+                              ensure_ascii=False),
                           "rejected_comments": json.dumps(
                               output.get("_rejected_review_comments") or [],
                               ensure_ascii=False)},
