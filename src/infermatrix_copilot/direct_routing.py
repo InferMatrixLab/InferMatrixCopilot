@@ -153,6 +153,9 @@ DIRECT_REVIEW_CHECKLIST = (
     "When the PR is a bugfix (title, labels, or linked issue), require a regression test that pins the original failure path; happy-path-only additions do not count, and a missing pin becomes an explicit blocking or non-blocking finding, never silence.",
     "Check the PR body's Test Plan and Test Result against the CI definition at the frozen head: name the guard steps whose declared source dependencies cover the changed paths, then compare their commands with what the PR reports running by selector — test targets, marker expression, run level — not by literal text. A guard step never run, a dropped marker, or absent test evidence is a blocking finding naming the step and both commands.",
     "When the diff passes a new argument to a dependency, check it against the lowest version the project's own constraints still permit, not the version installed here.",
+    "Before claiming an input is never forwarded or an effect never occurs, trace the concrete production caller through subclass overrides, explicit keywords, **kwargs and super() to the consumer; cite the decisive caller/callee locations at the frozen head, not just a local search or test stub.",
+    "For cleanup claims, inspect the actual callee, including standard-library/dependency code, at the applicable version and platform; distinguish success and exception paths and identify who already owns each side effect. Before suggesting extra cleanup, check whether it duplicates unregister, release, close or other non-idempotent work.",
+    "If a relevant caller, callee, dependency version or platform cannot be verified with available tools, keep that claim unresolved and state the exact evidence gap; do not infer absence from unreadable or sparse source. Preserve independently demonstrated reachable defects rather than suppressing them because another path is safe.",
     "For resource or cache changes, trace budget measurement through reservation and physical consumption, including warmup/profile/activation ordering and low-resource behavior.",
     "For runtime changes, trace exception propagation, partial-allocation cleanup, cancellation, timeout, shutdown, and concurrent scheduling to the terminal user-visible signal.",
     "At native dependency boundaries, verify the pinned API contract and caller inputs; native reuse does not prove the caller's budget, ordering, adapter, or lifecycle correctness.",
@@ -971,3 +974,4 @@ direct_knowledge_routes = _direct_knowledge_routes
 direct_execution_budget = _direct_execution_budget
 direct_completion_result = _direct_completion_result
 direct_mandatory_review_guides = _direct_mandatory_review_guides
+
