@@ -1,7 +1,7 @@
 ---
 title: "vLLM-Router 发布规范"
 created: 2026-11-06
-updated: 2026-11-09
+updated: 2026-11-13
 type: guide
 tags: [vllm-router, ci]
 sources: [.buildkite/release-pipeline.yml, .buildkite/scripts/build-wheel.sh, .buildkite/scripts/publish-release-images.sh, .buildkite/scripts/cleanup-nightly-router-builds.sh, .buildkite/README.md, docker/Dockerfile.router, pyproject.toml, Cargo.toml, py_src/vllm_router/version.py, docs/benchmarks/router_overhead.md, tests/python/e2e/perf/grpc/README.md, tests/python/e2e/perf/l1_encode/README.md, tests/python/e2e/pd_disagg_vllm/test_lm_eval_accuracy.py, .github/ISSUE_TEMPLATE/200-bug-report.yml, "vllm-project/router@ddf78218cffdb6361579d3babd69a90ba6d63aaa", "https://github.com/vllm-project/router/releases/tag/v0.1.17"]
@@ -46,7 +46,7 @@ tag→产物的机械门禁，测试矩阵、质量门槛和 GitHub Release 正�
 
 | # | 门禁 | 证据 job / 脚本 | 失败后果 |
 |---|---|---|---|
-| 1 | tag 版本 == `pyproject.toml` 版本 | `version-check`（仅 tag 构建） | 后续 build/publish 全部不执行 |
+| 1 | tag 版本 == `pyproject.toml` 版本 | `version-check`（仅 tag 构建） | 阻塞两架构 wheel 构建及后续 PyPI 发布 |
 | 2 | 两架构产物构建成功：x86_64 出二进制 + wheel + sdist，aarch64 出 wheel；在 manylinux_2_28 镜像里 `cargo build --release` + `python -m build` + `auditwheel repair`，Rust 用 nightly 工具链 | `build_wheels_x86_64`、`build_wheels_aarch64` | PyPI 发布阻塞 |
 | 3 | 二进制 smoke：`vllm-router --version`、`--help` 在 manylinux 容器内可执行 | `smoke-test-binary-x86_64` | PyPI 发布阻塞 |
 | 4 | wheel smoke：两个架构各自 `pip install` 后 `import vllm_router` 并打印 `__version__` | `test-python-wheel-x86_64`、`test-python-wheel-aarch64` | PyPI 发布阻塞 |
@@ -61,7 +61,7 @@ tag→产物的机械门禁，测试矩阵、质量门槛和 GitHub Release 正�
 - `vllm_router.__version__` 只被打印，不与 tag 比较；四份版本文件漏改一份，CI 不会报错。
 - wheel 用 nightly Rust 工具链构建，测试流水线固定 `rust:1.95.0`；CI 绿测不等于 wheel 里那份
   二进制已验证。
-- Docker 通道不校验 tag 与 `pyproject.toml`（`version-check` 只对 tag 构建生效），所以可以只发镜像；
+- Docker 正式版使用手工输入版本和独立的 build/publish block；该通道的显式依赖链不含 `version-check`，所以可以单独走镜像通道；
   `v0.1.16.1` 就是这么来的。
 
 Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 Docker job 上映射为
@@ -122,7 +122,7 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
 
 ## 常见失败模式
 
-- tag 与 `pyproject.toml` 不一致：`version-check` 直接失败，这是唯一能拦住后续所有产物的门禁。
+- tag 与 `pyproject.toml` 不一致：`version-check` 失败，两架构 wheel 构建及其下游 PyPI 发布被阻塞。不要把它当作 Docker 镜像的版本门禁；判断镜像是否能发，另查手工版本输入和 Docker 发布链。
 - 只改 `pyproject.toml`：wheel 装得上，但 `vllm_router.__version__` 还是旧值；smoke 只打印不比较。
 - 把 README 的 “CI/CD Pipeline” 当流程依据：该段仍写 `cibuildwheel` 和“`pyproject` 版本变化即发布”，
   与实际的 tag 驱动、四文件同步不一致；Dockerfile 路径 `/docker/Dockerfile.router` 倒是对的。
@@ -130,7 +130,9 @@ Docker 通道还有两条运维前提：secret `ROUTER_DOCKERHUB_TOKEN` 只在 D
 - 用 tag 列表判断发布状态：`v0.1.11`、`v0.1.13`、`v0.1.14` 没有任何产物，`v0.1.16.1` 只有镜像。
 - 用 nightly 的绿测替代发版证据：nightly 覆盖面最广，但它不阻塞 PR、也不校验 tag 与版本文件，
   过期一轮的 nightly 结果不能当本次 tag 的门禁证据。
-- 只验证 x86_64：PyPI 与镜像都要求两个架构各自构建并 smoke。
+- 只验证 x86_64：PyPI 的两个架构都要构建并做 wheel smoke；二进制 smoke 只跑 x86_64。
+  Docker 两个架构都构建并推送，但此 pin 的发布流水线没有镜像 smoke 步骤，不能把构建或
+  manifest 发布成功当成镜像运行验证。镜像运行证据需另行提供。
 - 声明 macOS/Windows wheel：构建只在 manylinux_2_28 上做，一个 abi3 wheel 覆盖多个 Python 版本，
   不是跨平台承诺。
 
