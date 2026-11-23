@@ -439,6 +439,47 @@ def test_baseline_venv_builds_and_installs_baseline_wheel(tmp_path):
     assert any("worktree" in c and "remove" in c for c in calls)
 
 
+def test_baseline_venv_installs_with_the_baseline_variant(tmp_path):
+    """The baseline is the last release the target repo was aligned to, which
+    can be published under another variant than a main target (vLLM: v0.34.0
+    ships cu130 only, main builds cu132): fetch it with the baseline's variant,
+    and keep `variant` when the adapter declares none."""
+    from infermatrix_copilot.rebase_engine.wheel import ensure_baseline_venv
+    url = "https://example.invalid/{commit}/{variant}/fixture/fix-{arch}.whl"
+
+    def spec(**extra):
+        return WheelSpec(
+            package="fixture", variant="cu132", arch="x86_64",
+            index_url_template="https://example.invalid/{commit}/{variant}/{package}/",
+            install_env={"VLLM_PRECOMPILED_WHEEL_COMMIT": "{commit}",
+                         "VLLM_PRECOMPILED_WHEEL_VARIANT": "{variant}"},
+            install_url_template=url, **extra)
+
+    seen = []
+
+    def run(cmd, *, cwd=None, env=None, timeout=600.0):
+        if " ".join(cmd).startswith("uv pip install"):
+            seen.append((env["VLLM_PRECOMPILED_WHEEL_VARIANT"], cmd[-1]))
+        return 0, "0.1\n", ""   # version mismatch -> build; every probe ok
+
+    def clone(src, dst):
+        (dst / "bin").mkdir(parents=True)
+        (dst / "pyvenv.cfg").write_text("home=/usr\n", encoding="utf-8")
+        return True
+
+    target = tmp_path / "venv"
+    target.mkdir()
+    (tmp_path / ".git").mkdir()
+    assert ensure_baseline_venv(target, spec(baseline_variant="cu130"), tmp_path,
+                                "a" * 40, run=run, clone=clone)
+    assert ensure_baseline_venv(target, spec(), tmp_path, "b" * 40,
+                                run=run, clone=clone)
+    assert seen == [("cu130", url.format(commit="a" * 40, variant="cu130",
+                                         arch="x86_64")),
+                    ("cu132", url.format(commit="b" * 40, variant="cu132",
+                                         arch="x86_64"))]
+
+
 def test_hardlinked_baseline_launchers_use_clone_without_modifying_target(tmp_path):
     import venv
 

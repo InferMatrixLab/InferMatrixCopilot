@@ -77,6 +77,10 @@ class WheelSpec:
     # Complete published wheels avoid editable installs tied to a disposable
     # source checkout. Optional: existing adapters retain editable installs.
     install_url_template: str = ""
+    # Variant of the LAST-RELEASE wheel the baseline venv installs, when it
+    # differs from `variant` (a main target built with a newer CUDA than the
+    # release the target repo is aligned to). "" keeps `variant`.
+    baseline_variant: str = ""
 
     @classmethod
     def from_manifest(cls, data: Mapping) -> "WheelSpec":
@@ -91,6 +95,7 @@ class WheelSpec:
             install_env=dict(data.get("install_env", {})),
             reinstall_retries=int(data.get("reinstall_retries", 3)),
             install_url_template=str(data.get("install_url_template", "")),
+            baseline_variant=str(data.get("baseline_variant", "")),
         )
 
 
@@ -847,15 +852,19 @@ def ensure_baseline_venv(
     try:
         run([uv, "pip", "uninstall", "--python", python, spec.package],
             cwd=wt)
+        # The baseline is the last release the target repo was aligned to, and
+        # that release can be published under another variant than a main
+        # target (vLLM: v0.34.0 ships cu130 only, main builds cu132).
+        baseline_variant = spec.baseline_variant or spec.variant
         env = dict(os.environ)
         env.update({key: value.replace("{commit}", baseline_commit)
-                          .replace("{variant}", spec.variant)
+                          .replace("{variant}", baseline_variant)
                     for key, value in spec.install_env.items()})
         # The worktree is deleted below. An editable install would retain a
         # finder pointing into that deleted tree and pass only the import check
         # run from inside it. Prefer the frozen published wheel when available.
         requirement = (spec.install_url_template.format(
-            commit=baseline_commit, variant=spec.variant, arch=spec.arch,
+            commit=baseline_commit, variant=baseline_variant, arch=spec.arch,
             package=spec.package) if spec.install_url_template else ".")
         rc, _, err = run([uv, "pip", "install", "--python", python,
                           requirement], cwd=wt, env=env, timeout=3600)
