@@ -25,14 +25,12 @@ upstream:
   kind: fork_tracking
   repo_path: ${VLLM_UPSTREAM_REPO}
   remote: origin
-  # v0.34.0 alignment campaign (2026-11-11): vLLM cut releases/v0.34.0 on
-  # 2026-11-08 (v0.34.0rc0 = 34b780fe66, cu130 x86_64 wheel published), so
-  # the wheel pick and commit assignment target the release branch, not
-  # main. vllm-omni main 725c1c9ac is aligned to vLLM v0.33.0 final
-  # (4ba787ec99). Pinned to the rc0 commit by the launcher's
-  # force_upstream_commit; re-pin to the tag commit once v0.34.0 final is
-  # tagged. Same pattern as the v0.33.0 campaign.
-  target_branch: releases/v0.34.0
+  # v0.35.0 preparation campaign (2026-11-23): vLLM has not cut a
+  # releases/v0.35.0 branch yet, so the wheel pick and commit assignment
+  # target main (tip eff4de9be3c, 2026-11-23). vllm-omni main 9b753874d is
+  # aligned to vLLM v0.34.0 final (62d4bc3c7e). Flip to the release branch
+  # once vLLM cuts it, as the v0.33.0 and v0.34.0 campaigns did.
+  target_branch: main
 
 # Repo-specific slice of the SHARED, human-curated knowledge base (the vendored
 # community docs at the repo-root `knowledge/` = settings.knowledge_dir;
@@ -234,7 +232,15 @@ rebase:
   wheel:
     package: vllm
     index_url_template: "https://wheels.vllm.ai/{commit}/{variant}/{package}/"
-    variant: cu130
+    # vLLM main moved its default CUDA build from 13.0 to 13.2 in 3996083d37
+    # (#55387, 2026-11-10): wheels for main commits are published under cu132
+    # only ("the cu129 and cu130 subdirectories no longer get new builds").
+    # PyPI's torch==2.14.0 stays +cu130; only vLLM's own kernels are built
+    # with 13.2. Release branches up to v0.34.0 publish cu130.
+    variant: cu132
+    # The baseline runtime (test loop) installs the wheel vllm-omni main was
+    # last aligned to, vLLM v0.34.0 final, which is published under cu130 only.
+    baseline_variant: cu130
     arch: x86_64
     import_check_modules: [vllm._C_stable_libtorch, vllm._C]
     ops_namespace: _C
