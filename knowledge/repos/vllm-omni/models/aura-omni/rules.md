@@ -1,12 +1,13 @@
 ---
 title: "Aura-Omni 规则"
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-11-23
 type: rule
 tags: [vllm-omni, models, model-executor, serving]
 sources:
   [
     "PR #7633",
+    "PR #8829",
     vllm_omni/model_executor/models/aura_omni/duplex/plugin.py,
     vllm_omni/model_executor/models/aura_omni/duplex/history.py,
     vllm_omni/model_executor/models/aura_omni/duplex/data_plane.py,
@@ -76,9 +77,17 @@ AURA-1e 因 Omni 尚未接线 Native 同名旋钮，单独视为 medium 证据�
   projected stage 的消费／截断。
 - 强制：Stage1 `project_intermediate_output=True`：文本可投影到 WS，**不
   consume、不截短** Stage2／3。Silent 走 `decide_output`。
+- 强制：只对完成的 Stage1 segment 判定 silent。若 `cumulative_text` 或 `text`
+  含非空、非纯 silent 标记的可发声文本，即使携带 stop token `151669` 或末尾
+  `<|silent|>`，也不能判为 listen 或中止已交给 Talker 的语句。
 - 禁止：投影即 consume；listening 误开 spoken audio turn。
-- 验收：in-tree — `tests/model_executor/models/aura_omni/duplex/test_aura_plugin_contract.py`
-  （投影／silent 决策）。**未证明** — 实权重多轮音质。^[PR #7633]
+- 验收：保留 in-tree `test_aura_plugin_contract.py` 的投影检查；
+  `test_decide_output_silent_short_circuits` 验证纯 silent
+  仍直接进入 listen；`test_decide_output_spoken_sentence_keeps_talker_despite_silent_id`
+  验证带相同 stop token 的可发声文本，无论是否带尾部标记，都不走 listen。
+  见[固定实现](https://github.com/vllm-project/vllm-omni/blob/7441c4b74a1ac9862ada159909182d31d9385ea0/vllm_omni/model_executor/models/aura_omni/duplex/plugin.py#L398-L445)
+  与[固定测试](https://github.com/vllm-project/vllm-omni/blob/7441c4b74a1ac9862ada159909182d31d9385ea0/tests/model_executor/models/aura_omni/duplex/test_aura_plugin_contract.py#L301-L354)。
+  **未证明** — 实权重多轮音质。^[PR #7633] ^[PR #8829]
 
 ## AURA-1c — 投影的 Stage1 仍必须 stash engine stage metrics
 
