@@ -14,6 +14,7 @@ import re
 from ....llm import parse_json_reply
 from ...step import StepContext
 from .utils import _SEVERITY_ORDER
+from .prompts import _CANCELLATION_REVIEW_GUIDANCE
 
 
 async def _promote_uncovered(ctx: StepContext, output: dict,
@@ -381,7 +382,7 @@ Verdicts:
 - unverifiable: you could not decide within budget.
 
 Confirming from plausibility alone is the one failure this pass exists to
-prevent — when in doubt between confirmed and unverifiable, unverifiable."""
+prevent — when in doubt between confirmed and unverifiable, unverifiable.""" + "\n\n" + _CANCELLATION_REVIEW_GUIDANCE
 
 
 async def _verify_comments(ctx: StepContext, output: dict,
