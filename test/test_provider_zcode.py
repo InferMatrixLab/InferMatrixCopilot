@@ -102,14 +102,14 @@ def _transport(tmp_path: Path, **settings) -> ZCodeTransport:
 
 
 def _request(tmp_path: Path, with_bridge: bool = True,
-             prompt: str = "PROMPT") -> AgentSessionRequest:
+             prompt: str = "PROMPT", read_only: bool = True) -> AgentSessionRequest:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     scope = read_only_scope()
     scope = type(scope)(name=scope.name, allowed_tools=scope.allowed_tools,
-                        read_only=True, root=str(worktree))
+                        read_only=read_only, root=str(worktree))
     bridge = write_bridge_spec(run_dir=run_dir, step_name="agent.review_diff",
                                scope=scope, repo="vllm-omni") \
         if with_bridge else None
@@ -125,7 +125,7 @@ def _capture(tmp_path: Path) -> dict:
         (tmp_path / "bin" / "capture.json").read_text(encoding="utf-8"))
 
 
-def test_run_session_plan_mode_bridge_and_parse(tmp_path, monkeypatch):
+def test_run_session_read_only_guarded_bridge_and_parse(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-leak")
     transport = _transport(tmp_path)
     req = _request(tmp_path)
@@ -139,11 +139,14 @@ def test_run_session_plan_mode_bridge_and_parse(tmp_path, monkeypatch):
 
     capture = _capture(tmp_path)
     argv = capture["argv"]
-    assert argv[argv.index("--mode") + 1] == "plan"
+    # zcode 0.18 asks for every MCP tool in plan mode: a read-only scope that
+    # needs the bridge runs guarded.
+    assert argv[argv.index("--mode") + 1] == "guarded"
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     denied = next(a for a in argv if a.startswith("--disallowed-tools="))
     for tool in ("Bash", "Edit", "Write", "Agent", "WebFetch",
-                 "mcp__node_repl__js"):
+                 "mcp__node_repl__js", "CreateSession", "InterruptSession",
+                 "SendToSession", "ReadSession"):
         assert tool in denied.split("=", 1)[1].split(",")
     prompt = next(a for a in argv if a.startswith("--prompt="))
     assert "SYS\n\nPROMPT" in prompt and str(req.scope.root) in prompt
@@ -164,6 +167,14 @@ def test_run_session_plan_mode_bridge_and_parse(tmp_path, monkeypatch):
                    if e["kind"] == "harness_session")
     assert session["audit_ok"] is True and session["bridge_calls"] == 1
     assert session["served_model"] == "GLM-5.3-Flash"
+
+
+def test_run_session_mutating_scope_runs_yolo(tmp_path):
+    transport = _transport(tmp_path)
+    transport.run_session(_request(tmp_path, read_only=False))
+
+    argv = _capture(tmp_path)["argv"]
+    assert argv[argv.index("--mode") + 1] == "yolo"
 
 
 def test_bridge_timeout_covers_long_running_module_tools(tmp_path):

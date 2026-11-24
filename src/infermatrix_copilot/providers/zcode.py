@@ -34,6 +34,13 @@ Governance (disclosed, per doc/features/provider-registry.md):
   still connects — verified live on 0.17.1 (bridge spawned, tool call
   round-trip). A future digest change fails CLOSED: the bridge stays
   unconnected and the engine's lifecycle check blocks the module.
+- **A read-only scope runs ``--mode guarded``, not ``plan`` (zcode 0.18).**
+  Plan mode asks for every MCP tool there, so a headless prompt gets the
+  bridge denied ("Plan mode requires approval for MCP tools that are not
+  read-only"; probed live on 0.18.0, 2026-11-24). After the denylist both
+  modes leave the same native tools, all reads; ``guarded`` keeps the ask for
+  dangerous commands. The host's plugin servers (``mcp__plugin_*``) are listed
+  in every mode and stay outside the audit allowlist.
 
 Model selection: zcode has no ``--model`` flag; a session takes the
 *configured default* of its personal provider config, and only when that
@@ -101,7 +108,8 @@ _BRIDGE_PREFIX = f"mcp__{_BRIDGE_SERVER}__"
 # runs retention cleanup against symlinked host dirs — rejected.
 _TRUST_STORE_REL = (".zcode", "security", "workspace-mcp-trust-v1.json")
 
-# Everything zcode 0.16.9 exposes in plan mode that is not a pure read.
+# Everything zcode exposes that is not a pure read: 0.16.9's set, plus the
+# session management zcode 0.18 added, which reaches the host's other sessions.
 _DISALLOWED = (
     "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Agent", "Skill",
     "ExitPlanMode", "EnterPlanMode", "AskUserQuestion", "SendMessage",
@@ -109,6 +117,8 @@ _DISALLOWED = (
     "SaveWorkflow", "EvalWorkflowSnippet", "ResumeWorkflowRun",
     "ResolveWorkflowQuestion", "TaskStop", "mcp__node_repl__js",
     "mcp__web_reader__webReader", "mcp__4_5v_mcp__analyze_image",
+    "CreateSession", "ForkSession", "InterruptSession", "ListSessions",
+    "ReadSession", "RenameSession", "SendToSession", "WaitSessions",
 )
 # What remains after the denylist — the audit's allowlist.
 _READ_TOOLS = frozenset({
@@ -748,7 +758,12 @@ class ZCodeTransport(HarnessTransport):
                 model=req.model or self.settings.strict_backend_model,
                 # Mutating workflows write only through the scoped bridge;
                 # native writes/shell/subagents retain the same denylist.
-                mode="plan" if req.scope.read_only else "yolo")
+                # A read-only scope takes `guarded`, not `plan`: zcode 0.18
+                # asks for every MCP tool in plan mode, so a headless prompt
+                # gets the bridge denied. After the denylist both modes leave
+                # the same native tools; `guarded` keeps asking for dangerous
+                # commands, which headless turns into a denial.
+                mode="guarded" if req.scope.read_only else "yolo")
         finally:
             shutil.rmtree(session, ignore_errors=True)
         usage = self._usage(events)
