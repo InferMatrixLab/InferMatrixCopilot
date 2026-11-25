@@ -60,8 +60,9 @@ _PYTEST_MODULE = re.compile(r"\s+-m\s+pytest(?=[\s)&|;]|$)")
 _CUDA_CODE = re.compile(
     r"torch\.cuda\b|cuda\.is_available\(|device\s*=\s*['\"]cuda|--device[=\s]+['\"]?cuda")
 _PYTHON_STDIN = re.compile(r"\bpython[0-9.]*\s+-\s*(?:<<|<)")
-# Commands that already handle the cards themselves.
-_SELF_SERVED = re.compile(r"\bgpu\s+run\b|\bimx-omni-pytest\b")
+# Commands that already handle the cards themselves: the scheduler, and the
+# repository's module test wrapper (named per repository by rebase_engine).
+_SELF_SERVED = re.compile(r"\bgpu\s+run\b|\bimx-[a-z0-9]+-pytest\b")
 # Outside quotes, each of these characters starts a new simple command.
 _COMMAND_START = ";|&()\n"
 

@@ -854,7 +854,7 @@ def ensure_baseline_venv(
             cwd=wt)
         # The baseline is the last release the target repo was aligned to, and
         # that release can be published under another variant than a main
-        # target (vLLM: v0.34.0 ships cu130 only, main builds cu132).
+        # target (a release line may ship cu130 only while main builds cu132).
         baseline_variant = spec.baseline_variant or spec.variant
         env = dict(os.environ)
         env.update({key: value.replace("{commit}", baseline_commit)

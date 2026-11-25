@@ -124,6 +124,7 @@ def test_command_gpus_is_the_largest_cards_marker():
     ("CUDA_VISIBLE_DEVICES=0 python x.py --device cuda", True),
     ("python - <<\"PY\"\nimport torch\ntorch.cuda.synchronize()\nPY", True),
     ("imx-omni-pytest tests/worker", False),
+    ("imx-other-pytest tests/worker", False),   # named per repository
     ("gpu run --gpus 1 -- pytest a", False),
     ("cat pytest.ini", False),
     ('git commit -m "fix pytest"', False),

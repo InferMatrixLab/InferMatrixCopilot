@@ -160,7 +160,8 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
   （`torch.cuda`、`cuda.is_available(`、`device="cuda"`、`--device cuda`）算 GPU
   代码；`python -` 从 stdin 读脚本时，脚本就是命令的其余部分。只在命令字上判断：
   对整行用一个正则时，`grep -rn pytest`、`echo pytest` 也会命中。提到
-  `imx-omni-pytest` 或 `gpu run` 的命令原样放过，它们自己申请。
+  `imx-<仓库>-pytest` 形式的模块测试包装器或 `gpu run` 的命令原样放过，它们自己申请
+  （包装器的名字由 adapter 侧决定，这里不写死任何一个仓库）。
 - **交给会话配置与提示词的卡数。** `session_devices(env)`：有
   `CUDA_VISIBLE_DEVICES` 就用它，否则是外层预约时代的历史缺省 `0,1`；按需模式
   下会话不持有卡，取空串。`prompt_devices("")` 在按需模式下返回一句"由调度器按
