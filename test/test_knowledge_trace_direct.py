@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -22,14 +23,19 @@ HEAD = "a" * 40
 def test_shipped_review_workflow_carries_trace_identity_and_explicit_usage():
     from infermatrix_copilot.upgrade.workflows import get_workflow
 
-    content = get_workflow("imreview")["content"]
-    assert "pinned `expected_head_sha`" in content
-    assert "`trace_id` and `repo` to" in content
-    assert "record_knowledge_usage" in content
-    assert '"source_exposure_id"' in content
-    assert '"evidence_registered"' in content
-    assert '"assessment_recorded"' in content
-    assert '`status="interrupted"`' in content
+    workflow = get_workflow("imreview")
+    assert "pinned `expected_head_sha`" in workflow["content"]
+    target = "references/knowledge-trace.md"
+    assert target in workflow["content"]
+    procedure = Path(workflow["references"][target]).read_text(encoding="utf-8")
+    assert "`trace_id` and `repo` to" in procedure
+    assert "record_knowledge_usage" in procedure
+    example = json.loads(procedure.split("```json", 1)[1].split("```", 1)[0])
+    assert [item["event_type"] for item in example] == [
+        "content_provided", "evidence_registered", "assessment_recorded",
+    ]
+    assert example[0]["exposure"]["source_exposure_id"]
+    assert '`status="interrupted"`' in procedure
 
 
 def request():
