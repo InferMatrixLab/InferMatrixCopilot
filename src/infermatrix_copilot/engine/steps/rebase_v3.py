@@ -32,6 +32,7 @@ from ...rebase_engine.substate import Substate
 from ...rebase_engine.test_manifest import ManifestSpec, build_manifest
 from ...rebase_engine.remote_ci_owner import RemoteOwnerResolver
 from ...rebase_engine.testing_env import scrubbed_agent_env
+from ...testing.gpu_demand import session_devices
 from ...scopes import PathScope, ToolScope
 from ..step import FailureKind, StepContext, StepResult
 from ._common import require_repo, step
@@ -100,6 +101,29 @@ def _local_timeout_multiplier(testing: Mapping) -> float | StepResult:
                           "rebase.testing.local_timeout_multiplier must be a "
                           "number >= 1")
     return factor
+
+
+def _local_test_job(job, *, timeout_multiplier: float, virtualenv: bool):
+    """Adapt container commands to the selected local runtime and budget.
+
+    VIRTUAL_ENV is supplied by _target_test_env for both candidate and
+    baseline runs. The CI manifest itself remains unchanged.
+    """
+    command = job.command
+    if virtualenv:
+        command = re.sub(
+            r'(?m)^([ \t]*uv[ \t]+pip[ \t]+install[ \t]+)--system(?=[ \t]|$)',
+            r'\1--python "$VIRTUAL_ENV/bin/python"', command)
+    if timeout_multiplier != 1:
+        # Ready jobs also put direct timeout commands around individual
+        # pytest invocations. Scaling only the outer runner leaves those
+        # inner CI budgets unchanged and still kills valid local runs.
+        command = re.sub(
+            r'(?m)^([ \t]*timeout[ \t]+)(\d+(?:\.\d+)?)([smhd]?)(?=[ \t])',
+            lambda m: (f'{m[1]}{float(m[2]) * timeout_multiplier:g}{m[3]}'),
+            command)
+    return _dc_replace(job, command=command,
+                       timeout_sec=job.timeout_sec * timeout_multiplier)
 
 
 def _tier_client(ctx: StepContext):
@@ -330,7 +354,7 @@ def build_backends(*, settings, state, run_dir: Path, trace,
         outcome = runner.run(
             TestJob(key=f"{key}_{abs(hash(cmd)) % 10 ** 8}", command=cmd,
                     timeout_sec=float(kw.get("timeout") or 1800),
-                    min_gpus=0, gpu_lock=True),
+                    min_gpus=0, gpu_lock=True, gpus=1),
             _target_test_env(settings, manifest, host_env=host_env))
         tail = ""
         try:
@@ -341,7 +365,11 @@ def build_backends(*, settings, state, run_dir: Path, trace,
                                  .splitlines()[-120:])
         except OSError:
             pass
-        return {"exit_code": outcome.rc, "passed": outcome.rc == 0,
+        # A run the scheduler gave no card to did not pass (rc is 0 for a skip).
+        return {"exit_code": outcome.rc,
+                "passed": outcome.rc == 0 and not outcome.skipped,
+                "skipped": outcome.skipped,
+                "skip_reason": outcome.skip_reason,
                 "timed_out": outcome.timed_out, "output": tail,
                 "log_file": outcome.log_file}
 
@@ -373,7 +401,7 @@ def build_backends(*, settings, state, run_dir: Path, trace,
         outcome = runner.run(
             TestJob(key="agent_precommit", command=command,
                     timeout_sec=float(pc.get("timeout_sec") or 600),
-                    min_gpus=0, gpu_lock=False),
+                    min_gpus=0, gpu_lock=False, gpus=0),
             _target_test_env(settings, manifest, host_env=host_env))
         return {"exit_code": outcome.rc, "passed": outcome.rc == 0,
                 "log_file": outcome.log_file}
@@ -1314,7 +1342,7 @@ async def _run_debug_agent(ctx: StepContext, manifest: dict, module: str,
                 # the same host facts and budgets a module attempt gets: the
                 # bridge forwards CUDA/HF from here and the debug prompt's
                 # budget note must not fall back to the dataclass defaults
-                cuda_devices=_os.environ.get("CUDA_VISIBLE_DEVICES", "0,1"),
+                cuda_devices=session_devices(_os.environ),
                 hf_home=_os.environ.get("HF_HOME", "/model"),
                 harness_timeout_s=float(getattr(
                     ctx.settings, "rebase_harness_timeout_sec", 7200)),
@@ -1546,9 +1574,10 @@ async def _v3_test_loop(ctx: StepContext) -> StepResult:
 
     def _job(slug: str) -> TestJob:
         job = manifest_job_to_test_job(jobs_by_slug[slug])
-        if timeout_multiplier != 1:
-            job = _dc_replace(job, timeout_sec=job.timeout_sec * timeout_multiplier)
-        return job
+        return _local_test_job(
+            job, timeout_multiplier=timeout_multiplier,
+            virtualenv=bool(_target_venv(
+                manifest, extra=ctx.settings.expansion_env())))
 
     def _to_result(outcome) -> tl.TestRunResult:
         infra = "timeout" if outcome.timed_out else \
@@ -2082,7 +2111,7 @@ async def _v3_module_rebase(ctx: StepContext) -> StepResult:
                                               ""),
         # the prompt's CUDA/HF facts must describe THIS host, not the
         # dataclass defaults
-        cuda_devices=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1"),
+        cuda_devices=session_devices(os.environ),
         hf_home=os.environ.get("HF_HOME", "/model"),
         model_aliases=ctx.settings.model_aliases,
         model_mismatch_policy=ctx.settings.model_mismatch_policy,

@@ -1,8 +1,8 @@
 # testing/ —— 规范
 
-<!-- verified-against: 2026-10-28 -->
+<!-- verified-against: 2026-11-25 -->
 
-`LOC ~1760（6 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
+`LOC ~2190（9 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
 
 ## 职责
 仓库中立的测试执行底座：gpu_lock.sh / kill_test_tree.sh / test_watchdog.sh /
@@ -22,6 +22,10 @@ test_runner.sh 的 Python 移植。仓库专属数据（watchdog 模式、artifa
   廉价 reviewer 裁决（KILL/CONTINUE）。
 - `watchdog_learn.py` —— Tier-2 裁决的记录/收割/晋升：一贯良性的模式
   自动晋升进噪声 overlay YAML（数据，而非 shell 时代的改代码）。
+- `cpu_ci_resources.py` —— 目标仓库 Simple CPU job 的单卡对齐：pytest 的 marker
+  表达式恰为 `core_model and cpu` 时，把 `CUDA_VISIBLE_DEVICES` 收到第一张。
+- `gpu_demand.py` —— 按需 GPU：向 canhazgpu 调度器**按命令**申请卡的模式开关、
+  一条命令的卡数、`gpu run` 包装程序，以及交给会话配置与提示词的卡数。
 
 ## 公开契约
 - `env_plan`：`build_subprocess_env(...)`、`scrub_agent_shell_env(env, keep_hf_token, extra_safe_prefixes)`，
@@ -32,8 +36,14 @@ test_runner.sh 的 Python 移植。仓库专属数据（watchdog 模式、artifa
 - `runner`：`TestRunner.run(job, env, baseline, dry_run) -> TestOutcome`、
   `TestRunner.terminate_active() -> bool`（对正在跑的 attempt 的进程组 + 快照
   后代 TERM→宽限→KILL；无 attempt 在跑返回 False；可自信号处理器/他线程调用，
-  `_spawn` 的 `proc.wait()` 随后返回子进程的信号 rc）、`TestJob`、`RunPlan`、`TestOutcome`、`strip_cov_flags`、`cleanup_test_artifacts`、
+  `_spawn` 的 `proc.wait()` 随后返回子进程的信号 rc）、`TestJob`（含 `gpus`）、
+  `RunPlan`、`TestOutcome`、`strip_cov_flags`、`cleanup_test_artifacts`、
   `log_file_for`/`pass_marker_for`、`TIMEOUT_RC=124`、`PY_TIMEOUT_MARGIN_SEC`。
+- `gpu_demand`：`GpuDemand`（`.from_env`）、`command_gpus`、`shell_needs_gpu`、
+  `scheduler_wrap`、`idle_timeout`、`granted_gpus`、`scheduler_error`、
+  `duration_seconds`、`session_devices`、`prompt_devices`；常量 `MODE_ENV`、
+  `HELD_ENV`、`WAIT_ENV`、`NO_GPU_RC`、`SCHEDULER_TIMEOUT_MARGIN_SEC`、
+  `IDLE_MAX_SEC`。
 - `watchdog`：`WatchdogPatterns(.from_yaml)`、`LogWatchdog(.start/.stop/.check_once/.result)`、`WatchdogResult`。
 - `watchdog_learn`：`record`、`harvest`、`eligible_patterns`、`promote`、
   `read_decisions`、`normalize_pattern`、`repair_tail`。
@@ -86,7 +96,10 @@ env 前缀 → `scrub_agent_shell_env(extra_safe_prefixes=…)`（manifest 数�
 （TestRunner 对 shell 的 command-echo 金样）、`test_module_pytest_signals.py`
 （经包装器：`terminate_active` 停树、stdin=/dev/null）；`watchdog_learn` 另由
 `test_curator.py`（harvest exactly-once）与 `test_knowledge_foundation.py`
-（record 身份字段、撕尾修复）钉住。
+（record 身份字段、撕尾修复）钉住。`test_gpu_demand.py`（64 个）以一个替身 `gpu`
+可执行文件覆盖按需模式：卡数、shell 命令的判定、包装程序的输出路由与等待到期、
+空闲回收的单位与上限、调度器拒绝请求时的日志行、`TestRunner` 的 skip，以及 agent
+shell 与模块测试包装器。
 
 ## 重构备注
 `runner.py`（643L）是包内最重的一块：`_spawn` 把快照线程、双定时器、watchdog
@@ -104,3 +117,64 @@ env 前缀 → `scrub_agent_shell_env(extra_safe_prefixes=…)`（manifest 数�
   KeyboardInterrupt/SystemExit 展开）打断时先刷新快照、杀树，再让异常传播——
   包装器被展开时测试树不得继续占 GPU。消费方是
   `rebase_engine/module_pytest.py::WrapperProcess` 的 SIGTERM/SIGINT 处理器。
+
+## 按命令向调度器申请 GPU（2026-11-25）
+
+在此之前，一次 rebase 从头到尾持有一份外层 `gpu run` 预约，每条 GPU 命令继承
+它的 `CUDA_VISIBLE_DEVICES`。v0.35.0 campaign 在 2026-11-25 连续五小时占着 4 张
+卡，其中最多只有 130 MB 在用；manifest 的 71 个 job 全部声明 `min_gpus=1`，在
+GPU 锁下一次只跑一个，52 个只用 1 张卡。负责人决定：不再有任何预约横跨整个
+campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在运行期间持有。
+
+- **开关。** `IMX_GPU_MODE=demand` 选择按需模式；未设置时行为不变（调用方已
+  持有卡，命令继承）。`IMX_GPU_WAIT`（缺省 `30m`）是命令在调度器队列里的等待
+  上限。`IMX_GPU_HELD=1` 表示所在命令树已持有卡，其下任何 `TestRunner` 都不再
+  申请。`TestRunner` 缺省从环境读取（`GpuDemand.from_env`），测试可显式传
+  `gpu_demand=`。
+- **卡数。** `TestJob.gpus` 显式给出；缺省取三者最大值：`min_gpus`、命令里最大
+  的 `cards_N` pytest marker（manifest 的每个 job 都是 `hw: any`，卡数只在 marker
+  里）、以及"取 GPU 锁的运行算 1 张"。0 表示不申请（`run_precommit`）。agent 的
+  `run_pytest`/`reproduce` 与 `imx-omni-pytest` 包装器各要 1 张。
+- **包装程序。** `scheduler_wrap(command, gpus, timeout_sec, wait, note, side_log)`
+  返回一段给 `bash --norc -c` 的 shell：命令的 stdout/stderr 留在调用方给的描述符
+  （fd 3/4），调度器自己的输出写进 `<日志>.scheduler`。实测调度器把进度打到
+  stdout、把 `Error: wait timeout exceeded` 打到 stderr，等待到期时退出码为 1；
+  包装程序把它换成 `NO_GPU_RC`（97），其余失败保留调度器的退出码。调度器的超时设为
+  `timeout_sec + SCHEDULER_TIMEOUT_MARGIN_SEC`（秒），让运行器自己的定时器先触发。
+  空闲回收由 `idle_timeout()` 给出：同一个时长向上取整到**单一单位**（秒、分或小时），
+  且不超过 `IDLE_MAX_SEC`（3 小时）。实测（2026-11-25）调度器只解析单一单位的空闲
+  时长：给 `1h30m` 直接拒绝；给 `8100s` 它接受，再把 `2h15m` 交给自己的 supervisor，
+  那个进程读不了（卡照给、照释放，只是不会因空闲回收）；超过 3 小时也直接拒绝。
+  v0.35.0 campaign 最初把整个超时按秒传给它，超时 6 小时的模块测试因此一次都没跑成。
+  命令的超时用秒则没有限制。
+- **调度器的输出绝不进测试日志。** 本机的 `gpu run` 会打印一条 "failed to
+  activate booking" 警告，命中看门狗 Tier-2 的 `failed to`，会让每个 job 多一次
+  LLM 评审。日志里只留运行器自己写的一行 `[gpu] …`（拿到的卡，或没跑成的原因）；
+  命令失败且调度器报了错时才附上它的错误文本。日志里没有 `Reserved …` 可依时写
+  `[gpu] not run: the scheduler named no card(s) and said: …`——没有卡，命令就没跑；
+  错误文本在它随后的 `Usage:` 处截断。
+- **排队到期是一次显式 skip。** `TestRunner.run` 返回 `rc=0, skipped=True`，
+  `skip_reason` 写明要几张、等了多久；命令没有运行，也不写 pass marker。等待
+  上限不超过 `timeout_sec` 的一半：运行器的定时器从 spawn 起算，排队时间也在内。
+- **按需模式下由调度器决定有没有卡**：不做硬件门槛，丢掉继承的
+  `CUDA_VISIBLE_DEVICES`（调度器授权时自己命名），并给子进程设 `IMX_GPU_HELD=1`。
+- **命令结束后不在已释放的卡上清理进程。** 外层预约时代
+  `cleanup_orphan_gpu_procs`/`wait_gpu_memory_idle` 是安全的，卡始终是自己的；
+  调度器授予的卡在命令结束时已经释放，可能已经分给了别人。逃逸的后代由调度器
+  自己的 guard 负责杀。
+- **agent 在 shell 里起的测试。** `shell_needs_gpu(command)` 把命令按引号之外的
+  列表分隔符与括号拆成简单命令，剥掉可能位于命令字之前的东西（`then`/`do`/
+  `else`、`env`、`VAR=value`、`sudo`、`timeout`、`nohup`、`uv run`），再看命令字：
+  `pytest` 或 `python -m pytest` 算测试；`python` 且同一条简单命令里有 CUDA 用法
+  （`torch.cuda`、`cuda.is_available(`、`device="cuda"`、`--device cuda`）算 GPU
+  代码；`python -` 从 stdin 读脚本时，脚本就是命令的其余部分。只在命令字上判断：
+  对整行用一个正则时，`grep -rn pytest`、`echo pytest` 也会命中。提到
+  `imx-<仓库>-pytest` 形式的模块测试包装器或 `gpu run` 的命令原样放过，它们自己申请
+  （包装器的名字由 adapter 侧决定，这里不写死任何一个仓库）。
+- **交给会话配置与提示词的卡数。** `session_devices(env)`：有
+  `CUDA_VISIBLE_DEVICES` 就用它，否则是外层预约时代的历史缺省 `0,1`；按需模式
+  下会话不持有卡，取空串。`prompt_devices("")` 在按需模式下返回一句"由调度器按
+  命令设置"，提示词不再把 `0,1` 当作会话持有的卡交给 agent。
+
+实测（2026-11-25）：一条 `TestRunner` 命令在真实调度器下恰好持有 1 张卡 35 秒，
+前后都是 0；torch 看到 1 张卡；import vllm 及其编译扩展不建立 CUDA 上下文。

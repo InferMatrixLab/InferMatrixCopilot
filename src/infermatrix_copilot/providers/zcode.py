@@ -22,13 +22,25 @@ Governance (disclosed, per doc/features/provider-registry.md):
 - **The session cwd is a scratch dir WE own, never the PR worktree.** zcode
   loads ``.env`` from its cwd and discovers ``zcode.json`` /
   ``.zcode/config.json`` from the cwd up to the git root — project config
-  can declare stdio MCP servers (i.e. commands) and zcode connects them
-  without a trust prompt. Running inside a PR checkout would let the PR
-  under review configure the reviewer. The worktree is read by absolute
-  path instead; the prompt names it.
-- The MCP tool bridge rides that scratch dir's ``.zcode/config.json``
+  can declare stdio MCP servers (i.e. commands). Running inside a PR
+  checkout would let the PR under review configure the reviewer. The
+  worktree is read by absolute path instead; the prompt names it.
+- **The MCP tool bridge rides that scratch dir's ``.zcode/config.json``
   (measured live: ``mcp__infermatrix-tools__read_file`` called, bridge
   trace recorded), so scoped reads still pass ``tools.dispatch``.
+  zcode 0.17 added a workspace trust gate for project-scope servers that
+  headless prompts cannot grant; the provider pre-seeds the host trust
+  store's matching record (``_seed_workspace_mcp_trust``) so the bridge
+  still connects — verified live on 0.17.1 (bridge spawned, tool call
+  round-trip). A future digest change fails CLOSED: the bridge stays
+  unconnected and the engine's lifecycle check blocks the module.
+- **A read-only scope runs ``--mode guarded``, not ``plan`` (zcode 0.18).**
+  Plan mode asks for every MCP tool there, so a headless prompt gets the
+  bridge denied ("Plan mode requires approval for MCP tools that are not
+  read-only"; probed live on 0.18.0, 2026-11-24). After the denylist both
+  modes leave the same native tools, all reads; ``guarded`` keeps the ask for
+  dangerous commands. The host's plugin servers (``mcp__plugin_*``) are listed
+  in every mode and stay outside the audit allowlist.
 
 Model selection: zcode has no ``--model`` flag; a session takes the
 *configured default* of its personal provider config, and only when that
@@ -52,6 +64,8 @@ OAuth login under HOME (``~/.zcode/v2``)."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -83,7 +97,19 @@ logger = logging.getLogger(__name__)
 _BRIDGE_SERVER = "infermatrix-tools"
 _BRIDGE_PREFIX = f"mcp__{_BRIDGE_SERVER}__"
 
-# Everything zcode 0.16.9 exposes in plan mode that is not a pure read.
+# zcode 0.17 gates project-scope MCP servers behind a workspace trust review
+# (createWorkspaceMcpTrust) that headless `--prompt` sessions cannot grant —
+# the server is silently left unconnected ("bridge never started"). The
+# trust record lives in `<home>/.zcode/security/workspace-mcp-trust-v1.json`
+# and matches on (workspaceIdentity, serverName, declarationDigest); we
+# pre-seed it after writing the session's project config. User-scope
+# declaration (kind "user" skips the gate) would need HOME redirection,
+# which measurably breaks the CLI's model-selection bootstrap (0.17.1) and
+# runs retention cleanup against symlinked host dirs — rejected.
+_TRUST_STORE_REL = (".zcode", "security", "workspace-mcp-trust-v1.json")
+
+# Everything zcode exposes that is not a pure read: 0.16.9's set, plus the
+# session management zcode 0.18 added, which reaches the host's other sessions.
 _DISALLOWED = (
     "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Agent", "Skill",
     "ExitPlanMode", "EnterPlanMode", "AskUserQuestion", "SendMessage",
@@ -91,6 +117,8 @@ _DISALLOWED = (
     "SaveWorkflow", "EvalWorkflowSnippet", "ResumeWorkflowRun",
     "ResolveWorkflowQuestion", "TaskStop", "mcp__node_repl__js",
     "mcp__web_reader__webReader", "mcp__4_5v_mcp__analyze_image",
+    "CreateSession", "ForkSession", "InterruptSession", "ListSessions",
+    "ReadSession", "RenameSession", "SendToSession", "WaitSessions",
 )
 # What remains after the denylist — the audit's allowlist.
 _READ_TOOLS = frozenset({
@@ -200,7 +228,87 @@ class ZCodeTransport(HarnessTransport):
 
     # -- process plumbing ----------------------------------------------------
     @staticmethod
-    def _write_mcp_config(session: Path, spec_path: Path, *,
+    def _zcode_canon(value) -> str:
+        """zcode's hash2 pre-image: JSON.stringify with a replacer that
+        sorts the keys of every object (arrays untouched), compact
+        separators, raw non-ASCII — json.dumps(sort_keys=True) matches it
+        exactly (golden-verified against a live 0.17.1 session)."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False)
+
+    @classmethod
+    def _trust_declaration_digest(cls, session: Path, server: str,
+                                  server_config: dict) -> str:
+        """The declarationDigest zcode 0.17 computes over a project-scope
+        server: sha256 over the canonical form of
+        ``{version, workspaceIdentity, workingDirectory, serverName,
+        sourcePaths, config}`` where config is the server entry's execution
+        fields (enabled/source stripped, env defaulted to {}, cwd defaulted
+        to the working directory) and workspaceIdentity defaults to the
+        working directory. sourcePaths is the project config file list —
+        here exactly the one file we write."""
+        execution = {k: v for k, v in server_config.items()
+                     if k not in ("enabled", "source")}
+        execution["env"] = server_config.get("env") or {}
+        execution["cwd"] = server_config.get("cwd") or str(session)
+        value = {
+            "version": 1,
+            "workspaceIdentity": str(session),
+            "workingDirectory": str(session),
+            "serverName": server,
+            "sourcePaths": [str(session / ".zcode" / "config.json")],
+            "config": execution,
+        }
+        canonical = cls._zcode_canon(value)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _seed_workspace_mcp_trust(cls, session: Path, server: str,
+                                  server_config: dict) -> None:
+        """Append the session's trust record (idempotent, flock-serialized)
+        to the host's workspace MCP trust store. Best effort: on failure the
+        bridge stays untrusted and the engine's bridge-lifecycle check
+        surfaces it — never a silent pass."""
+        home = Path(sanitized_env().get("HOME") or Path.home())
+        store = home.joinpath(*_TRUST_STORE_REL)
+        record = {
+            "workspaceIdentity": str(session),
+            "serverName": server,
+            "declarationDigest": cls._trust_declaration_digest(
+                session, server, server_config),
+            "grantedAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                          + f".{int(time.time() * 1000) % 1000:03d}Z",
+        }
+        store.parent.mkdir(parents=True, exist_ok=True)
+        with open(store, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                try:
+                    data = json.loads(fh.read() or "{}")
+                except ValueError:
+                    data = {}
+                records = data.get("records") if isinstance(data, dict) else None
+                if not isinstance(records, list):
+                    records = []
+                key = (record["serverName"], record["declarationDigest"])
+                if not any((r.get("serverName"), r.get("declarationDigest"))
+                           == key for r in records):
+                    records.append(record)
+                # prune OUR records whose session dir is gone — the store is
+                # host-global and every dispatch session adds one record
+                records = [r for r in records
+                           if r.get("serverName") != _BRIDGE_SERVER
+                           or Path(str(r.get("workspaceIdentity", ""))).is_dir()]
+                fh.seek(0)
+                fh.truncate()
+                fh.write(json.dumps({"schemaVersion": 1, "records": records},
+                                    indent=2))
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+    @classmethod
+    def _write_mcp_config(cls, session: Path, spec_path: Path, *,
                           timeout_s: float = 30.0) -> None:
         package_root = Path(__file__).resolve().parents[2]
         # The harness stays credential-free; its scoped bridge also needs
@@ -210,12 +318,14 @@ class ZCodeTransport(HarnessTransport):
             "OMP_NUM_THREADS", "MKL_NUM_THREADS", "ZCODE_DATA_BASE_DIR",
             "STRICT_BACKEND", "STRICT_BACKEND_MODEL", "STRICT_BACKEND_CLI",
             "ZCODE_PROVIDER_ID", "ZCODE_REASONING_LEVEL",
-            "REBASE_REVIEWER_MODEL", "NOTIFY_EMAIL") if k in os.environ}
+            "REBASE_REVIEWER_MODEL", "NOTIFY_EMAIL",
+            # The bridge starts GPU commands itself (the agents' shell and
+            # test tools): it asks the scheduler for their cards when the
+            # campaign does. IMX_GPU_HELD is deliberately not passed: it is
+            # only ever true inside a command tree that already holds them.
+            "IMX_GPU_MODE", "IMX_GPU_WAIT") if k in os.environ}
         bridge_env["PYTHONPATH"] = str(package_root)
-        config = session / ".zcode" / "config.json"
-        config.parent.mkdir()
-        config.write_text(json.dumps({"features": {"memory": False}, "memory": {"use": False},
-                                     "mcp": {"servers": {_BRIDGE_SERVER: {
+        server = {
             "type": "stdio",
             # ZCode otherwise abandons tools after 30s, even while a valid
             # test or nested plan review is still running in the bridge.
@@ -225,7 +335,17 @@ class ZCodeTransport(HarnessTransport):
             "args": ["-m", "infermatrix_copilot.tool_bridge",
                      "--spec", str(spec_path)],
             "env": bridge_env,
-        }}}}, indent=2), encoding="utf-8")
+        }
+        config = session / ".zcode" / "config.json"
+        config.parent.mkdir()
+        config.write_text(json.dumps({"features": {"memory": False}, "memory": {"use": False},
+                                     "mcp": {"servers": {_BRIDGE_SERVER: server}}},
+                                     indent=2), encoding="utf-8")
+        try:
+            cls._seed_workspace_mcp_trust(session, _BRIDGE_SERVER, server)
+        except OSError as exc:
+            logger.warning("zcode workspace MCP trust seed failed "
+                           "(bridge will stay untrusted): %s", exc)
 
     @staticmethod
     def _write_oneshot_config(session: Path) -> None:
@@ -643,7 +763,12 @@ class ZCodeTransport(HarnessTransport):
                 model=req.model or self.settings.strict_backend_model,
                 # Mutating workflows write only through the scoped bridge;
                 # native writes/shell/subagents retain the same denylist.
-                mode="plan" if req.scope.read_only else "yolo")
+                # A read-only scope takes `guarded`, not `plan`: zcode 0.18
+                # asks for every MCP tool in plan mode, so a headless prompt
+                # gets the bridge denied. After the denylist both modes leave
+                # the same native tools; `guarded` keeps asking for dangerous
+                # commands, which headless turns into a denial.
+                mode="guarded" if req.scope.read_only else "yolo")
         finally:
             shutil.rmtree(session, ignore_errors=True)
         usage = self._usage(events)

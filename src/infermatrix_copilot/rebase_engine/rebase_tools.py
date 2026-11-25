@@ -178,6 +178,50 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
 
     def handle_run_shell(command: str, workdir: str | None = None,
                          timeout: int = 600, **_: Any) -> dict:
+        import tempfile
+
+        from ..testing.gpu_demand import (
+            HELD_ENV, MODE_ENV, NO_GPU_RC, GpuDemand, scheduler_error,
+            scheduler_wrap, shell_needs_gpu)
+
+        env, side_log, wait = (dict(paths.env) or None), None, ""
+        if GpuDemand.from_env(os.environ).enabled:
+            # The mode is this process's (a bridge learns it from its env)
+            # and must reach what the command starts: the test wrapper asks
+            # for its own cards.
+            env = dict(env or os.environ)
+            env[MODE_ENV] = "demand"
+            if shell_needs_gpu(command):
+                # Agents start tests from the shell (`run_pytest` is gated
+                # behind the decision file): such a command gets its cards
+                # the way the wrapper does, and what it starts must not ask
+                # for them a second time.
+                env[HELD_ENV] = "1"
+                fd, name = tempfile.mkstemp(prefix="imx-gpu-", suffix=".log")
+                os.close(fd)
+                side_log, wait = Path(name), f"{max(int(timeout / 2), 1)}s"
+                command = scheduler_wrap(
+                    command, gpus=1, timeout_sec=timeout + 60, wait=wait,
+                    note=f"imx agent shell {os.getpid()}", side_log=side_log)
+        try:
+            result = _run_shell(command, workdir, timeout, env)
+        finally:
+            scheduler = scheduler_error(side_log) if side_log else ""
+            if side_log:
+                side_log.unlink(missing_ok=True)
+        if result.get("exit_code") == NO_GPU_RC:
+            return {"exit_code": 1, "stdout": result.get("stdout", ""),
+                    "stderr": "Not run: the scheduler granted no GPU within "
+                              f"{wait}. Retry later, or continue with work "
+                              "that needs no GPU.",
+                    "gpu_unavailable": True}
+        if scheduler and result.get("exit_code", 0) != 0:
+            result["stderr"] = (f"[gpu] scheduler: {scheduler}\n"
+                                + result.get("stderr", ""))[-5000:]
+        return result
+
+    def _run_shell(command: str, workdir: str | None, timeout: int,
+                   env: dict[str, str] | None) -> dict:
         from ..testing.process_tree import collect_descendants, kill_tree
         from ..testing.runner import TestRunner, _record_walk
 
@@ -189,7 +233,7 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
                     # and replace the target venv's PATH before verification.
                     ["bash", "--norc", "-c", command], stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, errors="replace",
-                    cwd=cwd, env=dict(paths.env) or None,
+                    cwd=cwd, env=env,
                     start_new_session=True) as proc:
                 # Killing only bash leaves pytest and setsid'd model workers
                 # alive. Reuse the test runner's identity-checked snapshots so

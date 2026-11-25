@@ -77,6 +77,10 @@ class WheelSpec:
     # Complete published wheels avoid editable installs tied to a disposable
     # source checkout. Optional: existing adapters retain editable installs.
     install_url_template: str = ""
+    # Variant of the LAST-RELEASE wheel the baseline venv installs, when it
+    # differs from `variant` (a main target built with a newer CUDA than the
+    # release the target repo is aligned to). "" keeps `variant`.
+    baseline_variant: str = ""
 
     @classmethod
     def from_manifest(cls, data: Mapping) -> "WheelSpec":
@@ -91,6 +95,7 @@ class WheelSpec:
             install_env=dict(data.get("install_env", {})),
             reinstall_retries=int(data.get("reinstall_retries", 3)),
             install_url_template=str(data.get("install_url_template", "")),
+            baseline_variant=str(data.get("baseline_variant", "")),
         )
 
 
@@ -749,6 +754,31 @@ def ensure_wheel_installed(repo: Path, commit: str, spec: WheelSpec, *,
 
 # -- baseline runtime ----------------------------------------------------------
 
+def _relocate_venv_scripts(src: Path, dst: Path) -> None:
+    """Point cloned launchers/activation scripts at the clone, without writing
+    through hardlinks into the campaign runtime."""
+    import stat
+
+    source = os.fsencode(str(src))
+    destination = os.fsencode(str(dst))
+    # The baseline directory name starts with the campaign name. Match the
+    # complete path so a healthy cloned launcher is not relocated twice.
+    source_path = re.compile(re.escape(source) + rb"(?=[/\x22\x27\s]|$)")
+    for script in (dst / "bin").iterdir():
+        if script.is_symlink() or not script.is_file():
+            continue
+        data = script.read_bytes()
+        if b"\0" in data or not source_path.search(data):
+            continue
+        replacement = script.with_name(f".{script.name}.relocate-{os.getpid()}")
+        try:
+            replacement.write_bytes(source_path.sub(lambda _: destination, data))
+            replacement.chmod(stat.S_IMODE(script.stat().st_mode))
+            os.replace(replacement, script)
+        finally:
+            replacement.unlink(missing_ok=True)
+
+
 def _clone_tree_hardlinked(src: Path, dst: Path) -> bool:
     """Hardlink clone (near-zero disk, same filesystem). uv replaces files
     by rename, which breaks the links — the campaign venv is never modified
@@ -757,6 +787,7 @@ def _clone_tree_hardlinked(src: Path, dst: Path) -> bool:
     if rc != 0:
         _log(f"baseline-venv clone failed: {err.strip()}")
         return False
+    _relocate_venv_scripts(src, dst)
     return True
 
 
@@ -778,7 +809,8 @@ def ensure_baseline_venv(
     against the wheel main was LAST aligned to"; this builds exactly that
     runtime: hardlink-clone the campaign venv (identical deps), swap in
     the baseline wheel from a throwaway worktree of the upstream at the
-    baseline commit. Returns None on any failure — a missing baseline
+    baseline commit. Installs are non-editable so cleanup cannot remove code
+    the runtime needs; console scripts are relocated to the clone. Returns None on any failure — a missing baseline
     runtime keeps the loop's regression-preserving default and must never
     read as pre-existing."""
     import shutil
@@ -791,9 +823,16 @@ def ensure_baseline_venv(
     python = str(bv / "bin" / "python")
     if (bv / "pyvenv.cfg").is_file():
         installed = read_installed_version(spec, python=python, run=run)
-        if installed and version_matches_commit(installed, baseline_commit):
-            log(f"baseline venv already healthy at {bv}")
-            return bv
+        matches = (installed_wheel_matches(
+            spec, baseline_commit, installed, python=python, run=run)
+            if spec.install_url_template else
+            bool(installed and version_matches_commit(installed, baseline_commit)))
+        if matches:
+            rc, _, _ = run([python, "-c", build_import_check_snippet(spec)], cwd=bv)
+            if rc == 0:
+                _relocate_venv_scripts(target_venv, bv)
+                log(f"baseline venv already healthy at {bv}")
+                return bv
     if not (Path(upstream) / ".git").exists():
         log(f"baseline venv: upstream {upstream} is not a git checkout")
         return None
@@ -813,12 +852,22 @@ def ensure_baseline_venv(
     try:
         run([uv, "pip", "uninstall", "--python", python, spec.package],
             cwd=wt)
+        # The baseline is the last release the target repo was aligned to, and
+        # that release can be published under another variant than a main
+        # target (a release line may ship cu130 only while main builds cu132).
+        baseline_variant = spec.baseline_variant or spec.variant
         env = dict(os.environ)
         env.update({key: value.replace("{commit}", baseline_commit)
-                          .replace("{variant}", spec.variant)
+                          .replace("{variant}", baseline_variant)
                     for key, value in spec.install_env.items()})
+        # The worktree is deleted below. An editable install would retain a
+        # finder pointing into that deleted tree and pass only the import check
+        # run from inside it. Prefer the frozen published wheel when available.
+        requirement = (spec.install_url_template.format(
+            commit=baseline_commit, variant=baseline_variant, arch=spec.arch,
+            package=spec.package) if spec.install_url_template else ".")
         rc, _, err = run([uv, "pip", "install", "--python", python,
-                          "-e", "."], cwd=wt, env=env, timeout=3600)
+                          requirement], cwd=wt, env=env, timeout=3600)
         if rc != 0:
             log(f"baseline wheel install failed: {err.strip()[-300:]}")
             shutil.rmtree(bv, ignore_errors=True)
@@ -832,6 +881,13 @@ def ensure_baseline_venv(
     finally:
         run(["git", "-C", str(upstream), "worktree", "remove",
              "--force", str(wt)], timeout=600)
+    # Probe after removal, away from both source trees: cwd must not rescue a
+    # broken install. This also protects baseline classification on later reuse.
+    rc, _, err = run([python, "-c", build_import_check_snippet(spec)], cwd=bv)
+    if rc != 0:
+        log(f"baseline venv import failed after source cleanup: {err.strip()[-200:]}")
+        shutil.rmtree(bv, ignore_errors=True)
+        return None
     log(f"baseline venv ready at {bv} (wheel {baseline_commit[:12]})")
     return bv
 

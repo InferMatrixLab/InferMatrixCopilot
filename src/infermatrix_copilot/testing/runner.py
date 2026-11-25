@@ -26,6 +26,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .gpu_demand import (
+    HELD_ENV, NO_GPU_RC, SCHEDULER_TIMEOUT_MARGIN_SEC, GpuDemand, command_gpus,
+    duration_seconds, granted_gpus, scheduler_error, scheduler_wrap)
 from .gpu_lock import (GpuLock, cleanup_orphan_gpu_procs, visible_devices,
                        wait_gpu_memory_idle)
 from .watchdog import LogWatchdog, WatchdogPatterns
@@ -67,6 +70,10 @@ class TestJob:
     setup: str = ""
     index: int = 0
     hw: str = ""  # informational only — never enforced (shell parity)
+    # Cards to ask the scheduler for, when the runner is in demand mode.
+    # None derives them: min_gpus, the command's `cards_N` markers, and one
+    # card for a run that takes the GPU lock; 0 asks for none.
+    gpus: int | None = None
 
 
 @dataclass
@@ -309,7 +316,8 @@ class TestRunner:
                  cuda_visible_devices: str = "",
                  available_gpus: Callable[[], int] | None = None,
                  watchdog_interval: float = 10.0,
-                 notify_download: Callable[[str, str], None] | None = None):
+                 notify_download: Callable[[str, str], None] | None = None,
+                 gpu_demand: GpuDemand | None = None):
         self.repo_root = Path(repo_root)
         self.tests_dir = Path(tests_dir)
         self.patterns = patterns
@@ -319,6 +327,8 @@ class TestRunner:
         self.artifact_globs = artifact_globs or []
         self.gpu_lock_dir = gpu_lock_dir
         self.cuda = cuda_visible_devices
+        self.gpu_demand = (gpu_demand if gpu_demand is not None
+                           else GpuDemand.from_env())
         self.available_gpus = available_gpus or (
             lambda: len(visible_devices(self.cuda)))
         self.watchdog_interval = watchdog_interval
@@ -344,8 +354,14 @@ class TestRunner:
     def run(self, job: TestJob, env: dict[str, str], *, baseline: bool = False,
             dry_run: bool = False) -> TestOutcome:
         log_file = log_file_for(self.tests_dir, job, baseline=baseline)
+        # In demand mode the command asks the scheduler for its cards, and
+        # the scheduler's own output goes beside the log, never into it.
+        gpus = self._job_gpus(job) if self.gpu_demand.enabled else 0
+        side_log = (log_file.with_name(log_file.name + ".scheduler")
+                    if gpus else None)
         plan = RunPlan(
-            argv=["bash", "--norc", "-c", _exec_wrap(job.command)],
+            argv=["bash", "--norc", "-c",
+                  self._command(job, job.command, side_log)],
             env_overlay=dict(job.env), timeout_sec=job.timeout_sec,
             needs_gpu_lock=(job.gpu_lock if job.gpu_lock is not None
                             else job.min_gpus > 0),
@@ -365,7 +381,14 @@ class TestRunner:
         # effective env is {**env, **job.env}, and either layer may redirect
         # CUDA_VISIBLE_DEVICES away from the runner's own view
         run_env = {**env, **job.env}
-        if "CUDA_VISIBLE_DEVICES" in run_env:
+        if gpus:
+            # The scheduler names the cards when it grants them; an inherited
+            # selection would name cards this command does not hold. Anything
+            # the command starts must not ask for cards a second time.
+            run_env.pop("CUDA_VISIBLE_DEVICES", None)
+            run_env[HELD_ENV] = "1"
+            job_cuda, avail = "", gpus
+        elif "CUDA_VISIBLE_DEVICES" in run_env:
             job_cuda = run_env["CUDA_VISIBLE_DEVICES"]
             avail = len(visible_devices(job_cuda))
         else:
@@ -419,7 +442,18 @@ class TestRunner:
             except OSError:
                 primary_offset = 0
             rc, wd_hit, timed_out = self._spawn(
-                _exec_wrap(job.command), job, run_env, log_file, append=True)
+                self._command(job, job.command, side_log), job, run_env,
+                log_file, append=True)
+            if gpus:
+                self._note_scheduler(job, side_log, rc, log_file)
+            if rc == NO_GPU_RC:
+                # The queue outlasted the wait. An explicit skip, like the
+                # hardware gate: never a failure, never a silent pass.
+                return TestOutcome(rc=0, skipped=True, log_file=str(log_file),
+                                   plan=plan, skip_reason=(
+                                       f"needs {self._job_gpus(job)} GPU(s); the "
+                                       f"scheduler granted none within "
+                                       f"{self._wait(job)}"))
             append_silent_log_footer(log_file, rc, "primary")
             if wd_hit:
                 rc = rc or 1
@@ -439,15 +473,19 @@ class TestRunner:
                         f.write("\n[coverage-fallback] Retrying without --cov "
                                 f"flags:\n{fallback}\n")
                     rc, wd_hit, timed_out = self._spawn(
-                        _exec_wrap(fallback), job, run_env, log_file,
-                        append=True)
+                        self._command(job, fallback, side_log), job, run_env,
+                        log_file, append=True)
                     append_silent_log_footer(log_file, rc, "cov-fallback")
                     if wd_hit:
                         rc = rc or 1
         finally:
             if lock is not None:
-                cleanup_orphan_gpu_procs(job_cuda)
-                wait_gpu_memory_idle(job_cuda)
+                if not gpus:
+                    # Under a reservation of our own anything on these cards
+                    # is our orphan. A card the scheduler granted is released
+                    # by now and may already be someone else's.
+                    cleanup_orphan_gpu_procs(job_cuda)
+                    wait_gpu_memory_idle(job_cuda)
                 lock.release()
 
         cleanup_test_artifacts(self.repo_root, self.artifact_globs)
@@ -456,6 +494,63 @@ class TestRunner:
         return TestOutcome(rc=rc, watchdog_triggered=wd_hit,
                            timed_out=timed_out, log_file=str(log_file),
                            plan=plan)
+
+    # -- cards on demand ------------------------------------------------------
+    def _job_gpus(self, job: TestJob) -> int:
+        """What one job asks the scheduler for (TestJob.gpus)."""
+        if job.gpus is not None:
+            return job.gpus
+        takes_gpu = (job.gpu_lock if job.gpu_lock is not None
+                     else job.min_gpus > 0)
+        return command_gpus(job.command,
+                            max(job.min_gpus, 1 if takes_gpu else 0))
+
+    def _wait(self, job: TestJob) -> str:
+        """The queue wait: the configured one, but never more than half of the
+        job's timeout, because the runner's own timer starts at the spawn."""
+        seconds = min(duration_seconds(self.gpu_demand.wait, 1800.0),
+                      job.timeout_sec / 2)
+        return f"{max(int(seconds), 1)}s"
+
+    def _command(self, job: TestJob, command: str,
+                 side_log: Path | None) -> str:
+        wrapped = _exec_wrap(command)
+        if side_log is None:
+            return wrapped
+        return scheduler_wrap(
+            wrapped, gpus=self._job_gpus(job),
+            timeout_sec=job.timeout_sec + SCHEDULER_TIMEOUT_MARGIN_SEC,
+            wait=self._wait(job),
+            note=f"imx {self.tests_dir.parent.name} {job.key}"[:100],
+            side_log=side_log)
+
+    def _note_scheduler(self, job: TestJob, side_log: Path, rc: int,
+                        log_file: Path) -> None:
+        """One or two lines for whoever reads the log: the cards a command
+        ran on, or why it did not run. The scheduler's own text stays in the
+        side log unless the command failed anyway."""
+        gpus = self._job_gpus(job)
+        granted = granted_gpus(side_log)
+        if rc == NO_GPU_RC:
+            lines = [f"[gpu] not run: the scheduler granted no {gpus} card(s) "
+                     f"within {self._wait(job)}."]
+        elif granted:
+            lines = [f"[gpu] {gpus} card(s) from the scheduler: "
+                     f"[{' '.join(granted)}]"]
+            if rc not in (0, TIMEOUT_RC):
+                error = scheduler_error(side_log)
+                if error:
+                    lines.append(f"[gpu] scheduler: {error}")
+        else:
+            # no card was ever named, so nothing ran under the scheduler
+            error = scheduler_error(side_log)
+            lines = ["[gpu] not run: the scheduler named no card(s)"
+                     + (f" and said: {error}" if error else ".")]
+        try:
+            with open(log_file, "a", encoding="utf-8") as lf:
+                lf.write("\n" + "\n".join(lines) + "\n")
+        except OSError:
+            pass
 
     # -- internals ------------------------------------------------------------
     def _run_setup(self, job: TestJob, env: dict[str, str],

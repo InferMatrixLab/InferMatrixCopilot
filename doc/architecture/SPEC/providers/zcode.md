@@ -1,6 +1,6 @@
 # providers/zcode.py —— 规范
 
-<!-- verified-against: 2026-10-27 -->
+<!-- verified-against: 2026-11-25 -->
 
 `harness transport（Z.AI / GLM 订阅） · refactor-status: ok`
 
@@ -12,11 +12,12 @@
 `ZCodeFailure`；额度、限流、认证和暂时不可用分别表达。未知失败保留现有 RuntimeError
 行为；分类器不把提示、原始事件或提供方错误正文暴露给 RFC 服务。
 
-headless `zcode --prompt=... --output-format stream-json --mode plan --cwd <临时目录>
+headless `zcode --prompt=... --output-format stream-json --mode <mode> --cwd <临时目录>
 --disallowed-tools=<非读工具>`；工具桥写进临时目录的 `.zcode/config.json`；从事件流解析
 `result.response`、`result.usage`、`session.updated.modelId` 和 `tool.updated`（`kind:
 scheduled`）。prompt 超过 100,000 字节时写成文件并 `--attach`（zcode 没有 stdin 通道，
-argv 单参数上限 128KiB）。
+argv 单参数上限 128KiB）。`--mode` 按调用选：一次性调用用 `plan`（不带桥）；agent 会话里
+只读作用域用 `guarded`、会改动的作用域用 `yolo`（0.18 起，见下文）。
 
 ## 公开契约
 `ZCodeTransport`（`auth_gap`、`run_session`、`complete`）、`spec = PROVIDERS["zcode"]`。
@@ -84,3 +85,33 @@ stdlib + `.base` + `..agent_loop.AgentOutcome` + `..llm` 的类型与 `ModelMism
 `subscription_billing` 仅在实际选中的 provider 为已知 OAuth coding plan 时为 True；自定义 provider
 或 settings 中的 API provider override 返回 False。它描述计费模式，不声称调用花费为零。
 `kb init --subscription-generator` 通过此声明显式使用订阅生成器，保留未报告的 USD 与 token 用量。
+
+## zcode 0.17 与 0.18（2026-11-11、2026-11-24）
+
+- **项目级 MCP server 的信任登记（0.17）。** 0.17 给项目作用域的 MCP server 加了
+  工作区信任门（`createWorkspaceMcpTrust`），无头 prompt 过不去：工具桥被静默留成
+  未连接，每个模块 agent 都只能读、随后阻塞（run-20261111-160314）。`_write_mcp_config`
+  写完会话配置后调用 `_seed_workspace_mcp_trust`，把本会话的信任记录追加进宿主的
+  `~/.zcode/security/workspace-mcp-trust-v1.json`（flock 串行、幂等，并清掉会话目录
+  已不存在的记录）。记录的 `declarationDigest` 是对规范化后的
+  `{version, workspaceIdentity, workingDirectory, serverName, sourcePaths, config}`
+  做 sha256——键排序、紧凑分隔符、非 ASCII 原样；其中 `config` 是该 server 去掉
+  `enabled`/`source` 后的执行字段，`env` 缺省为 `{}`、`cwd` 缺省为工作目录。摘要
+  的算法若在将来的版本里变化，就**失败关闭**：桥保持未连接，引擎的桥存活检查拦住
+  该模块。0.17.1 上实测过（桥被拉起、工具调用往返）。
+- **只读作用域跑 `--mode guarded`，不再是 `plan`（0.18）。** 0.18 的 plan 模式要求
+  每个 MCP 工具都经审批，而无头会话无人审批：只读作用域经工具桥的读取被拒
+  （"Plan mode requires approval for MCP tools that are not read-only"）。拒绝列表
+  剥掉之后，plan 与 guarded 留下同一批原生工具（全是读），guarded 只对危险命令
+  保留询问。给桥工具标 `readOnlyHint` 在 plan 模式下不起作用：那里的 MCP 能力一律
+  是 `needsApproval`。一次性调用（`complete()`）仍用 plan，它不带桥。
+- **会话管理工具加入 `_DISALLOWED`（0.18）。** `CreateSession`、`ForkSession`、
+  `InterruptSession`、`ListSessions`、`ReadSession`、`RenameSession`、`SendToSession`、
+  `WaitSessions` 能触达宿主的其他会话。宿主安装的插件 server（`mcp__plugin_*`）在
+  每种模式下都列在工具清单里，仍留在审计白名单之外，与之前相同。
+- **桥进程的环境带上 `IMX_GPU_MODE` 与 `IMX_GPU_WAIT`。** 桥自己会启动 GPU 命令
+  （agent 的 shell 与测试工具），campaign 按命令向调度器取卡时它需要知情。
+  `IMX_GPU_HELD` 有意不传：它只在已持有卡的命令树内部为真。
+
+0.18.0 上的实测（2026-11-24）：一次性调用服务于钉住的模型；只读会话经桥读文件；
+  会改动的作用域经桥写文件。信任登记沿用 0.17 的算法，0.18 仍然连得上桥。
