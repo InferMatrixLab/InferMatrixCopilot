@@ -458,7 +458,10 @@ def main(argv: list[str] | None = None, *,
     # so a GPU-less box still RUNS the command (a skip would be a false
     # pass), while gpu_lock=True holds the lock for the run
     job = TestJob(key=_job_key(args), command=command, timeout_sec=timeout,
-                  min_gpus=0, gpu_lock=_needs_gpu_lock(args), index=0)
+                  min_gpus=0, gpu_lock=_needs_gpu_lock(args), index=0,
+                  # the tests may use a card, as they could under the
+                  # campaign-wide reservation this wrapper used to run in
+                  gpus=1)
     if process_setup:
         process.install_signal_handlers(runner)
     outcome = runner.run(job, dict(os.environ))
@@ -472,8 +475,12 @@ def main(argv: list[str] | None = None, *,
                            platform_marker=platform_marker, process=process)
     try:
         if outcome.skipped:
-            print(f"imx-omni-pytest: skipped — {outcome.skip_reason}",
-                  file=sys.stderr)
+            notice = f"imx-omni-pytest: skipped — {outcome.skip_reason}"
+            # On stdout as well as stderr: the rc is the outcome's own (0
+            # here), so a reader of the output alone must see that nothing
+            # ran and why (in demand mode: the scheduler granted no card).
+            print(notice)
+            print(notice, file=sys.stderr)
         if verdict["signal_diagnosis"]:
             print(f"module test wrapper: {verdict['signal_diagnosis']}",
                   file=sys.stderr)

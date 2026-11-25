@@ -24,6 +24,7 @@ from .hooks import RebaseHooks
 from .prompt_builder import (ModulePromptData, build_debug_prompt,
                              build_module_prompt)
 from .substate import Substate
+from ..testing.gpu_demand import prompt_devices
 
 
 @dataclass(frozen=True)
@@ -484,7 +485,7 @@ async def rebase_module(
         vllm_path=config.vllm_path, omni_path=config.omni_path,
         script_dir=config.script_dir,
         last_rebase_vllm_commit=assignment_baseline,
-        cuda_devices=config.cuda_devices, hf_home=config.hf_home,
+        cuda_devices=prompt_devices(config.cuda_devices), hf_home=config.hf_home,
         log_dir=config.log_dir, signal_dir=config.signal_dir,
         rebase_run_id=substate.run_id,
         max_debug_retries=config.max_debug_retries,

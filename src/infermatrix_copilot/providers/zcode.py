@@ -318,7 +318,12 @@ class ZCodeTransport(HarnessTransport):
             "OMP_NUM_THREADS", "MKL_NUM_THREADS", "ZCODE_DATA_BASE_DIR",
             "STRICT_BACKEND", "STRICT_BACKEND_MODEL", "STRICT_BACKEND_CLI",
             "ZCODE_PROVIDER_ID", "ZCODE_REASONING_LEVEL",
-            "REBASE_REVIEWER_MODEL", "NOTIFY_EMAIL") if k in os.environ}
+            "REBASE_REVIEWER_MODEL", "NOTIFY_EMAIL",
+            # The bridge starts GPU commands itself (the agents' shell and
+            # test tools): it asks the scheduler for their cards when the
+            # campaign does. IMX_GPU_HELD is deliberately not passed: it is
+            # only ever true inside a command tree that already holds them.
+            "IMX_GPU_MODE", "IMX_GPU_WAIT") if k in os.environ}
         bridge_env["PYTHONPATH"] = str(package_root)
         server = {
             "type": "stdio",
