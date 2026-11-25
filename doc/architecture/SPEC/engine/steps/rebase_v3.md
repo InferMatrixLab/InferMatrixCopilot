@@ -1,8 +1,8 @@
 # engine/steps/rebase_v3.py —— 规范
 
-<!-- verified-against: 2026-10-30 -->
+<!-- verified-against: 2026-11-25 -->
 
-`LOC ~2204 · step 库（v3 rebase 装配层） · refactor-status: oversized`
+`LOC ~2660 · step 库（v3 rebase 装配层） · refactor-status: oversized`
 
 ## 职责
 把 `rebase_engine` 包接进 executor：locked playbook `repo-rebase-v3` 的全部
@@ -165,3 +165,16 @@ done；`_v3_wave_gate` 把 interrupted 与 failed 同等视为"wave-1 未完成"
 rebase 的模块不是 wave 2 的基础）。测试：`test_assembly.py::
 test_v3_module_rebase_reruns_interrupted_and_blocks_on_interrupt`、
 `test_run_shutdown.py::test_wave_gate_treats_interrupted_as_not_done`。
+
+## agent 测试工具的卡数与会话卡数（2026-11-25）
+
+campaign 改为按命令向调度器取卡之后（`testing` 规范的"按命令向调度器申请 GPU"），
+经本文件启动的 GPU 命令各自声明要几张：
+
+- `run_pytest`/`reproduce`（`_run_tests`）以 `TestJob(min_gpus=0, gpu_lock=True,
+  gpus=1)` 运行，向调度器要 1 张卡。返回值新增 `skipped` 与 `skip_reason`；
+  `passed` 只在 `rc == 0 and not skipped` 时为真——调度器没给卡的运行没有通过。
+- `run_precommit` 以 `gpus=0` 运行，不申请。
+- 两处 `ModuleRunConfig` 的 `cuda_devices` 改取 `testing.gpu_demand.session_devices()`：
+  有 `CUDA_VISIBLE_DEVICES` 就用它，否则保留历史缺省 `0,1`；按需模式下会话不持有
+  卡，取空串，不再把 `0,1` 写进桥的环境。

@@ -1,8 +1,8 @@
 # rebase_engine/ —— 规范
 
-<!-- verified-against: 2026-10-30 -->
+<!-- verified-against: 2026-11-25 -->
 
-`LOC ~7500（26 个模块） · repo-rebase-v3 的原生 rebase 引擎 · refactor-status: ok`
+`LOC ~9530（30 个模块） · repo-rebase-v3 的原生 rebase 引擎 · refactor-status: ok`
 
 ## 职责
 父级 rebase agent 机制的仓库中立移植（PR0..PR7 分片落地）：repo-rebase-v3
@@ -259,3 +259,39 @@ GPU 进程执行 SIGINT→SIGTERM→SIGKILL 阶梯。`module_pytest.py` 现在�
   收口而不是推进到下一个兄弟；substate 短路**只**接受 done/skipped，所以
   `--resume` 重跑 interrupted 模块、跳过 done；`_v3_wave_gate` 把 interrupted
   与 failed 同等视为未完成。
+
+## 按需 GPU：agent shell、测试包装器与提示词（2026-11-25）
+
+campaign 不再从头到尾持有一份外层预约，每条 GPU 命令向调度器申请自己需要的卡
+（`testing` 规范的"按命令向调度器申请 GPU"）。本包里三处与之相接：
+
+- **`run_shell`。** `handle_run_shell` 先决定这条命令要不要卡，再把执行交给
+  `_run_shell`（原有的 Popen、后代快照与超时逻辑未变）。按需模式（读本进程环境的
+  `IMX_GPU_MODE`）下，它把模式写进子进程环境，使命令启动的 `imx-omni-pytest`
+  自己去申请；`testing.gpu_demand.shell_needs_gpu` 判定会起测试或 CUDA 代码的命令，
+  用 `scheduler_wrap` 向调度器要 1 张卡（等待上限是工具超时的一半），并给子进程设
+  `IMX_GPU_HELD=1`，命令启动的东西不再申请。等待到期时返回
+  `{"exit_code": 1, "gpu_unavailable": true, "stderr": "Not run: …"}`；其余失败
+  在 stderr 前附上调度器的错误文本。2026-11-24/25 的 campaign 里，agent 的 1039 次
+  工具调用有 882 次走 `run_shell`（计划评审之前 `run_pytest` 是锁住的），其中绝大多数
+  是 `git`、`grep` 与读取，不受影响。
+- **`module_pytest.py`。** 包装器的 `TestJob` 带 `gpus=1`：测试可能用到卡，如同它
+  过去在外层预约下运行时那样。包装器仍返回结果自己的 rc（既有契约，由
+  `test_module_pytest_outcomes.py` 钉住），所以跳过时把
+  `imx-omni-pytest: skipped — <原因>` 同时写到 stdout 和 stderr。
+- **提示词。** `build_module_prompt(..., cuda_devices=prompt_devices(config.cuda_devices))`：
+  按需模式下 `CUDA_DEVICES` 替换成"由调度器按命令设置（本会话不持有卡）"。模板里的
+  "Use only env from this prompt: `CUDA_VISIBLE_DEVICES={CUDA_DEVICES}`" 不再让
+  agent 以为自己握有 0、1 两张卡。
+
+测试在 `test_gpu_demand.py`（agent shell、模块测试包装器）。
+
+## 基线运行时的 wheel variant（2026-11-23）
+
+`wheel.ensure_baseline_venv` 装基线 commit 的 wheel 时，variant 改为
+`spec.baseline_variant or spec.variant`；`WheelSpec.from_manifest` 读可选的
+`rebase.wheel.baseline_variant`，未声明时行为不变。vLLM 在 3996083d37 把 main 的
+默认 CUDA 构建从 13.0 换到 13.2：main 只发布 `cu132` wheel，而作为基线的 v0.34.0
+final 只有 `cu130`。按目标的 variant 去取，测试循环用来区分既有失败与回归的基线
+运行时就建不出来，退回到让基线也跑在 campaign 的 venv 上。vllm-omni adapter 把
+`baseline_variant` 设为 `cu130`。测试：`test_rebase_release_target.py`。
