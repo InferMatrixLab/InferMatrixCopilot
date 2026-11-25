@@ -530,16 +530,22 @@ class TestRunner:
         ran on, or why it did not run. The scheduler's own text stays in the
         side log unless the command failed anyway."""
         gpus = self._job_gpus(job)
+        granted = granted_gpus(side_log)
         if rc == NO_GPU_RC:
             lines = [f"[gpu] not run: the scheduler granted no {gpus} card(s) "
                      f"within {self._wait(job)}."]
-        else:
+        elif granted:
             lines = [f"[gpu] {gpus} card(s) from the scheduler: "
-                     f"[{' '.join(granted_gpus(side_log))}]"]
+                     f"[{' '.join(granted)}]"]
             if rc not in (0, TIMEOUT_RC):
                 error = scheduler_error(side_log)
                 if error:
                     lines.append(f"[gpu] scheduler: {error}")
+        else:
+            # no card was ever named, so nothing ran under the scheduler
+            error = scheduler_error(side_log)
+            lines = ["[gpu] not run: the scheduler named no card(s)"
+                     + (f" and said: {error}" if error else ".")]
         try:
             with open(log_file, "a", encoding="utf-8") as lf:
                 lf.write("\n" + "\n".join(lines) + "\n")

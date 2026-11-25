@@ -2,7 +2,7 @@
 
 <!-- verified-against: 2026-11-25 -->
 
-`LOC ~2160（9 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
+`LOC ~2190（9 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
 
 ## 职责
 仓库中立的测试执行底座：gpu_lock.sh / kill_test_tree.sh / test_watchdog.sh /
@@ -40,9 +40,10 @@ test_runner.sh 的 Python 移植。仓库专属数据（watchdog 模式、artifa
   `RunPlan`、`TestOutcome`、`strip_cov_flags`、`cleanup_test_artifacts`、
   `log_file_for`/`pass_marker_for`、`TIMEOUT_RC=124`、`PY_TIMEOUT_MARGIN_SEC`。
 - `gpu_demand`：`GpuDemand`（`.from_env`）、`command_gpus`、`shell_needs_gpu`、
-  `scheduler_wrap`、`granted_gpus`、`scheduler_error`、`duration_seconds`、
-  `session_devices`、`prompt_devices`；常量 `MODE_ENV`、`HELD_ENV`、`WAIT_ENV`、
-  `NO_GPU_RC`、`SCHEDULER_TIMEOUT_MARGIN_SEC`。
+  `scheduler_wrap`、`idle_timeout`、`granted_gpus`、`scheduler_error`、
+  `duration_seconds`、`session_devices`、`prompt_devices`；常量 `MODE_ENV`、
+  `HELD_ENV`、`WAIT_ENV`、`NO_GPU_RC`、`SCHEDULER_TIMEOUT_MARGIN_SEC`、
+  `IDLE_MAX_SEC`。
 - `watchdog`：`WatchdogPatterns(.from_yaml)`、`LogWatchdog(.start/.stop/.check_once/.result)`、`WatchdogResult`。
 - `watchdog_learn`：`record`、`harvest`、`eligible_patterns`、`promote`、
   `read_decisions`、`normalize_pattern`、`repair_tail`。
@@ -95,9 +96,10 @@ env 前缀 → `scrub_agent_shell_env(extra_safe_prefixes=…)`（manifest 数�
 （TestRunner 对 shell 的 command-echo 金样）、`test_module_pytest_signals.py`
 （经包装器：`terminate_active` 停树、stdin=/dev/null）；`watchdog_learn` 另由
 `test_curator.py`（harvest exactly-once）与 `test_knowledge_foundation.py`
-（record 身份字段、撕尾修复）钉住。`test_gpu_demand.py`（50 个）以一个替身 `gpu`
+（record 身份字段、撕尾修复）钉住。`test_gpu_demand.py`（64 个）以一个替身 `gpu`
 可执行文件覆盖按需模式：卡数、shell 命令的判定、包装程序的输出路由与等待到期、
-`TestRunner` 的 skip，以及 agent shell 与模块测试包装器。
+空闲回收的单位与上限、调度器拒绝请求时的日志行、`TestRunner` 的 skip，以及 agent
+shell 与模块测试包装器。
 
 ## 重构备注
 `runner.py`（643L）是包内最重的一块：`_spawn` 把快照线程、双定时器、watchdog
@@ -137,13 +139,20 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
   返回一段给 `bash --norc -c` 的 shell：命令的 stdout/stderr 留在调用方给的描述符
   （fd 3/4），调度器自己的输出写进 `<日志>.scheduler`。实测调度器把进度打到
   stdout、把 `Error: wait timeout exceeded` 打到 stderr，等待到期时退出码为 1；
-  包装程序把它换成 `NO_GPU_RC`（97），其余失败保留调度器的退出码。调度器的超时
-  与空闲回收都设为 `timeout_sec + SCHEDULER_TIMEOUT_MARGIN_SEC`，让运行器自己的
-  定时器先触发。
+  包装程序把它换成 `NO_GPU_RC`（97），其余失败保留调度器的退出码。调度器的超时设为
+  `timeout_sec + SCHEDULER_TIMEOUT_MARGIN_SEC`（秒），让运行器自己的定时器先触发。
+  空闲回收由 `idle_timeout()` 给出：同一个时长向上取整到**单一单位**（秒、分或小时），
+  且不超过 `IDLE_MAX_SEC`（3 小时）。实测（2026-11-25）调度器只解析单一单位的空闲
+  时长：给 `1h30m` 直接拒绝；给 `8100s` 它接受，再把 `2h15m` 交给自己的 supervisor，
+  那个进程读不了（卡照给、照释放，只是不会因空闲回收）；超过 3 小时也直接拒绝。
+  v0.35.0 campaign 最初把整个超时按秒传给它，超时 6 小时的模块测试因此一次都没跑成。
+  命令的超时用秒则没有限制。
 - **调度器的输出绝不进测试日志。** 本机的 `gpu run` 会打印一条 "failed to
   activate booking" 警告，命中看门狗 Tier-2 的 `failed to`，会让每个 job 多一次
   LLM 评审。日志里只留运行器自己写的一行 `[gpu] …`（拿到的卡，或没跑成的原因）；
-  命令失败且调度器报了错时才附上它的错误文本。
+  命令失败且调度器报了错时才附上它的错误文本。日志里没有 `Reserved …` 可依时写
+  `[gpu] not run: the scheduler named no card(s) and said: …`——没有卡，命令就没跑；
+  错误文本在它随后的 `Usage:` 处截断。
 - **排队到期是一次显式 skip。** `TestRunner.run` 返回 `rc=0, skipped=True`，
   `skip_reason` 写明要几张、等了多久；命令没有运行，也不写 pass marker。等待
   上限不超过 `timeout_sec` 的一半：运行器的定时器从 spawn 起算，排队时间也在内。

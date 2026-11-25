@@ -18,6 +18,8 @@ up, names the granted cards as "Reserved N GPU(s): [a b]" and sets
 CUDA_VISIBLE_DEVICES to them. Its own output is kept out of test logs: on this
 machine it carries a "failed to activate booking" warning, which matches the
 watchdog's `failed to` pattern and would start an LLM review of every job.
+Its idle release takes one unit and at most three hours (`idle_timeout`); its
+command timeout takes any duration in seconds.
 """
 from __future__ import annotations
 
@@ -35,6 +37,9 @@ DEFAULT_WAIT = "30m"
 #: The scheduler stops a command this long after the runner's own timers
 #: would have, so the runner's timeout stays the one that fires.
 SCHEDULER_TIMEOUT_MARGIN_SEC = 900
+#: The longest idle release the scheduler accepts; it refuses the request
+#: outright above this ("idle timeout cannot exceed 3h").
+IDLE_MAX_SEC = 3 * 3600
 #: The wrapper's own status for "the scheduler granted no cards in time".
 NO_GPU_RC = 97
 
@@ -167,7 +172,7 @@ def scheduler_wrap(command: str, *, gpus: int, timeout_sec: float, wait: str,
         # the scheduler releases an idle card after 30 min by default; a test
         # may take longer before its first kernel (a model download), and the
         # timeout already bounds this reservation
-        "--idle-timeout", f"{int(timeout_sec)}s",
+        "--idle-timeout", idle_timeout(timeout_sec),
         "--wait", wait, "--note", note, "--",
         "bash", "--norc", "-c", "exec >&3 2>&4\n" + command])
     side = shlex.quote(str(side_log))
@@ -179,6 +184,22 @@ def scheduler_wrap(command: str, *, gpus: int, timeout_sec: float, wait: str,
         f"then exit {NO_GPU_RC}; fi",
         'exit "$rc"',
     ])
+
+
+def idle_timeout(seconds: float) -> str:
+    """`seconds` as an idle release the scheduler takes: one unit (seconds,
+    minutes or hours), rounded up so the reservation outlives the command's
+    own timers, and never above IDLE_MAX_SEC. It parses one unit only. Given
+    `2h15m` it refuses the request; given `8100s` it accepts, then hands its
+    supervisor `"2h15m"`, which that process cannot read (the card is still
+    granted and released, but never for idleness)."""
+    seconds = min(int(seconds), IDLE_MAX_SEC)
+    if seconds < 60:
+        return f"{max(seconds, 1)}s"
+    minutes = -(-seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{-(-seconds // 3600)}h"
 
 
 def granted_gpus(side_log: Path) -> list[str]:
@@ -198,7 +219,11 @@ def scheduler_error(side_log: Path) -> str:
     except OSError:
         return ""
     hit = text.find("Error:")
-    return text[hit:hit + 300].strip() if hit >= 0 else ""
+    if hit < 0:
+        return ""
+    error = text[hit:]
+    usage = error.find("\nUsage:")  # the flag list that follows is not the error
+    return (error if usage < 0 else error[:usage]).strip()[:300]
 
 
 INHERITED_DEFAULT = "0,1"

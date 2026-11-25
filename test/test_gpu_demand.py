@@ -9,6 +9,7 @@ the command, or reports an expired wait. No card is involved.
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,12 +23,14 @@ from infermatrix_copilot.rebase_engine.rebase_tools import (
 from infermatrix_copilot.testing import gpu_demand
 from infermatrix_copilot.testing.gpu_demand import (
     DEFAULT_WAIT,
+    IDLE_MAX_SEC,
     NO_GPU_RC,
     SCHEDULER_TIMEOUT_MARGIN_SEC,
     GpuDemand,
     command_gpus,
     duration_seconds,
     granted_gpus,
+    idle_timeout,
     prompt_devices,
     scheduler_error,
     scheduler_wrap,
@@ -47,6 +50,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 printf 'gpus=%s\n' "$gpus" >> "$IMX_GPU_STUB_LOG"
+if [ -f "$(dirname "$IMX_GPU_STUB_REFUSE")/deny" ]; then
+    printf 'Error: invalid idle timeout: idle timeout cannot exceed 3h\nUsage:\n  canhazgpu run\nFlags:\n  --gpus int   Number of GPUs\n' >&2
+    printf 'Error: invalid idle timeout: idle timeout cannot exceed 3h\n' >&2
+    exit 1
+fi
 if [ -f "$IMX_GPU_STUB_REFUSE" ]; then
     printf 'Waiting for GPUs... (queue position: 3)\n'
     printf 'Error: wait timeout exceeded\nUsage:\n  canhazgpu run\n' >&2
@@ -152,6 +160,20 @@ def test_duration_seconds_reads_the_scheduler_formats():
     assert duration_seconds("later", -1) == -1
 
 
+@pytest.mark.parametrize("seconds, text", [
+    (0, "1s"), (59, "59s"), (60, "1m"), (1040, "18m"), (1500, "25m"),
+    (1501, "26m"), (3599, "1h"), (3600, "1h"), (7200, "2h"), (7201, "3h"),
+    (8100, "3h"), (IDLE_MAX_SEC, "3h"),
+    (21600 + SCHEDULER_TIMEOUT_MARGIN_SEC, "3h"),
+])
+def test_idle_timeout_is_one_unit_within_the_schedulers_cap(seconds, text):
+    assert idle_timeout(seconds) == text
+    # measured on the scheduler (2026-11-25): it reads one unit only (given
+    # `1h30m` it refuses the request) and at most three hours
+    assert re.fullmatch(r"\d+[smh]", text)
+    assert duration_seconds(text) <= IDLE_MAX_SEC
+
+
 def test_mode_comes_from_the_environment(monkeypatch):
     assert GpuDemand.from_env({}) == GpuDemand(enabled=False, wait="30m")
     demand = {gpu_demand.MODE_ENV: "demand", gpu_demand.WAIT_ENV: "2m"}
@@ -239,7 +261,29 @@ def test_runner_asks_for_the_jobs_cards_and_bounds_the_wait(scheduler, tmp_path)
     # the runner's own timer starts at the spawn: the wait is at most half of it
     assert "--wait 50s" in program
     assert f"--timeout {int(100 + SCHEDULER_TIMEOUT_MARGIN_SEC)}s" in program
-    assert f"--idle-timeout {int(100 + SCHEDULER_TIMEOUT_MARGIN_SEC)}s" in program
+    assert "--idle-timeout 17m" in program
+
+
+def test_runner_caps_the_idle_release_of_a_long_job(scheduler, tmp_path):
+    env, _, _ = scheduler
+    job = TestJob(key="long", command="printf 'ran\\n'", timeout_sec=21600)
+    outcome = _runner(tmp_path).run(job, dict(env))
+    assert outcome.rc == 0
+    program = outcome.plan.argv[-1]
+    assert f"--timeout {21600 + SCHEDULER_TIMEOUT_MARGIN_SEC}s" in program
+    assert "--idle-timeout 3h" in program
+
+
+def test_runner_says_so_when_the_scheduler_refuses_the_request(scheduler, tmp_path):
+    env, _, _ = scheduler
+    (tmp_path / "deny").touch()
+    job = TestJob(key="probe", command="printf 'ran\\n'", timeout_sec=600)
+    outcome = _runner(tmp_path).run(job, dict(env))
+    assert outcome.rc == 1 and not outcome.skipped   # the scheduler's own status
+    log = Path(outcome.log_file).read_text()
+    assert ("[gpu] not run: the scheduler named no card(s) and said: "
+            "Error: invalid idle timeout: idle timeout cannot exceed 3h\n") in log
+    assert "Usage:" not in log and "\nran\n" not in log
 
 
 def test_runner_leaves_a_command_that_asks_for_no_cards_alone(scheduler, tmp_path):
