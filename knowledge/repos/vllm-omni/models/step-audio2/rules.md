@@ -1,10 +1,10 @@
 ---
 title: "Step-Audio2 设备边界与流式性能规则"
 created: 2026-09-02
-updated: 2026-09-05
+updated: 2026-11-25
 type: rule
 tags: [vllm-omni, models]
-sources: ["PR #5067", vllm_omni/model_executor/models/step_audio2/step_audio2_thinker.py, vllm_omni/model_executor/models/step_audio2/step_audio2_token2wav.py, vllm_omni/model_executor/models/step_audio2/step_audio2_dit_trt.py, tests/model_executor/models/step_audio2/test_step_audio2_token2wav_async_chunk.py, tests/model_executor/models/step_audio2/test_step_audio2_dit_trt.py, tests/platforms/npu/test_step_audio2_token2wav.py, "PR #6467", "PR #6957"]
+sources: ["PR #5067", vllm_omni/model_executor/models/step_audio2/step_audio2_thinker.py, vllm_omni/model_executor/models/step_audio2/step_audio2_token2wav.py, vllm_omni/model_executor/models/step_audio2/step_audio2_dit_trt.py, tests/model_executor/models/step_audio2/test_step_audio2_token2wav_async_chunk.py, tests/model_executor/models/step_audio2/test_step_audio2_dit_trt.py, tests/platforms/npu/test_step_audio2_token2wav.py, "PR #6467", "PR #6957", "PR #9927"]
 ---
 
 # Step-Audio2 设备边界与流式性能规则
@@ -14,9 +14,10 @@ sources: ["PR #5067", vllm_omni/model_executor/models/step_audio2/step_audio2_th
 | PR 描述信号 | 规则 |
 |---|---|
 | streaming token ownership 或 ragged audio features | `STEPA2-1a`、`STEPA2-1b` |
+| thinker 长音频分块、尾块与 prompt patch | `STEPA2-1c` |
 | shared audio runtime 或 DiT TensorRT plan publication | `STEPA2-2a`、`STEPA2-2b` |
 
-以下规则在 `main @ 12a5f6fb` 复核；主要约束 Step-Audio2 的 thinker/token2wav
+除下文另有 pin 的规则外，本页在 `main @ 12a5f6fb` 复核；主要约束 Step-Audio2 的 thinker/token2wav
 路径。共享 `Token2Wav` core 的 blast radius 在下文显式列出，runtime 的通用规则
 仍归组件 owner。
 
@@ -47,6 +48,13 @@ sources: ["PR #5067", vllm_omni/model_executor/models/step_audio2/step_audio2_th
 - 边界：`.tolist()` 仍是一次 host 同步；CUDA/XPU/NPU 上都不应表述为
   “无同步”，CPU 上则没有 accelerator 同步问题。本次无测试改动，
   现有 async-chunk 测试也未证明 tensor 参数、设备常驻或非别名。
+
+## STEPA2-1c — Thinker 分块后 prompt patch 数必须等于实际 embedding 数
+
+- 触发：修改 StepAudio2 Thinker 的 waveform 分块、feature length、multimodal 字段或 prompt replacement。
+- 强制：现有 16 kHz、25 秒分块按原始音频 item 保留 chunk 边界和顺序；每个 chunk 发出 tokenizer 解析的 start/end 包裹及与 encoder+adapter 实际长度等量的 patch，embedding 再按 item 拼回。尾块可以有包裹但没有 patch 或 embedding。
+- 禁止：用 `max(1, length)` 抬高零特征尾块，或按整个音频只算一次长度再平分到 chunk；不要把模型专属输入分块与 Token2Wav 的流式 lookahead 混为一谈。
+- 验收：覆盖原始单 item、多 item、25 秒边界、短至零特征的尾块及第一个非零特征长度；逐 item 断言 prompt embed mask 数等于拼接后的 embedding 行数。验证 start/end 时用目标 checkpoint 的 tokenizer，不把 mock token ID 当 checkpoint 合同。见[固定实现](https://github.com/vllm-project/vllm-omni/blob/95513b5322fc78fe3b47bd02b9244d30ba6f0e20/vllm_omni/model_executor/models/step_audio2/step_audio2_thinker.py#L513-L539)与[固定测试](https://github.com/vllm-project/vllm-omni/blob/95513b5322fc78fe3b47bd02b9244d30ba6f0e20/tests/model_executor/models/step_audio2/test_step_audio2_thinker.py#L187-L247)。 ^[PR #9927]
 
 ## 性能证据的可用边界
 
