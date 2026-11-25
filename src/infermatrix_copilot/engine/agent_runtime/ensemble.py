@@ -630,6 +630,8 @@ async def run_agent_step_ensemble(
                 if str(v.get("action", "")).lower() == "drop"
             ]
     else:
+        if "claim_checks" in (output_extension or {}):
+            merged["_assessment_incomplete"] = True
         merged["summary"] = (f"ensemble of {len(samples)} samples "
                              "(merge reduction failed; unverified union)")
     # near-dup guard (W2): the reducer occasionally re-emits the same finding

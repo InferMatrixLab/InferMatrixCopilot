@@ -49,7 +49,7 @@ def test_committed_claims_require_real_blob_quotes(records):
 
 def test_required_artifact_zero_differs_from_unperformed_check(records):
     missing = claim("missing", records=[{"path": "results/raw.tsv", "requirement_path": "AGENTS.md",
-                                          "requirement_quote": "requires results/raw.tsv."}])
+                                          "requirement_quote": "A passing review requires results/raw.tsv."}])
     checked = evidence.assess_claims([missing], records)
     assert checked[0]["status"] == "missing"
     assert evidence.score_review(ratings(), checked, records)["total"] == 70
@@ -60,16 +60,44 @@ def test_required_artifact_zero_differs_from_unperformed_check(records):
     assert evidence.assess_claims([missing], records)[0]["status"] == "unverified"
 
 
+@pytest.mark.parametrize(("policy", "cited"), [
+    ("We do not require results/raw.tsv.", "require results/raw.tsv."),
+    ("We do not require results/raw.tsv.", "We do not require results/raw.tsv."),
+    ("We require results/raw.tsv if the optional suite ran.", "We require results/raw.tsv"),
+    ("We require results/raw.tsv.old.", "We require results/raw.tsv"),
+    ("## Optional validation\nWe require results/raw.tsv.", "We require results/raw.tsv."),
+    ("For performance changes only:\n- We require results/raw.tsv.", "- We require results/raw.tsv."),
+    ("```text\nWe require results/raw.tsv.\n```", "We require results/raw.tsv."),
+])
+def test_ambiguous_or_partial_policy_cannot_zero_score_or_block(records, policy, cited):
+    (records.repo / "AGENTS.md").write_text(policy + "\n")
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                    "commit", "-qam", "policy"], cwd=records.repo, check=True)
+    records.head = records.base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=records.repo, text=True).strip()
+    missing = claim("missing", records=[{"path": "results/raw.tsv", "requirement_path": "AGENTS.md",
+                                        "requirement_quote": cited}], acceptance_path="AGENTS.md",
+                    acceptance_quote=cited)
+    checked = evidence.assess_claims([missing], records)
+    assert checked[0]["status"] == "unverified"
+    assert "acceptance_quote" not in checked[0]
+    assert evidence.score_review(ratings(), checked, records)["total"] is None
+
+
 def test_comparison_needs_raw_records_from_both_actual_revisions(records):
     def job_revision(job_id):
         return {1: records.head, 2: records.base, 3: records.head}[job_id]
     records.job_revision = job_revision
     records.job_line = lambda job, quote: ("inaccessible", "") if job == 3 else ("verified", quote)
     raw = [{"job_id": 1, "quote": "42 ms"}, {"job_id": 2, "quote": "76 ms", "role": "baseline"}]
-    def check(refs):
-        return evidence.assess_claims([claim(kind="runtime", comparison=True, records=refs)], records)[0]["status"]
+    def check(refs, comparison=True):
+        return evidence.assess_claims([claim(kind="runtime", comparison=comparison, records=refs)], records)[0]["status"]
     assert check(raw) == "verified"
+    assert evidence.assess_claims([claim(records=raw[:1])], records)[0]["status"] == "unverified"
     assert check(raw[:1]) == "unverified"
+    assert check(raw[:1], comparison="true") == "unverified"
+    assert check(raw, comparison=1) == "unverified"
+    assert check([*raw, {"job_id": 2, "quote": "76 ms", "role": "unknown"}]) == "unverified"
     assert check(raw[1:]) == "unverified"
     assert check([{"job_id": 2, "quote": "76 ms"}]) == "mismatched"
     assert check([{"job_id": 3, "quote": "expired"}]) == "inaccessible"
@@ -106,11 +134,37 @@ def test_upstream_multiline_comment_rule_requires_a_governing_policy_and_changed
     assert not evidence._requires_path("Normal reports are required but results/raw.tsv is optional.", "results/raw.tsv")
 
 
+def test_comment_penalty_rejects_negations_and_unquoted_exemptions(records):
+    upstream = ("- **Simplicity is 0/3** if the diff adds or rewrites any explanatory code\n"
+                "  comment. Apply this check to changed source, tests, scripts, and config.\n"
+                "  License headers, shebangs, tool directives, and required docstrings are exempt.\n"
+                "  Express the underlying behavior through code, tests, or relevant docs.")
+    scoped = ("- **Simplicity is 0/3** if the diff adds or rewrites any explanatory code\n"
+              "  comment in maintained source, tests, scripts, or config. License headers,\n"
+              "  shebangs, tool directives, and required docstrings are exempt. Treat\n"
+              "  byte-preserved historical evidence as data. Express behavior through code,\n"
+              "  tests, or relevant docs.")
+    assert evidence._comment_penalty_rule(scoped, "src/app.py")
+    assert not evidence._comment_penalty_rule(scoped, "campaign/old/src/app.py")
+    negated = "Do not set simplicity to 0/3 for explanatory comments."
+    (records.repo / "AGENTS.md").write_text(upstream + "\n\n" + negated + "\n")
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                    "commit", "-qam", "policy"], cwd=records.repo, check=True)
+    records.base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=records.repo, text=True).strip()
+    checked = evidence.assess_claims([claim()], records)
+    diff = "diff --git a/src/app.py b/src/app.py\n+++ b/src/app.py\n+    # increment value\n"
+    rows = ratings()
+    rows[-1].update(comment_penalty=True, policy_path="AGENTS.md", quote="# increment value")
+    for rule, total in [(negated, None), (upstream.split("  License")[0].rstrip(), None), (upstream, 90)]:
+        rows[-1]["policy_quote"] = rule
+        assert evidence.score_review(rows, checked, records, diff=diff)["total"] == total
+
+
 def test_actual_merge_verdict_only_changes_for_cited_acceptance_condition(records):
     ctx = SimpleNamespace(settings=SimpleNamespace(pr_context_source="snapshot"), state={
         "pr_head_sha": records.head, "pr_base_sha": records.base, "task_spec": {"params": {}}})
     raw = claim("missing", records=[{"path": "results/raw.tsv", "requirement_path": "AGENTS.md",
-                                     "requirement_quote": "requires results/raw.tsv."}])
+                                     "requirement_quote": "A passing review requires results/raw.tsv."}])
     for policy, state, verdict in [(False, "OPEN", "APPROVE"), (True, "OPEN", "REQUEST CHANGES"),
                                    (True, "MERGED", "FOLLOW-UP REQUIRED (post-merge)")]:
         ctx.state["pr_state"] = state

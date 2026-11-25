@@ -30,7 +30,7 @@ insufficient. For a comparison set comparison=true and mark each reference role=
 If repository acceptance explicitly requires the missing artifact, cite acceptance_path and
 acceptance_quote from the governing policy at the base; otherwise report the verification gap.
 For a missing tracked artifact use status=missing and {path,requirement_path,requirement_quote}
-with the required repository location documented in the quoted requirement. For an identified CI
+with the complete affirmative governing clause, including qualifiers and the exact artifact path. For an identified CI
 job whose log cannot be retrieved use status=inaccessible with {job_id}. For a wrong-run record use status=mismatched and cite its revision.
 Use unverified for checks you could not perform, including unsupported media or links.
 Use a single not_applicable row with rationale only when there is no applicable claim."""
@@ -130,6 +130,19 @@ class ReviewRecords:
         except (ValueError, OSError, subprocess.SubprocessError):
             return None
 
+    def governing_clause(self, sha, path, statement):
+        if not _text(statement) or self.tracked(sha, path) is not True:
+            return False
+        try:
+            rc, source = git(self.repo, "show", f"{sha}:{_safe_rel_path(path)}")
+        except (ValueError, OSError, subprocess.SubprocessError):
+            return False
+        return not rc and _unconditional_clause(source, statement)
+
+    def requires_artifact(self, sha, path, statement, artifact):
+        statement = _text(statement)
+        return _requires_path(statement, artifact) and self.governing_clause(sha, path, statement)
+
     def match(self, record, kind):
         if not isinstance(record, dict):
             return "unverified"
@@ -139,7 +152,9 @@ class ReviewRecords:
             return "unverified"
         if kind not in ("source", "runtime"):
             return "unverified"
-        if type(record.get("job_id")) is int:
+        if "job_id" in record:
+            if kind != "runtime" or type(record["job_id"]) is not int or record["job_id"] < 1:
+                return "unverified"
             actual = self.job_revision(record["job_id"])
             if _sha(actual) and actual != expected:
                 return "mismatched"
@@ -168,11 +183,16 @@ def assess_claims(proposals, records):
         status, refs = row.get("status"), row.get("records")
         refs = refs if isinstance(refs, list) else []
         failed_paths = []
-        if status == "missing":
+        if "comparison" in row and type(row["comparison"]) is not bool:
+            status = "unverified"
+        elif any(not isinstance(ref, dict) or ref.get("role", "head") not in ("head", "baseline")
+                 for ref in refs):
+            status = "unverified"
+        elif status == "missing":
             failed_paths = [ref["path"] for ref in refs if (
                 isinstance(ref, dict) and _text(ref.get("path"))
-                and ref["path"] in _text(ref.get("requirement_quote"))
-                and records.tracked(records.head, ref.get("requirement_path"), ref["requirement_quote"]) is True
+                and records.requires_artifact(records.head, ref.get("requirement_path"),
+                                              ref.get("requirement_quote"), ref["path"])
                 and records.tracked(records.head, ref["path"]) is False
             )]
             status = "missing" if failed_paths else "unverified"
@@ -198,8 +218,9 @@ def assess_claims(proposals, records):
         policy = _text(row.get("acceptance_path"))
         statement = _text(row.get("acceptance_quote"))
         if (status in ("missing", "inaccessible", "mismatched") and statement
-                and _policy_path(policy, "", records) and records.tracked(records.base, policy, statement)
-                and any(_requires_path(statement, path) for path in failed_paths if path)):
+                and any(_policy_path(policy, path, records)
+                        and records.requires_artifact(records.base, policy, statement, path)
+                        for path in failed_paths if path)):
             result.update(acceptance_path=policy, acceptance_quote=statement)
         if result not in rows:
             rows.append(result)
@@ -223,10 +244,9 @@ def score_review(proposals, claims, records, *, gap="", diff=""):
                 continue
             if key == "simplicity" and row.get("comment_penalty") is True:
                 rule = _text(row.get("policy_quote"))
-                if not (re.search(r"simplicity", rule, re.I) and re.search(r"comments?", rule, re.I)
-                        and re.search(r"\b0\s*/\s*3\b", rule)
+                if not (_comment_penalty_rule(rule, row["path"])
                         and _policy_path(row.get("policy_path"), row["path"], records)
-                        and records.tracked(records.base, row.get("policy_path"), rule)
+                        and records.governing_clause(records.base, row.get("policy_path"), rule)
                         and _introduced_comment(records, diff, row["path"], row["quote"])):
                     continue
                 rating = 0
@@ -259,13 +279,75 @@ def score_review(proposals, claims, records, *, gap="", diff=""):
 
 
 def _requires_path(statement, path):
-    flat = " ".join(statement.casefold().split())
-    if re.search(r"\b(not|never|unless|optional|recommend(?:ed)?)\b", flat):
+    if not _text(path):
         return False
-    artifact = re.escape(path.casefold())
-    obligation = r"(?:requires?|must (?:include|produce|attach|provide|retain)|shall (?:include|provide))"
-    return bool(re.search(rf"\b{obligation}\s+(?:the\s+)?`?{artifact}(?:`|\b)", flat)
-                or re.search(rf"{artifact}`? (?:is required|must be (?:included|present|provided))\b", flat))
+    # Accept a small grammar of explicit requirements. A substring of a
+    # negation, alternative, example, or similarly named path is insufficient.
+    clause = re.sub(r"^(?:[-*+] |[0-9]+[.)] )", "", statement.strip()).strip()
+    artifact = rf"(?:`{re.escape(path)}`|{re.escape(path)})"
+    subject = r"(?:we|you|(?:all |every |each |a |the )?(?:passing )?(?:reviews?|pull requests?|PRs?|changes?|submissions?|contributors?))"
+    verb = r"(?:requires?|(?:must|shall) (?:include|produce|attach|provide|retain))"
+    return bool(re.fullmatch(rf"(?i:(?:{subject} {verb}|must (?:include|produce|attach|provide|retain)) (?:the )?){artifact}[.]?", clause)
+                or re.fullmatch(rf"{artifact}(?i: (?:is required|must be (?:included|present|provided)))[.]?", clause))
+
+
+def _comment_penalty_rule(statement, target):
+    rule = " ".join(statement.replace("**", "").removeprefix("- ").split())
+    if "byte-preserved historical evidence" in rule.casefold():
+        # The scoped rule covers maintained code. A file copied into a campaign
+        # archive can have a source extension without being maintained code.
+        if target.partition("/")[0] not in {"src", "csrc", "test", "tests", "scripts", "config"}:
+            return False
+    return bool(re.fullmatch(
+        r"simplicity is 0/3 if the diff adds or rewrites (?:any|an) explanatory code comment"
+        r"(?: in maintained source, tests, scripts, or config)?\."
+        r"(?: Apply this check to changed source, tests, scripts, and config\.)?"
+        r"(?: License headers(?:, shebangs, tool directives, and required docstrings| and directives) are exempt\.)?"
+        r"(?: Treat byte-preserved historical evidence as data\.)?"
+        r"(?: Express (?:the underlying )?behavior through code, tests, or relevant docs\.)?", rule, re.I))
+
+
+def _unconditional_clause(source, statement):
+    """Ignore quoted examples and qualifications outside the model's excerpt."""
+    headings = {}
+    fence = ""
+    lines = source.splitlines()
+    qualifier = re.compile(r"\b(if|unless|when|except(?:ions?)?|only|optional|example[s]?|"
+                           r"sample[s]?|obsolete|legacy|deprecated|draft|recommend(?:ed)?)\b", re.I)
+    clause = [line.strip() for line in statement.splitlines()]
+    clause[0] = clause[0].removeprefix("- ")
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            mark = stripped[:3]
+            if not fence or fence == mark:
+                fence = "" if fence else mark
+            continue
+        if fence:
+            continue
+        heading = re.match(r"^(#{1,6}) (.+)", stripped)
+        if heading:
+            level = len(heading[1])
+            headings = {k: v for k, v in headings.items() if k < level}
+            headings[level] = heading[2]
+            continue
+        if stripped.removeprefix("- ") != clause[0] or any(qualifier.search(h) for h in headings.values()):
+            continue
+        end = index + len(clause)
+        if [s.strip() for s in lines[index + 1:end]] != clause[1:]:
+            continue
+        # List-wide qualifiers may precede earlier items in the same block.
+        previous_block = "\n".join(lines[:index]).rstrip().rsplit("\n\n", 1)[-1]
+        if any(s.rstrip().endswith(":") for s in previous_block.splitlines()):
+            continue
+        if index and lines[index - 1].strip() and not re.match(r"^(?:#|[-*+] |[0-9]+[.)] )", lines[index - 1].strip()):
+            if not lines[index - 1].rstrip().endswith((".", "!", "?")):
+                continue
+        if end < len(lines) and (re.match(r"^(?:except|unless|if|when|only|provided|but|or)\b", lines[end].strip(), re.I)
+                                 or lines[end].startswith((" ", "\t")) and lines[end].strip()):
+            continue
+        return True
+    return False
 
 
 def _policy_path(path, target, records):

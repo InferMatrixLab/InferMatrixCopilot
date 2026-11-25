@@ -151,8 +151,10 @@ def test_ensemble_empty_merge_reply_falls_open_without_repair(settings, trace,
         contract(items=[{"name": "y"}]),
         Reply(blocks=[Block(type="text", text="")]),   # reducer returns nothing
     ])
-    result, output = _run(_ctx(settings, trace, tmp_path, llm=llm))
+    result, output = _run(_ctx(settings, trace, tmp_path, llm=llm),
+                          output_extension={"items": "list", "claim_checks": "list"})
     assert result.ok
+    assert output["_assessment_incomplete"] is True
     assert [i["name"] for i in output["items"]] == ["x", "x2", "y"]  # union
     assert len(llm.calls) == 3  # no repair call happened
 
@@ -1486,5 +1488,6 @@ def test_reducer_keeps_evidence_from_each_investigator_when_it_drops_all_comment
     _, output = _run(_ctx(settings, trace, tmp_path, llm=llm),
                      output_extension={"items": "list", "claim_checks": "list", "dimension_ratings": "list"})
     assert output["items"] == []
+    assert output["_assessment_incomplete"] is False
     assert [r["claim"] for r in output["claim_checks"]] == ["raw output", "comparison"]
     assert [r["dimension"] for r in output["dimension_ratings"]] == ["validation", "claim_evidence"]
