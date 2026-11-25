@@ -129,3 +129,9 @@ K3/K4/K7 的精简（require_repo/published/from_state）已在各子模块落�
 ## 自进化接入（2026-10-04）
 
 影子模式下 `pr.fetch_diff`、gate 和 CI 取数从可信控制器准备的 `pr_snapshot` 读取；快照缺少必要字段即阻塞，不回退到实时网络。基线和候选共用冻结的 base/head 与上下文。
+
+Strict review fetches the PR description, commit subjects and linked issue
+acceptance criteria before source investigation. Its initial GitHub query omits
+PR discussion and review threads. Full PR quality assessments may still include
+discussion. The checkpoint records whether the fetched context is independent of
+feedback, so reviews resumed from older combined bundles can exclude discussion.

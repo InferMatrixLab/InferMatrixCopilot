@@ -328,6 +328,11 @@ async def _second_round(ctx: StepContext, output: dict, common: dict,
                         ("[validated]", "[resolved]", "[claim-", "[sweep]",
                          "[upstream-verify]"))]
     out2 = dict(output)
+    for key in ("claim_checks", "dimension_ratings"):
+        values = (extra or {}).get(key)
+        if isinstance(values, list):
+            previous = output.get(key)
+            out2[key] = (previous if isinstance(previous, list) else []) + values
     if new_comments:
         out2["review_comments"] = list(
             output.get("review_comments") or []) + new_comments

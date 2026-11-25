@@ -161,7 +161,8 @@ Strict 会用它配置的模型运行打包好的 `pr-review` playbook，带进�
 
 - `review(target, repo?, mode="direct", post=false, title="", body="",
   changed_files=[], review_depth="", repo_path="", expected_head_sha="",
-  idempotency_key="")`：在宿主发出进度更新之后，
+  idempotency_key="", include_score=false)`：Strict 可按要求在结论之后给出百分制参考分数。
+  在宿主发出进度更新之后，
   Direct 用 title/body 返回**至多三条**精确的 owner/model 路由，各自带内嵌的精简
   `quick_map` 摘录。changed files 通常只做范围校验；但当返回的路由**没有一条**命中
   它们推导出的 owner 时，改由 changed files 选路，并在响应里明说

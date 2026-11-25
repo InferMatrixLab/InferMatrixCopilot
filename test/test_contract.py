@@ -43,6 +43,7 @@ def test_result_reads_the_verdict_as_a_field_not_from_markdown(tmp_path):
     assert result["verdict"] == "REQUEST CHANGES"
     assert result["reviewed_head_sha"] == "a" * 40
     assert result["state"] == rs.DONE
+    assert "review_score" not in result and "review_claim_evidence" not in result
     assert result["contract_version"] == contract.STRICT_API_VERSION
 
 

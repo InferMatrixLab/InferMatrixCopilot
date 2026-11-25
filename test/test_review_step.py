@@ -437,3 +437,88 @@ def test_carried_findings_are_rechecked_on_frozen_head_and_persisted(settings, t
     structured = build_review_result(run_dir)
     assert structured["rechecks_complete"]
     assert structured["finding_rechecks"] == payload["finding_rechecks"]
+
+
+def test_open_thread_suppresses_only_the_same_verified_finding(settings, trace, tmp_path, git_repo, monkeypatch):
+    from infermatrix_copilot.engine.steps.review import feedback
+    from infermatrix_copilot.engine.steps._common import gh_read_tools
+    import infermatrix_copilot.engine.steps._common as common
+
+    head = "f" * 40
+    marker = "PRIOR-THREAD-MARKER"
+    body = "**[major]** empty input raises\n\nEvidence: " + marker
+    root = {"body": body, "url": "https://github.com/org/repo/pull/9#discussion_r999"}
+    node = {"isResolved": False, "isOutdated": False, "path": "a.py", "line": 2,
+            "diffSide": "RIGHT", "comments": {"nodes": [root]}}
+    llm = ScriptedLLM([_contract_reply([
+        {"file": "a.py", "line": 88, "anchor_snippet": "b = items[0]", "severity": "major",
+         "comment": "empty input raises", "evidence": "a.py:2 b = items[0]"},
+        {"file": "a.py", "line": 2, "severity": "minor", "comment": "different defect", "evidence": "a.py:2"},
+    ])])
+    def query(args, cwd):
+        assert llm.calls, "feedback was fetched before source investigation"
+        assert args[:2] == ["api", "graphql"]
+        return 0, json.dumps({"data": {"repository": {"pullRequest": {
+            "headRefOid": head, "reviewThreads": {"nodes": [node]}}}}})
+    monkeypatch.setattr(feedback, "gh", query)
+    state = {"diff_text": "+++ b/a.py\n@@ -1 +1,2 @@\n a = 1\n+b = items[0]\n",
+             "pr_head_sha": head, "repo_path": str(git_repo), "task_spec": {"pr": 9},
+             "pr_context": "## PR description\nfixes #13\n\n## Review summaries\n" + marker
+                           + "\n\n## Linked issue #13: zero length\nAcceptance criterion"}
+    result = asyncio.run(_registry().get("agent.review_diff").handler(
+        _ctx(settings, trace, tmp_path, state, llm=llm)))
+    assert result.ok, result.summary
+    prompt = str(llm.calls[0]["messages"])
+    assert marker not in prompt and "Acceptance criterion" in prompt
+    assert [c["comment"] for c in state["review_comments"]] == ["different defect"]
+    assert state["review_comments"][0]["line"] == 2
+    assert state["review_verdict"] == "REQUEST CHANGES"
+    for key in ("review_summary", "review_text"):
+        assert "discussion_r999" in state[key]
+        assert state[key].endswith("**Verdict:** REQUEST CHANGES")
+    assert [r["disposition"] for r in state["review_finding_dispositions"]] == ["duplicate", "publish"]
+
+    fields = []
+    monkeypatch.setattr(common, "gh", lambda args, **kw: (fields.append(args[-1]) or 0, "{}"))
+    gh_read_tools(git_repo, issue_comments=False)["gh_issue_view"].handler(issue=9)
+    assert "comments" not in fields[0].split(",")
+    assert feedback.independent_context("## PR description\n## Review summaries for this experiment\nkeep").endswith("keep")
+
+
+def test_inactive_stale_and_unavailable_threads_never_suppress(settings, trace, tmp_path, git_repo, monkeypatch):
+    from infermatrix_copilot.engine.steps.review import feedback
+
+    ctx = _ctx(settings, trace, tmp_path, {"repo_path": str(git_repo)})
+    head = "a" * 40
+    thread = {"isResolved": False, "isOutdated": False, "path": "a", "line": 1, "diffSide": "RIGHT",
+              "comments": {"nodes": [{"body": "issue", "url": "thread"}]}}
+    data = {"headRefOid": head, "reviewThreads": {"nodes": [
+        dict(thread, isResolved=True), dict(thread, isOutdated=True), dict(thread, diffSide="LEFT")]}}
+    monkeypatch.setattr(feedback, "gh", lambda *a, **kw: (0, json.dumps(
+        {"data": {"repository": {"pullRequest": data}}})))
+    assert feedback.existing_threads(ctx, 9, head) == ({}, "checked")
+    assert feedback.existing_threads(ctx, 9, "b" * 40) == ({}, "stale")
+    monkeypatch.setattr(feedback, "gh", lambda *a, **kw: (1, "unavailable"))
+    assert feedback.existing_threads(ctx, 9, head) == ({}, "unavailable")
+    settings.pr_context_mode = "no_discussion"
+    def forbidden(*args, **kwargs):
+        raise AssertionError("offline review opened GitHub")
+    monkeypatch.setattr(feedback, "gh", forbidden)
+    assert feedback.existing_threads(ctx, 9, head) == ({}, "disabled")
+
+
+def test_carried_verdict_requires_a_current_head_recheck(settings, trace, tmp_path):
+    from infermatrix_copilot.engine.steps.review.publication import finalize_review_publication
+
+    ctx = _ctx(settings, trace, tmp_path, {"task_spec": {"pr": 9}})
+    packet = {"review_comments": [], "draft_selection": [], "ut_candidates": []}
+    carried = [{"finding_id": "prior", "title": "Empty batch", "severity": "major"}]
+    for outcome, verdict in (("fixed", "APPROVE"), ("still_affected", "REQUEST CHANGES"),
+                             ("unverified", "COMMENT")):
+        checks = [{"finding_id": "prior", "outcome": outcome, "evidence": "Observed return on line 3"}]
+        outputs = asyncio.run(finalize_review_publication(ctx, packet, carried, checks, []))
+        assert outputs["review_verdict"] == verdict
+        assert outputs["review_text"].endswith(f"**Verdict:** {verdict}")
+    outputs = asyncio.run(finalize_review_publication(ctx, packet, carried, [], ["missing recheck: prior"]))
+    assert outputs["review_verdict"] == "COMMENT"
+    assert "missing recheck" in outputs["review_summary"]

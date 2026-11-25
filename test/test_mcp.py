@@ -770,3 +770,20 @@ def test_a_configured_knowledge_dir_is_pinned_not_replaced_by_the_packaged_tree(
     assert env["KNOWLEDGE_DIR"] == str(custom.resolve()) and KNOWLEDGE_ROOT_ENV not in env
     assert build_review_result(core.run_root / run_id)["diagnostics"]["knowledge_snapshot"] == "unverified"
     core.close()
+
+
+def test_score_parameter_is_opt_in_for_cli_and_reserved_requests(settings):
+    from infermatrix_copilot.cli.utils import parse_task_params
+    from infermatrix_copilot.intent import pre_parse, validate_spec
+    from infermatrix_copilot.task_spec import TaskSpec
+    from infermatrix_copilot.app.request_policy import enforce_strict_review_policy
+
+    req = {"kind": "pr_review", "repo": "widget", "pr": 7}
+    for words, expected in (("with a score", True), ("without a score", False), ("scoring logic", False)):
+        assert pre_parse("review PR 7 " + words, settings).spec.params.get("include_score", False) is expected
+    assert validate_spec(TaskSpec(**req, params=parse_task_params(["include_score=true"]))) == ""
+    assert "boolean" in validate_spec(TaskSpec(**req, params=parse_task_params(["include_score=maybe"])))
+    policy = enforce_strict_review_policy
+    assert policy({**req, "params": {"include_score": False}}, allowed_repos=["widget"]) == policy(req, allowed_repos=["widget"])
+    with pytest.raises(ValueError, match="boolean"):
+        policy({**req, "params": {"include_score": "false"}}, allowed_repos=["widget"])

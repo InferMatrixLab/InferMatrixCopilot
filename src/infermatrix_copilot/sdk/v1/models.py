@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 SDK_API_VERSION = "1.0.0"
 DIRECT_API_VERSION = "1.1.0"
-STRICT_API_VERSION = "1.4.0"  # StrictRuntimeConfig.max_workers
+STRICT_API_VERSION = "1.5.0"  # Claim evidence and optional advisory scores
 QUALITY_API_VERSION = "1.0.0"
 KNOWLEDGE_API_VERSION = "1.1.0"
 KNOWLEDGE_TRACE_API_VERSION = "1.0.0"
@@ -320,6 +320,11 @@ class StrictReviewRequest(_Serializable):
     idempotency_key: str
     review_depth: str = "standard"
     carried_findings: tuple[CarriedFinding, ...] = ()
+    include_score: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.include_score, bool):
+            raise InvalidRequestError("include_score must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -373,6 +378,10 @@ class StrictReviewResult(_Serializable):
     recheck_missing: tuple[str, ...]
     stale: bool
     diagnostics: dict[str, Any]
+    review_claim_evidence: tuple[dict[str, Any], ...] = ()
+    review_score: dict[str, Any] | None = None
+    review_feedback_status: str = ""
+    finding_dispositions: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)

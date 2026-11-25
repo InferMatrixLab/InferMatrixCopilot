@@ -243,11 +243,12 @@ def worker_run(payload, settings, llm):
             git("add", "-A"); git("commit", "--allow-empty", "-qm", "frozen input")
             revisions.append(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip())
         state = {"playbook": "pr-review", "repo_path": str(repo), "diff_text": data["diff"],
+                 "defer_review_evidence": True, "pr_context_independent": data.get("pr_context_independent", False),
                  "pr_base_sha": revisions[0], "pr_head_sha": revisions[1],
                  "pr_context": data.get("context_text", ""), "gate_report": data.get("gate_report", ""),
                  "pr_state": data.get("pr_state", ""),
                  "task_spec": {"kind": "pr_review", "repo": data["repo"], "pr": data["pr"], "params": data.get("task_params", {})}}
-        settings = settings.model_copy(update={"improve_shadow": True, "run_root": Path("/tmp/runs"),
+        settings = settings.model_copy(update={"improve_shadow": True, "pr_context_source": "snapshot", "run_root": Path("/tmp/runs"),
                     "knowledge_dir": Path("/tmp/knowledge"), "skills_dir": Path("/candidate/skills"),
                     "playbooks_dir": Path("/candidate/playbooks"), "adapters_dir": Path("/candidate/adapters"), "memory_db": Path("/tmp/memory.db")})
         for path, content in data.get("knowledge_files", {}).items():
@@ -256,7 +257,9 @@ def worker_run(payload, settings, llm):
         ctx.run_dir.mkdir()
         result = asyncio.run(_review_diff(ctx))
         if not result.ok: raise ArtifactError(result.summary)
-        return {"review_text": result.outputs.get("review_text") or state.get("review_text", ""),
+        return {"review_publication_input": result.outputs["review_publication_input"],
+                "review_assessment_input": result.outputs["review_assessment_input"],
+                "review_text": result.outputs.get("review_text") or state.get("review_text", ""),
                 "review_comments": result.outputs.get("review_comments", []),
                 **{k: state.get(k) for k in ("review_summary", "review_verdict", "review_finding_dispositions", "review_carried_findings", "review_finding_rechecks", "review_recheck_missing")}}
     raise ArtifactError(f"worker has no driver {driver}")

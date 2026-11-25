@@ -55,6 +55,9 @@
 - briefing 只在 `profile_briefing_enabled` 时进 prompt（消融开关）。
 - 输出：base+extension schema、一轮修复、状态→FailureKind；预算耗尽会**强制最终答复**。
   全程 trace（`agent_dispatch`/`agent_output`）。
+- Strict 的每个调查可以返回 `claim_checks`。请求评分时还会返回 `dimension_ratings`。
+  重试和深度升级保留已获取的证据。reducer 独立合并调查记录，即使所有评论都被丢弃，
+  证据仍会进入固定版本的核验和结果输出。
 - ensemble reducer：逐编号候选做 keep/drop/dup、确定性组装、**未提及即保留**
   （fail-open）、共识门控的快路径。
 - **零产出的 lens 单独重问一次**（`ensemble_zero_yield_retry`），

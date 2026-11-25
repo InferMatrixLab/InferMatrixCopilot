@@ -330,6 +330,8 @@ def test_strict_facade_preserves_idempotency_and_hides_private_paths():
     assert "review_depth" not in core.requests[0]
     assert status.to_dict()["payload"]["progress"] == {"completed": {}}
     assert result.to_dict()["payload"]["result"] == {"verdict": "APPROVE"}
+    assert result.review.review_claim_evidence == ()
+    assert result.review.review_score is None
     assert result.payload["offset_seen"] == 12
     assert "report_path" not in result.payload
     assert runtime.capabilities().distribution_version == __version__
@@ -426,7 +428,7 @@ def test_strict_runtime_public_capabilities_smoke(tmp_path):
         caps = runtime.capabilities()
 
     assert caps.distribution_version == __version__
-    assert caps.strict_api_version == "1.4.0"
+    assert caps.strict_api_version == "1.5.0"
     assert caps.knowledge_api_version == KNOWLEDGE_API_VERSION
     assert caps.supports_knowledge_curation is True
 

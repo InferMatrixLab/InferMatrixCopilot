@@ -292,6 +292,8 @@ def build_review_result(run_dir: Path | str) -> dict[str, Any]:
         "reviewed_head_sha": str(updates.get("pr_head_sha") or ""),
         "verdict": str(updates.get("review_verdict") or ""),
         "summary_markdown": str(updates.get("review_summary") or ""),
+        **{field: updates[field] for field in ("review_claim_evidence", "review_score", "review_feedback_status")
+           if field in updates},
         "comments": sanitize_comments(updates.get("review_comments")),
         # Every candidate this review considered and what became of it. The
         # published `comments` above are the finalized set; this is the proof,

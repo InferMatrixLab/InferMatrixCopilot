@@ -138,3 +138,23 @@ Direct 1.1 / Strict 1.3 accept typed `CarriedFinding` inputs (unique IDs, source
 ## 自进化接入（2026-10-04）
 
 影子评审继承严格工具 scope；PR 文件、基础版本与历史工具只能读取冻结仓库，涉及生产写入的步骤由执行器拒绝。
+
+## Independent findings and publication
+
+`publication.py` derives the verdict from selected findings before applying
+thread suppression, the unit-test comment cap or the inline comment budget.
+Current-head rechecks may contribute a confirmed carried defect. An open recheck
+gap is reported and precludes an otherwise empty approval.
+
+`feedback.py` compares at most the latest 50 inline threads after candidate
+selection. Suppression requires an active, current RIGHT-side thread at the same
+path and line with matching concern text on the reviewed head. The review links
+the existing thread and retains its impact in the verdict. Missing feedback and
+a moved head preserve the independently selected findings. No-discussion and
+isolated snapshot reviews perform no GitHub feedback lookup.
+
+The host verifies claim evidence against the pinned source or raw CI log
+records tied to the reviewed revision. A verified acceptance requirement can
+affect the verdict. When the caller requests `include_score`, missing required
+artifacts zero the claim-evidence dimension. The scoring result explains a
+withheld total when the head is stale or material checks remain incomplete.

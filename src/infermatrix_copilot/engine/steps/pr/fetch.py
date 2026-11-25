@@ -223,15 +223,18 @@ def _clip(text: str, n: int = 700) -> str:
 def _pr_context_bundle(ctx: StepContext, repo: str, pr: int) -> str:
     """Assemble the PR-side evidence bundle (design W1): title/body/labels
     always; discussion comments, review summaries, and inline review comments
-    only in `pr_context_mode=full` (the eval-leakage policy: the frozen
+    only for PR quality tasks in `pr_context_mode=full` (the frozen
     dataset's ground truth IS the human review discussion, so arm runs export
     PR_CONTEXT_MODE=no_discussion); linked issues (fixes/closes #N in body or
     branch name, capped 2) in both modes. Every sub-fetch failure degrades to
     a note — this bundle must never block the review."""
     mode = str(getattr(ctx.settings, "pr_context_mode", "full") or "full")
+    include_discussion = mode == "full" and (ctx.state.get("task_spec") or {}).get("kind") == "pr_quality"
+    fields = "title,body,labels,headRefName,commits"
+    if include_discussion:
+        fields += ",comments,reviews"
     parts: list[str] = []
-    code, out = _gh(["pr", "view", str(pr), "--json",
-                     "title,body,labels,headRefName,comments,reviews,commits"],
+    code, out = _gh(["pr", "view", str(pr), "--json", fields],
                     cwd=repo)
     data: dict = {}
     if code == 0:
@@ -258,7 +261,7 @@ def _pr_context_bundle(ctx: StepContext, repo: str, pr: int) -> str:
         if subjects:
             parts.append("## Commit timeline (subjects only — the diff below "
                          "is the squashed net change)\n" + "\n".join(subjects))
-    if mode == "full" and data:
+    if include_discussion and data:
         comments = [f"@{c.get('author', {}).get('login', '?')}: {_clip(c.get('body'))}"
                     for c in _last_n(data.get("comments") or [])]
         if comments:
@@ -466,6 +469,7 @@ async def _pr_fetch_diff(ctx: StepContext) -> StepResult:
     # partial bundle on any sub-fetch failure; never blocks the run.
     pr_context = _pr_context_bundle(ctx, repo, int(pr))
     ctx.state["pr_context"] = pr_context
+    ctx.state["pr_context_independent"] = spec.get("kind") != "pr_quality"
     ctx.state["repo_path"] = wt_path
     ctx.state["checkout_note"] = note
     return StepResult(
@@ -473,6 +477,7 @@ async def _pr_fetch_diff(ctx: StepContext) -> StepResult:
         summary=f"fetched PR #{pr} diff ({len(out)} chars{diff_note}, context "
                 f"{len(pr_context)} chars); {note.split(' — ')[0]}",
         outputs={"state_updates": {"diff_text": out, "pr_context": pr_context,
+                                   "pr_context_independent": ctx.state["pr_context_independent"],
                                    "repo_path": wt_path,
                                    "checkout_note": note,
                                    "pr_head_sha": head_sha,

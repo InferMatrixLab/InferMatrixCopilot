@@ -52,10 +52,11 @@ def build_mcp(settings: Settings | None = None):
     @mcp.tool()
     def start_review(pr: int, repo: str = "", review_depth: str = "",
                      mode: Literal["eco", "performance"] = "eco",
-                     expected_head_sha: str = "") -> dict:
+                     expected_head_sha: str = "", include_score: bool = False) -> dict:
         """Start a read-only review of PR `pr` in eco or performance mode.
         Returns {run_id}; poll get_result. `review_depth` optionally pins the
         adaptive depth (light|standard|full|auto; policy-validated).
+        Set `include_score` when the user requests a numeric advisory score.
         `expected_head_sha` optionally pins the review to one snapshot: pass the
         full 40-hex head you observed and the run stops as stale rather than
         reviewing a different commit if the PR moved in between."""
@@ -64,6 +65,8 @@ def build_mcp(settings: Settings | None = None):
                      "pr": pr, "mode": mode}
         if review_depth:
             req["params"] = {"review_depth": review_depth}
+        if include_score:
+            req.setdefault("params", {})["include_score"] = include_score
         if expected_head_sha:
             req["expected_head_sha"] = expected_head_sha
         return _guard(lambda: {"run_id": core.start(req)})

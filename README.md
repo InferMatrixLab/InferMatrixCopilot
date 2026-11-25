@@ -150,6 +150,7 @@ Strict——运行完整 CLI 工作流：
 
 ```bash
 ./infermatrix-copilot -p "review pr 5172"
+./infermatrix-copilot --playbook pr-review --task-param pr=5172 --task-param include_score=true
 ./infermatrix-copilot -p "review pr 5172" --plan-only        # 只看计划不执行
 ./infermatrix-copilot -p "review pr 5172" --performance      # 用高能力模型档
 ```
@@ -158,6 +159,15 @@ Strict 在固定到 PR head 的 checkout 上运行，并按改动规模和风险
 `~/.infermatrix-copilot/runs/run-*/RUN_REPORT.md`。也可以在 MCP 宿主中说
 “Use InferMatrixCopilot in Strict mode to review …”；拿到 `run_id` 后，用
 `get_review_status` 和 `get_review_result` 轮询。
+
+Strict 根据改动承诺检查证据。性能比较需要同一工作负载下可比的原始记录，生成结果需要检查实际输出。
+报告会列出无法核实的主张。评审结论考虑所有独立核实的实质性发现。即使某个严重问题已有当前
+head 上的活跃讨论、无需再发一条行内评论，它仍可导致 `REQUEST CHANGES`。
+
+需要百分制评分时，CLI 可使用上面的 `include_score=true`，MCP 可传
+`review(..., mode="strict", include_score=true)`，SDK 可传 `StrictReviewRequest(..., include_score=True)`。
+评分默认关闭。结构化结果的 `review_claim_evidence` 给出证据检查，`review_score` 仅在请求时出现。
+有数值时它只供参考；head 已移动、无法复核或审查不完整时，报告列出原因并保留已支持的分项。
 
 ## 快速上手 2 · rebase
 
@@ -366,7 +376,7 @@ Agent 会先读取仓库约定、相关源码和知识，明确完成条件，�
 zero（`vllm-omni`），可传任何已接入仓库的短名、别名或 owner/name：
 
 - `review(target, repo="vllm-omni", mode="direct", post=false,
-  review_depth="", title="", body="", changed_files=[], repo_path="")`：
+  review_depth="", title="", body="", changed_files=[], repo_path="", include_score=false)`：
   Direct 返回至多 3 条精确知识路由和审查门禁；Strict 返回 `run_id`。
   `repo_path` 可临时指定 Strict 使用的本地 checkout。
 - `validate_direct_review(subtraction_signal, subtraction?,

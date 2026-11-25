@@ -164,7 +164,7 @@ def git(repo: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
     return out.returncode, (out.stdout + out.stderr).strip()
 
 
-def gh_read_tools(repo: Path | None) -> dict:
+def gh_read_tools(repo: Path | None, *, issue_comments: bool = True) -> dict:
     """Read-only gh tools for agent steps (int-coerced args — no injection)."""
     from ...tools import ToolDef
 
@@ -184,7 +184,7 @@ def gh_read_tools(repo: Path | None) -> dict:
     def gh_issue_view(issue, **_: object) -> str:
         """Tool handler: return issue `issue`'s title/body/labels/comments as
         JSON text."""
-        return _view("issue", issue, "title,body,labels,comments")
+        return _view("issue", issue, "title,body,labels,comments" if issue_comments else "title,body,labels")
 
     def gh_ci_read(pr, **_: object) -> str:
         """Tool handler: return PR `pr`'s CI checks (name/state/bucket) as JSON

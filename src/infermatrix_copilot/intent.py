@@ -149,12 +149,25 @@ def repo_identity(alias: str, settings) -> str | None:
     return _remote_full_name(str(path)) if path else None
 
 
-def _depth_param(text: str) -> dict:
+_SCORE_REQUEST = re.compile(
+    r"(?:\bwith|(?:^|[,;]|\band)\s*(?:please\s+)?(?:include|give|provide|return|add))"
+    r"\s+(?:me\s+)?(?:an?\s+)?(?:numeric(?:al)?\s+)?score\b"
+    r"|\bscore (?:it|this (?:PR|review))\b|(?:请|并|同时|给它|给这个\s*PR)\s*(?:打分|评分)|给(?:出)?(?:一个)?(?:数值)?评分",
+    re.IGNORECASE)
+_SCORE_NEGATED = re.compile(
+    r"\b(?:no|without|omit|skip|never|not|don't)\b[^,.;]{0,24}\bscor(?:e|ing)\b"
+    r"|(?:不[要用需]?|无需|别)\s*(?:打分|评分)", re.IGNORECASE)
+
+
+def _review_params(text: str) -> dict:
+    params = {}
+    if _SCORE_REQUEST.search(text) and not _SCORE_NEGATED.search(text):
+        params["include_score"] = True
     if _DEPTH_FULL.search(text):
-        return {"review_depth": "full"}
-    if _DEPTH_LIGHT.search(text):
-        return {"review_depth": "light"}
-    return {}
+        params["review_depth"] = "full"
+    elif _DEPTH_LIGHT.search(text):
+        params["review_depth"] = "light"
+    return params
 
 
 def validate_spec(spec: TaskSpec) -> str:
@@ -162,6 +175,9 @@ def validate_spec(spec: TaskSpec) -> str:
     run_task, playbook params): return a typed error message, or '' when the
     spec can actually run. Applied BEFORE a run is created so failures are
     upfront, not a BLOCKED fetch step later."""
+    if "include_score" in spec.params:
+        if spec.kind != "pr_review" or not isinstance(spec.params["include_score"], bool):
+            return "include_score must be a boolean on a PR review"
     if spec.kind == "pr_review" and not spec.pr:
         return "review needs a PR number or URL (e.g. `review pr 5134`)"
     if spec.kind in ("pr_rebase", "pr_debug") and not spec.pr:
@@ -181,7 +197,7 @@ def pre_parse(text: str, settings) -> IntentResult | None:
     if not text:
         return None
     mode = "performance" if _wants_performance(text) else "eco"
-    params = _depth_param(text)
+    params = _review_params(text)
     post = _wants_post(text)
 
     m = _GH_URL.search(text)
@@ -378,7 +394,8 @@ def _parse_llm(text: str, llm: LLM, default_repo: str, model: str | None) -> Int
     depth = str(obj.get("review_depth") or "").lower()
     if depth in _VALID_DEPTHS:
         params["review_depth"] = depth
-    params.update(_depth_param(text))  # deterministic phrase wins over the LLM
+    if obj.get("kind") == "pr_review":
+        params.update(_review_params(text))
     try:
         return IntentResult(spec=TaskSpec(
             kind=obj["kind"], mode=mode, repo=default_repo, pr=obj.get("pr"),

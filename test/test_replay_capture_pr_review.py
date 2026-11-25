@@ -1,6 +1,7 @@
 """Oversize replay capture preserves the PR review release boundary."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -56,3 +57,16 @@ def test_oversize_review_replay_never_executes_or_becomes_dataset_input(tmp_path
     assert any(r['result'].get('type') == 'replay_capture_missing' for r in records)
     assert objectives.collect(settings, store, WORKFLOW) == 0
     assert objectives.rows(settings, WORKFLOW) == []
+
+
+@pytest.mark.parametrize("carried", [False, True])
+def test_incompatible_worker_uses_native_before_model_spend(tmp_path, settings, monkeypatch, carried):
+    root = Path(__file__).resolve().parents[1] if carried else tmp_path
+    store = TraceStore(tmp_path / "traces", environ={})
+    frozen = {"repo": "demo", "pr": 1, "head_sha": "a" * 40,
+              "task_params": {"carried_findings": [{"finding_id": "previous"}]} if carried else {}}
+    monkeypatch.setattr(runtime, "active", lambda _: {"workflows": [WORKFLOW], "artifact": str(root)})
+    monkeypatch.setattr(runtime, "freeze_review", lambda *_: frozen)
+    monkeypatch.setattr(runtime, "execute", lambda *_: pytest.fail("incompatible worker reached model execution"))
+    with bind_store(store):
+        assert asyncio.run(runtime.review_step(SimpleNamespace(settings=settings, state={}))) is None
