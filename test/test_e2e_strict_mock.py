@@ -26,6 +26,7 @@ from infermatrix_copilot.engine import worktrees as wt_mod
 from infermatrix_copilot.engine.agent_runtime import BASE_OUTPUT_SCHEMA
 from infermatrix_copilot.engine.steps import _common as common_mod
 from infermatrix_copilot.engine.steps.pr import fetch as fetch_mod
+from infermatrix_copilot.engine.steps.review import claim_evidence, feedback
 from infermatrix_copilot.llm import Block, Reply
 from infermatrix_copilot.mcp_server import CopilotMCP
 
@@ -169,6 +170,8 @@ def strict(settings, tmp_path, monkeypatch):
 
     monkeypatch.setattr(fetch_mod, "_gh", _fake_gh(head))
     monkeypatch.setattr(common_mod, "gh", _fake_gh(head))
+    monkeypatch.setattr(feedback, "gh", _fake_gh(head))
+    monkeypatch.setattr(claim_evidence, "gh", _fake_gh(head))
     # PR-time worktrees default to ~/.infermatrix-copilot/worktrees, which is a
     # developer's real scratch directory. A test must never materialize into it.
     monkeypatch.setattr(wt_mod.Path, "home", staticmethod(lambda: tmp_path))

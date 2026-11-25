@@ -3,6 +3,7 @@ shapes are recorded from a live zcode 0.16.9 run (2026-09-30)."""
 
 import json
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -476,6 +477,16 @@ def test_workspace_mcp_trust_digest_golden():
                                                       server)
     assert digest == ("f5f218c5e9d36908b100ef3a0bb57f3be12b19d4"
                       "fc3f271d5a27e0e82f3ba633")
+
+
+def test_workspace_mcp_trust_requires_lock_before_writing(tmp_path, monkeypatch):
+    from infermatrix_copilot.engine.lifecycle import FileLockingUnavailable
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    monkeypatch.setattr(zcode_mod, "sanitized_env", lambda: {"HOME": str(tmp_path)})
+    with pytest.raises(FileLockingUnavailable, match="ZCode workspace MCP trust"):
+        ZCodeTransport._seed_workspace_mcp_trust(tmp_path / "session", "server", {})
+    assert not (tmp_path / ".zcode").exists()
 
 
 def test_workspace_mcp_trust_seed_is_idempotent_and_prunes_dead_sessions(

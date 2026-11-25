@@ -25,6 +25,9 @@ argv 单参数上限 128KiB）。`--mode` 按调用选：一次性调用用 `pla
 实时交付原生事件，`supports_native_events=True`。`native_snapshot()` 只返回提供方实际报告的
 用量与模型；缺失的 token、缓存和 USD 字段保持未知，不补造零值。
 
+RFC 的错误分类和无工具调用可在缺少 `fcntl` 的平台上导入。写入工作区 MCP
+信任记录前必须取得 POSIX 文件锁；缺少锁支持时抛出 `FileLockingUnavailable`。
+
 ## 不变量（**C1**、**C2**）
 - **会话 cwd 永远是自有临时目录，不是 PR worktree。** zcode 从 cwd 加载 `.env`，并从 cwd
   往上到 git 根发现 `zcode.json` / `.zcode/config.json`，项目配置里的 stdio MCP server 会被

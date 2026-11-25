@@ -64,7 +64,6 @@ OAuth login under HOME (``~/.zcode/v2``)."""
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -269,6 +268,11 @@ class ZCodeTransport(HarnessTransport):
         to the host's workspace MCP trust store. Best effort: on failure the
         bridge stays untrusted and the engine's bridge-lifecycle check
         surfaces it — never a silent pass."""
+        try:
+            import fcntl
+        except ImportError as exc:
+            from ..engine.lifecycle import FileLockingUnavailable
+            raise FileLockingUnavailable("ZCode workspace MCP trust requires POSIX file locking (fcntl)") from exc
         home = Path(sanitized_env().get("HOME") or Path.home())
         store = home.joinpath(*_TRUST_STORE_REL)
         record = {
