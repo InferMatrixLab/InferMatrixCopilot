@@ -1,6 +1,6 @@
 # engine/steps/_common.py —— 规范
 
-<!-- verified-against: 2026-09-26 -->
+<!-- verified-against: 2026-11-25 -->
 
 `LOC ~300 · step 库基础设施 · refactor-status: ok`
 
@@ -61,3 +61,7 @@ step 样板的收敛就落在这个文件。`require_repo`（K3）、`no_llm_gap
   `store_for(adapter)`（K3）。
 已落地与待抽取的每一个都必须**保住它所包裹的那条保证**（B1 类型化返回、B2 交接、
 E2 `capability_gap` 事件）。**只在 ≥2 个真实现场时才抽取**。
+
+Strict review passes `issue_comments=False` to `gh_read_tools`. Its issue reader
+can inspect issue title, body and labels without exposing conversation on a PR
+addressed by the same number. Issue workflows retain the default comment access.

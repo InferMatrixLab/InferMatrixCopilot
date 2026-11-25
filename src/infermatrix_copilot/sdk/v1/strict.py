@@ -60,6 +60,9 @@ def _review_result(raw: Any) -> StrictReviewResult | None:
     complete = raw.get("rechecks_complete", False)
     if not isinstance(complete, bool):
         raise ResultDecodeError("rechecks_complete must be a boolean")
+    score = raw.get("review_score")
+    if score is not None and not isinstance(score, dict):
+        raise ResultDecodeError("review_score must be an object")
     return StrictReviewResult(
         contract_version=str(raw.get("contract_version") or ""),
         reviewed_head_sha=str(raw.get("reviewed_head_sha") or ""),
@@ -70,6 +73,10 @@ def _review_result(raw: Any) -> StrictReviewResult | None:
         finding_rechecks=tuple(rechecks),
         rechecks_complete=complete,
         recheck_missing=tuple(missing),
+        review_claim_evidence=_object_rows(raw.get("review_claim_evidence"), "review_claim_evidence"),
+        review_score=score,
+        review_feedback_status=str(raw.get("review_feedback_status") or ""),
+        finding_dispositions=_object_rows(raw.get("finding_dispositions"), "finding_dispositions"),
         stale=bool(raw.get("stale", False)),
         diagnostics=_diagnostics(raw.get("diagnostics")),
     )
@@ -166,6 +173,8 @@ class StrictRuntime:
             "repo_path": request.repo_path,
             "idempotency_key": request.idempotency_key,
         }
+        if request.include_score:
+            payload["params"]["include_score"] = True
         run_id, created = self._core.reserve_strict_review(payload)
         return StrictRunHandle(run_id=str(run_id), created=bool(created))
 

@@ -1,6 +1,6 @@
 # mcp_server.py —— 规范
 
-<!-- verified-against: 2026-09-26 -->
+<!-- verified-against: 2026-11-25 -->
 
 `MCP 协议适配器 · refactor-status: ok`
 
@@ -18,7 +18,7 @@
 `CopilotMCP` 是 `RunService` 的兼容别名；`build_mcp()` 注册 start/poll 工具，外加
 `get_capabilities()`（包 `contract.capabilities`，含
 `MAX_STRICT_WORKERS=1` 与文件锁能力上报）。`start_review` 接受
-`expected_head_sha`；`start_strict_review` 接受 `idempotency_key` 并把
+`expected_head_sha` 及默认关闭的 `include_score`；`start_strict_review` 接受 `idempotency_key` 并把
 `(run_id, created)` 语义（见下）落到入队决定上。新增内部
 `reserve_strict_review` 原样返回该 tuple，供 typed SDK 准确报告幂等复用；
 `start_strict_review` 继续只返 `run_id`，保持 MCP/既有调用兼容；

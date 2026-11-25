@@ -15,17 +15,19 @@ import asyncio
 import json
 import re
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from ....review.planner import DEFAULT_STANDARD_LENSES, DEPTHS, plan_review
 from ....ut_coverage import UTCoverageRules, analyze as _ut_analyze
-from ....ut_coverage import cap_gap_comments, render as _ut_render
+from ....ut_coverage import render as _ut_render
 from ...step import FailureKind, StepContext, StepResult
 from .._common import gh_read_tools as _gh_read_tools
 from .._common import repo_path as _repo_path
 from .._common import step
-from .anchor import resolve_review_comments
+from .claim_evidence import CLAIMS, RATINGS, ReviewRecords, apply_review_evidence
+from .feedback import independent_context
+from .publication import finalize_review_publication
 from .repo_tools import review_repo_tools
 from .refinement import refine_review
 from .prompts import (
@@ -36,15 +38,7 @@ from .prompts import (
     _REVIEW_MERGE,
     _REVIEW_SYSTEM,
 )
-from .utils import (
-    _SEVERITY_ORDER,
-    _render_review_md,
-    _render_review_summary,
-    _review_verdict,
-    disposition_records,
-    finalize_review_dispositions,
-    _sweep_targets,
-)
+from .utils import _sweep_targets
 
 
 # Planner causes that are NOT a capability gap: no client configured at all, and
@@ -158,6 +152,9 @@ async def _review_diff(ctx: StepContext) -> StepResult:
         ctx.trace.record("review_ut_candidates", step="agent.review_diff",
                          **ut_report.to_dict())
 
+    pr_context = str(ctx.state.get("pr_context") or "")
+    if not ctx.state.get("pr_context_independent"):
+        pr_context = independent_context(pr_context)
     common = dict(
         step_name="agent.review_diff",
         purpose=f"Review PR #{spec.get('pr')} like an engaged maintainer: "
@@ -167,7 +164,7 @@ async def _review_diff(ctx: StepContext) -> StepResult:
                  "evidence/disposition; APPROVE-equivalent = empty "
                  "review_comments with a summary.",
         evidence={"pr_diff": str(diff),
-                  "pr_context": ctx.state.get("pr_context", ""),
+                  "pr_context": pr_context,
                   "gate_report": ctx.state.get("gate_report", ""),
                   "sweep_targets": _sweep_targets(str(diff), language),
                   "changed_symbol_consumers": await asyncio.to_thread(
@@ -183,9 +180,25 @@ async def _review_diff(ctx: StepContext) -> StepResult:
                           "no_issue — only publish is published, kind: "
                           "optional, `untested_api` only for a missing unit "
                           "test on a listed untested-function candidate}"},
-        extra_tools={**_gh_read_tools(_repo_path(ctx)),
+        extra_tools={**_gh_read_tools(_repo_path(ctx), issue_comments=False),
                      **review_repo_tools(_repo_path(ctx), str(ctx.state.get('pr_base_sha') or ''))},
     )
+    records = ReviewRecords(_repo_path(ctx), ctx.state.get("pr_head_sha", ""),
+                            ctx.state.get("pr_base_sha", ""),
+                            getattr(ctx.settings, "pr_context_source", "live") != "snapshot")
+    if records.repo and records.live:
+        common["extra_tools"]["read_review_ci"] = records.log_tool()
+    common["output_extension"]["claim_checks"] = CLAIMS
+    common["guidance"] += (
+        "\nInvestigate the PR's acceptance claims and report claim_checks independently of "
+        "review_comments. A breached acceptance requirement belongs in the usual findings. "
+        "Verify applicable outputs and matching raw records at the pinned revision. "
+        "Issues, comments and CI badges alone do not establish a measured result."
+    )
+    common["evidence"]["review_revisions"] = f"Base: {records.base}\nHead: {records.head}"
+    if (spec.get("params") or {}).get("include_score") is True:
+        common["output_extension"]["dimension_ratings"] = RATINGS
+    light_output = {}
     plan = None
     if not ctx.settings.review_ensemble:   # legacy kill-switch: single pass
         result, output = await run_agent_step(ctx, **common)
@@ -231,7 +244,7 @@ async def _review_diff(ctx: StepContext) -> StepResult:
             # protocol; measured, that cost it ~70% of its anchored findings
             result, output = await run_agent_step(
                 ctx, max_iters=ctx.settings.review_light_max_iters,
-                **{**common, "guidance": guidance + _REVIEW_LIGHT_PROTOCOL})
+                **{**common, "guidance": common["guidance"] + _REVIEW_LIGHT_PROTOCOL})
             if ctx.settings.review_light_zero_yield_escalate \
                     and not (output.get("review_comments") or []):
                 # Silence from the cheapest tier is the one result it is least
@@ -240,6 +253,7 @@ async def _review_diff(ctx: StepContext) -> StepResult:
                 ctx.trace.record("review_depth_escalated", step="agent.review_diff",
                                  depth_from="light", depth_to="standard",
                                  reason="light pass returned no findings")
+                light_output = output
                 plan = replace(plan, depth="standard",
                                lens_names=DEFAULT_STANDARD_LENSES,
                                reason=plan.reason + "; escalated: light found nothing")
@@ -283,6 +297,11 @@ async def _review_diff(ctx: StepContext) -> StepResult:
                 result, output = await run_agent_step_ensemble(
                     ctx, lenses=lenses, merge_key="review_comments",
                     merge_guidance=_REVIEW_MERGE, **common)
+    if light_output:
+        from ...agent_runtime.ensemble import retain_review_assessments
+
+        retain_review_assessments(light_output, output)
+    assessment_partial = not result.ok or bool(output.get("_assessment_incomplete"))
     if not result.ok and output.get("review_comments"):
         # A review that FOUND defects is a successful review whose verdict is
         # REQUEST CHANGES — not a failed step. Agents conflate the PR's
@@ -304,76 +323,6 @@ async def _review_diff(ctx: StepContext) -> StepResult:
             ctx, output, common=common, diff=str(diff), spec=spec,
             depth=plan.depth,
         )
-    # deterministic comment budget: severity-ordered, corroboration-aware,
-    # capped at 8 — the low-signal tail goes first (reducers ignored a
-    # prompted cap; the cap is a product budget, so it applies to every
-    # depth). The old 5-comment, severity-only cut deleted reducer-KEPT
-    # findings that were literal maintainer concerns on large PRs, while a
-    # nit-heavy unconditional overflow read as noise to the blind judge.
-    # Within a severity, findings corroborated by more independent lenses go
-    # first; the overflow tail renders on evidence-rich reviews (≥2
-    # major/blocker) or for individually verify-confirmed cut comments — a
-    # quiet PR with an unverified tail stays terse (a thin-GT val item
-    # rendering 12 findings lost 3/3 on noise).
-    # Apply the review's OWN selection before anything else reads the list.
-    # It runs ahead of the budget below so a withheld candidate cannot occupy
-    # one of the eight publishable slots, and ahead of every renderer so the
-    # summary, the body and the inline comments are all made from the same
-    # finalized set (#141).
-    all_candidates = list(output.get("review_comments") or [])
-    published, withheld = finalize_review_dispositions(output)
-    # at most three untested-function comments; the rest are named, not lost
-    published, ut_dropped = cap_gap_comments(published, ut_report)
-    output["review_comments"] = published
-    output["_withheld_findings"] = withheld
-    comments = sorted(output.get("review_comments") or [],
-                      key=lambda c: (_SEVERITY_ORDER.get(
-                          str(c.get("severity", "minor")).lower(), 2),
-                          -len(c.get("corroborated_by") or [])))
-    for c in comments:
-        c.pop("corroborated_by", None)
-    output["review_comments"] = comments[:8]
-    final_selection = [
-        (c.get("file"), c.get("line"), c.get("comment"), c.get("severity"))
-        for c in output["review_comments"]
-    ]
-    if sorted(draft_selection, key=repr) != sorted(final_selection, key=repr):
-        # The reducer's prose describes its draft selection. After promotion,
-        # verification or a budget cut it may contradict the published set.
-        # Let the renderer derive a truthful summary from the final comments.
-        output["summary"] = ""
-    if ut_dropped:
-        output["summary"] = (str(output.get("summary") or "").rstrip()
-                             + "\n\nAlso without a unit test: "
-                             + ", ".join(f"`{n}`" for n in ut_dropped) + ".").lstrip()
-    # Recorded AFTER the cut: a candidate the review chose to publish but the
-    # budget dropped is `over_budget`, never `excluded`. A consumer checking
-    # that no withheld finding was published must not trip over a healthy
-    # review whose ninth comment simply did not fit.
-    output["_finding_dispositions"] = disposition_records(
-        all_candidates, output["review_comments"])
-    if withheld:
-        ctx.trace.record(
-            "finding_dispositions",
-            withheld=len(withheld),
-            published=len(output["review_comments"]),
-            dispositions=[r["disposition"]
-                          for r in output["_finding_dispositions"]],
-        )
-    rich = sum(1 for c in comments[:8]
-               if _SEVERITY_ORDER.get(str(c.get("severity", "minor")).lower(),
-                                      2) <= _SEVERITY_ORDER["major"]) >= 2
-    # Overflow renders on evidence-rich reviews (unchanged), and ALSO for any
-    # cut comment the verify pass individually CONFIRMED on the tree — wave-2
-    # forensics measured three verify-confirmed findings (one echoing the GT
-    # thread) silently dying here because the kept eight were minors and the
-    # rich gate never opened. A confirmed tail is evidence, not noise; the
-    # unverified tail still renders only on rich reviews.
-    output["_review_overflow"] = [
-        c for c in comments[8:]
-        if _SEVERITY_ORDER.get(str(c.get("severity", "minor")).lower(), 2)
-        <= _SEVERITY_ORDER["minor"]
-        and (rich or c.get("_verified"))][:4]
     if plan is not None:
         result.outputs["review_plan"] = {"depth": plan.depth,
                                          "planner": plan.planner,
@@ -407,47 +356,31 @@ async def _review_diff(ctx: StepContext) -> StepResult:
             str(ctx.state.get("pr_head_sha") or ""),
         )
     if result.ok:
-        # Derive each finding's line from its quoted snippet BEFORE rendering: the
-        # review body prints `file:line` too, so resolving later (at publish) would
-        # show one position in the body and anchor the inline thread at another.
-        if output.get("review_comments"):
-            resolved, anchor_stats = resolve_review_comments(
-                output["review_comments"], str(ctx.state.get("diff_text") or ""))
-            output["review_comments"] = resolved
-            ctx.trace.record("anchor_resolution", **anchor_stats)
-        review_md = _render_review_md(output,
-                                      pr_state=str(ctx.state.get("pr_state", "")))
-        review_summary = _render_review_summary(
-            output, pr_state=str(ctx.state.get("pr_state", "")))
-        review_comments = output.get("review_comments") or []
-        # The verdict has existed only as a rendered `**Verdict:** …` line inside
-        # the Markdown. A machine consumer would have to scrape it back out of
-        # prose to learn the outcome, so publish it as a field — from the SAME
-        # helper the renderer calls, never a second copy of the calibration rules.
-        review_verdict = _review_verdict(
-            review_comments, str(ctx.state.get("pr_state", "")))
-        ctx.state.update({
-            "review_text": review_md,
-            "review_summary": review_summary,
-            "review_comments": review_comments,
-            "review_verdict": review_verdict,
-        })
-        result.outputs["review_text"] = review_md
-        result.outputs["review_summary"] = review_summary
-        result.outputs["review_comments"] = review_comments
-        result.outputs.setdefault("state_updates", {}).update({
-            "review_text": review_md,
-            "review_summary": review_summary,
-            "review_comments": review_comments,
-            "review_verdict": review_verdict,
-            # The audit trail crosses the contract with the result: a
-            # consumer can prove the published set IS the finalized set.
-            "review_finding_dispositions": output.get("_finding_dispositions") or [],
+        packet = {
+            "review_comments": output.get("review_comments") or [],
+            "findings": output.get("findings") or [],
+            "summary": output.get("summary") or "",
+            "draft_selection": draft_selection,
+            "ut_candidates": [asdict(d) for d in ut_report.candidates] if ut_report else [],
+        }
+        updates = result.outputs.setdefault("state_updates", {})
+        updates.update(await finalize_review_publication(ctx, packet, carried, rechecks, recheck_missing))
+        updates.update({
             "review_carried_findings": carried,
             "review_finding_rechecks": rechecks,
             "review_recheck_missing": recheck_missing,
         })
+        if ctx.state.get("defer_review_evidence"):
+            result.outputs["review_publication_input"] = packet
+            result.outputs["review_assessment_input"] = {
+                "claim_checks": output.get("claim_checks"),
+                "dimension_ratings": output.get("dimension_ratings"), "partial": assessment_partial,
+            }
+        else:
+            await apply_review_evidence(ctx, output, updates, partial=assessment_partial, records=records)
+        ctx.state.update(updates)
+        result.outputs.update(updates)
         depth_note = f"; depth={plan.depth} via {plan.planner}" if plan else ""
-        result.summary = (f"review produced ({len(output.get('review_comments') or [])} "
+        result.summary = (f"review produced ({len(updates['review_comments'])} "
                           f"comments{depth_note}) — {result.summary}")
     return result

@@ -151,8 +151,10 @@ def test_ensemble_empty_merge_reply_falls_open_without_repair(settings, trace,
         contract(items=[{"name": "y"}]),
         Reply(blocks=[Block(type="text", text="")]),   # reducer returns nothing
     ])
-    result, output = _run(_ctx(settings, trace, tmp_path, llm=llm))
+    result, output = _run(_ctx(settings, trace, tmp_path, llm=llm),
+                          output_extension={"items": "list", "claim_checks": "list"})
     assert result.ok
+    assert output["_assessment_incomplete"] is True
     assert [i["name"] for i in output["items"]] == ["x", "x2", "y"]  # union
     assert len(llm.calls) == 3  # no repair call happened
 
@@ -1472,3 +1474,20 @@ def test_an_unrouted_dead_tier_is_not_re_asked(settings, trace, tmp_path,
         lenses=[{"name": "b", "focus": "look at B"}], merge_key="items",
         output_extension={"items": "list"}))
     assert len(seen) == 1, f"a dead unrouted tier must not be re-asked: {seen}"
+
+
+def test_reducer_keeps_evidence_from_each_investigator_when_it_drops_all_comments(settings, trace, tmp_path):
+    settings.ensemble_parallel = False
+    llm = ScriptedLLM([
+        contract(items=[{"name": "a"}], claim_checks=[{"claim": "raw output"}],
+                 dimension_ratings=[{"dimension": "validation"}]),
+        contract(items=[{"name": "b"}], claim_checks=[{"claim": "comparison"}],
+                 dimension_ratings=[{"dimension": "claim_evidence"}]),
+        verdicts_reply({"i": 0, "action": "drop"}, {"i": 1, "action": "drop"}),
+    ])
+    _, output = _run(_ctx(settings, trace, tmp_path, llm=llm),
+                     output_extension={"items": "list", "claim_checks": "list", "dimension_ratings": "list"})
+    assert output["items"] == []
+    assert output["_assessment_incomplete"] is False
+    assert [r["claim"] for r in output["claim_checks"]] == ["raw output", "comparison"]
+    assert [r["dimension"] for r in output["dimension_ratings"]] == ["validation", "claim_evidence"]

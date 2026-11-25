@@ -26,6 +26,7 @@ from infermatrix_copilot.engine import worktrees as wt_mod
 from infermatrix_copilot.engine.agent_runtime import BASE_OUTPUT_SCHEMA
 from infermatrix_copilot.engine.steps import _common as common_mod
 from infermatrix_copilot.engine.steps.pr import fetch as fetch_mod
+from infermatrix_copilot.engine.steps.review import claim_evidence, feedback
 from infermatrix_copilot.llm import Block, Reply
 from infermatrix_copilot.mcp_server import CopilotMCP
 
@@ -169,6 +170,8 @@ def strict(settings, tmp_path, monkeypatch):
 
     monkeypatch.setattr(fetch_mod, "_gh", _fake_gh(head))
     monkeypatch.setattr(common_mod, "gh", _fake_gh(head))
+    monkeypatch.setattr(feedback, "gh", _fake_gh(head))
+    monkeypatch.setattr(claim_evidence, "gh", _fake_gh(head))
     # PR-time worktrees default to ~/.infermatrix-copilot/worktrees, which is a
     # developer's real scratch directory. A test must never materialize into it.
     monkeypatch.setattr(wt_mod.Path, "home", staticmethod(lambda: tmp_path))
@@ -330,3 +333,94 @@ def test_a_key_reused_for_a_different_pr_is_refused(strict):
     assert strict.run(run_id) == 0
     with pytest.raises(idem.IdempotencyError, match="different request"):
         strict.start(pr=8, idempotency_key="k")
+
+
+def _scored_reciprocal_reply():
+    proof = {"path": "feature.py", "quote": "return 1 / x"}
+    ratings = {"scope": 3, "correctness": 0, "validation": 1, "claim_evidence": 3, "simplicity": 3}
+    return _review_reply(
+        review_comments=[FINDING],
+        claim_checks=[{"claim": "The helper returns a reciprocal", "kind": "source",
+                       "status": "verified", "reason": "Checked the implementation.", "records": [proof]}],
+        dimension_ratings=[{"dimension": dimension, "rating": rating, "reason": "Checked the reciprocal path.", **proof}
+                           for dimension, rating in ratings.items()],
+    )
+
+
+@pytest.mark.parametrize("include_score,head_moves", [(False, False), (True, False), (True, True)])
+def test_sdk_returns_pinned_claim_evidence_and_opt_in_score(strict, include_score, head_moves, monkeypatch):
+    from dataclasses import replace
+    from infermatrix_copilot.sdk.v1 import RepositoryRef, StrictReviewRequest, StrictRuntime
+
+    strict.llm._replies = [_scored_reciprocal_reply()]
+    if head_moves:
+        def live_gh(args, cwd=None):
+            head = "b" * 40 if strict.llm.calls else strict.head
+            return _fake_gh(head)(args, cwd=cwd)
+        monkeypatch.setattr(fetch_mod, "_gh", live_gh)
+    runtime = object.__new__(StrictRuntime)
+    runtime._core = strict.core
+    request = StrictReviewRequest(RepositoryRef("widget"), 7, strict.head, "", "score-attempt",
+                                  review_depth="light", include_score=include_score)
+    run_id = runtime.reserve_review(request).run_id
+    assert strict.run(run_id) == 0
+    response = runtime.get_result(run_id)
+    assert response.review.verdict == "REQUEST CHANGES"
+    assert response.review.stale is head_moves
+    if head_moves:
+        assert response.payload["result"]["actual_head_sha"] == "b" * 40
+    assert response.review.review_claim_evidence[0]["status"] == "verified"
+    assert "The helper returns a reciprocal" in response.payload["report"]
+    assert response.review.finding_dispositions[0]["disposition"] == "publish"
+    if include_score:
+        score = response.review.review_score
+        assert score["reviewed_head_sha"] == strict.head
+        assert score["total"] == (None if head_moves else 62)
+        assert ("withheld" if head_moves else "62/100") in response.payload["report"]
+    else:
+        assert response.review.review_score is None
+        assert "review_score" not in response.payload["result"]
+        assert "Advisory score" not in response.payload["report"]
+
+    with pytest.raises(idem.IdempotencyError, match="different request"):
+        runtime.reserve_review(replace(request, include_score=not include_score))
+
+
+def test_frozen_worker_finalizes_against_original_head(strict, tmp_path, monkeypatch):
+    import asyncio
+    from infermatrix_copilot.engine.step import StepContext
+    from infermatrix_copilot.improve import drivers, runtime
+    from infermatrix_copilot.run_trace import RunTrace
+    from infermatrix_copilot.trace_store import TraceStore, bind_store
+
+    settings = strict.core.settings
+    settings.knowledge_dir = tmp_path / "fixture-knowledge"
+    state = {
+        "task_spec": {"kind": "pr_review", "pr": 7, "repo": "widget", "params": {"include_score": True}},
+        "repo_path": str(strict.work), "pr_head_sha": strict.head, "pr_base_sha": _git("rev-parse", "main", cwd=strict.work),
+        "diff_text": _git("diff", "main", strict.head, cwd=strict.work),
+        "pr_context": "PR description\n## Review summaries\nOLD REVIEWER TEXT",
+    }
+    strict.llm._replies = [_scored_reciprocal_reply()]
+    entry = {"workflows": ["pr-review.agent.review_diff"], "artifact": str(REPO_ROOT)}
+    monkeypatch.setattr(runtime, "active", lambda _: entry)
+    # The production worker owns /tmp inside its sandbox. Redirect that private
+    # root under pytest while exercising the real worker and its synthetic Git tree.
+    worker_root = tmp_path / "worker"
+    worker_root.mkdir()
+    monkeypatch.setattr(drivers, "Path", lambda path: worker_root / Path(path).name)
+
+    def isolated_worker(_settings, _store, _workflow, frozen, llm):
+        assert "OLD REVIEWER TEXT" not in frozen["context_text"]
+        return drivers.worker_run({"driver": "pr-review", "input": frozen}, _settings, llm)
+
+    monkeypatch.setattr(runtime, "execute", isolated_worker)
+    context = StepContext(settings, state, {}, tmp_path, RunTrace(tmp_path / "live.jsonl"), strict.llm)
+    with bind_store(TraceStore(tmp_path / "store", environ={})):
+        result = asyncio.run(runtime.review_step(context))
+    assert result.ok
+    assert _git("rev-parse", "HEAD", cwd=worker_root / "repository") != strict.head
+    assert result.outputs["review_score"]["reviewed_head_sha"] == strict.head
+    assert result.outputs["review_score"]["total"] == 62
+    assert result.outputs["review_claim_evidence"][0]["status"] == "verified"
+    assert len(strict.llm.calls) == 1

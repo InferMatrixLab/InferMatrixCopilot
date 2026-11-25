@@ -1,6 +1,6 @@
 # thin_mcp_server.py —— 规范
 
-<!-- verified-against: 2026-11-04 -->
+<!-- verified-against: 2026-11-25 -->
 
 `LOC ~490 · 默认 MCP：Direct 门面 + Strict 入口 · refactor-status: ok`
 
@@ -19,6 +19,7 @@
 `get_workflow` / `get_update_status`。
 
 ## 公开契约
+Strict 的 `review(..., include_score=true)` 请求参考分数，分页结果保留证据明细和可选评分。
 上述工具；`build_mcp(...)`；`main()`。`review(knowledge_profile="adaptive")`
 返回单一实际 `model_content` 和不重复正文的引用；默认 `legacy` 保持旧契约。
 会话工具累积预算，跨仓库目标只在主机授权与 confirmed 固定依赖同时成立时可读；

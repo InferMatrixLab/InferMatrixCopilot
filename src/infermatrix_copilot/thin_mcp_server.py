@@ -221,6 +221,7 @@ def _strict_review_request(
     expected_head_sha: str = "",
     repo_path: str = "",
     idempotency_key: str = "",
+    include_score: bool = False,
 ) -> dict:
     """Translate the Strict public surface to the internal review TaskSpec."""
     target = str(target).strip()
@@ -255,6 +256,8 @@ def _strict_review_request(
     }
     if review_depth:
         request["params"] = {"review_depth": review_depth}
+    if include_score:
+        request.setdefault("params", {})["include_score"] = include_score
     if expected_head_sha:
         # carried as a first-class field, not a param: the policy gate validates
         # it as a full 40-hex sha and refuses anything else
@@ -471,6 +474,7 @@ def build_mcp(
         knowledge_profile: str = "legacy",
         task_id: str = "",
         trace_id: str = "",
+        include_score: bool = False,
     ) -> dict:
         """Begin a Direct or Strict review.
 
@@ -494,6 +498,8 @@ def build_mcp(
         the attempt and a repeated call returns the SAME run — including a
         finished one, whose result you can read — instead of starting a second
         review. Use a new key for a genuinely new attempt.
+        In Strict mode, set ``include_score=true`` only when the user requests a
+        numeric score. The result also reports claim evidence independently.
         ``post`` applies to Direct only. Strict never publishes: exactly one
         publisher must own a PR's review marker and head gate, so read the
         structured result and post it yourself (``post=true`` with
@@ -507,6 +513,8 @@ def build_mcp(
             if selected_mode not in {"direct", "strict"}:
                 raise ValueError("mode must be 'direct' or 'strict'")
             if selected_mode == "direct":
+                if include_score:
+                    raise ValueError("include_score is a Strict request option; Direct scoring is host-owned")
                 if knowledge_profile == "adaptive":
                     if trace_id:
                         raise ValueError("adaptive traces are bound to their context session; omit trace_id")
@@ -598,7 +606,7 @@ def build_mcp(
             request = _strict_review_request(
                 target, repo, post=post, review_depth=review_depth,
                 settings=core.settings, expected_head_sha=expected_head_sha,
-                repo_path=repo_path, idempotency_key=idempotency_key)
+                repo_path=repo_path, idempotency_key=idempotency_key, include_score=include_score)
             missing = core.strict_readiness(request["repo"], repo_path)
             if missing:
                 raise ValueError(

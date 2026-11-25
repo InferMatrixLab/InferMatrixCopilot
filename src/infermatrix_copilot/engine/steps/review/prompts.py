@@ -14,11 +14,9 @@ from __future__ import annotations
 _REVIEW_SYSTEM = """You review pull requests like an engaged maintainer: grounded, \
 specific, and useful — real reviewers leave nits and doc asks, not just blockers.
 
-The `pr_context` evidence (when present) carries the PR description, discussion, and \
-linked issues: treat the description + linked issues as the acceptance criteria the \
-diff must satisfy (scope dropped from the description is a finding). DO NOT repeat \
-concerns maintainers already raised in the discussion — build on or extend them, or \
-stay silent on that point. Verifying that a hunk does what it says is the FLOOR, not \
+Use the PR description and linked issues as the acceptance criteria. Independently \
+verify concerns at the pinned head and freeze findings before comparing prior feedback. \
+Verifying that a hunk does what it says is the FLOOR, not \
 the review: a hunk that narrows, gates, or fixes an earlier problem usually leaves \
 residual risk — interrogate the residual (other batch sizes, other platforms, other \
 launch paths, other models sharing the code) instead of recording the fix as \

@@ -459,7 +459,8 @@ def _review_summary_parts(output: dict) -> list[str]:
     # budget-cut overflow counts in the scan too — a capped finding was still
     # found, and "no finding reported" over a category the lenses DID flag
     # misrepresents the review's coverage
-    for comment in list(comments) + list(output.get("_review_overflow") or []):
+    existing = output.get("_existing_findings") or []
+    for comment in [*comments, *(output.get("_review_overflow") or []), *existing]:
         category = _category_of(comment)
         counts[category] = counts.get(category, 0) + 1
     scan = ["| Category | Result |", "|---|---|"]
@@ -470,6 +471,14 @@ def _review_summary_parts(output: dict) -> list[str]:
             f"{f'{count} finding(s) below' if count else 'no finding reported'} |"
         )
     parts = ["**Scan:**\n" + "\n".join(scan)]
+    if existing:
+        parts.append("**Findings already tracked at this revision:**\n" + "\n".join(
+            f"- `{_anchor(c)}` [{c.get('severity', 'minor')}] — [existing thread]({c['thread_url']})"
+            for c in existing))
+    if output.get("_feedback_status") in {"unavailable", "stale"}:
+        parts.append("Could not compare inline threads at the reviewed head. All selected findings remain eligible for publication.")
+    if output.get("_recheck_notes"):
+        parts.append("**Carried findings:**\n" + "\n".join(f"- {note}" for note in output["_recheck_notes"]))
     if validated:
         parts.append(
             "**Validated:**\n"
@@ -531,7 +540,7 @@ OVER_BUDGET_DISPOSITION = "over_budget"
 
 
 def disposition_records(candidates: list[dict],
-                        published: list[dict]) -> list[dict]:
+                        published: list[dict], existing: dict | None = None) -> list[dict]:
     """The audit trail: one record per candidate, whatever became of it.
 
     Published as `finding_dispositions` so a consumer can prove the published
@@ -545,6 +554,8 @@ def disposition_records(candidates: list[dict],
         declared = _disposition_of(comment)
         if declared in WITHHOLDING_DISPOSITIONS:
             disposition = declared
+        elif existing and id(comment) in existing:
+            disposition = "duplicate"
         elif id(comment) in survived:
             disposition = PUBLISH_DISPOSITION
         else:
@@ -576,7 +587,7 @@ def negative_check_notes(withheld: list[dict]) -> list[str]:
     return notes
 
 
-def _render_review_summary(output: dict, pr_state: str = "") -> str:
+def _render_review_summary(output: dict, pr_state: str = "", *, verdict: str | None = None) -> str:
     """Render a concise review body; individual findings are posted inline."""
     comments = output.get("review_comments") or []
     parts = _review_summary_parts(output)
@@ -585,6 +596,8 @@ def _render_review_summary(output: dict, pr_state: str = "") -> str:
         parts.append(summary)
     elif comments:
         parts.append(f"{len(comments)} actionable finding(s).")
+    elif output.get("_existing_findings") or output.get("_recheck_notes"):
+        parts.append("No new inline findings.")
     else:
         parts.append("No actionable findings.")
     # A negative check keeps its evidence and loses its ask: it is reported
@@ -594,11 +607,11 @@ def _render_review_summary(output: dict, pr_state: str = "") -> str:
     if notes:
         parts.append("**Checked, no defect found:**\n"
                      + "\n".join(f"- {note}" for note in notes))
-    parts.append(f"**Verdict:** {_review_verdict(comments, pr_state)}")
+    parts.append(f"**Verdict:** {verdict or _review_verdict(comments, pr_state)}")
     return "\n\n".join(parts)
 
 
-def _render_review_md(output: dict, pr_state: str = "") -> str:
+def _render_review_md(output: dict, pr_state: str = "", *, verdict: str | None = None) -> str:
     """Render the review output dict as Markdown: a category scan table
     (finding counts per category; empty rows say `no finding reported`),
     comments sorted by severity as `file:line [severity] — comment`, then a
@@ -636,8 +649,12 @@ def _render_review_md(output: dict, pr_state: str = "") -> str:
             entry += f"\n\nProposed change (not a ready patch): {suggestion}"
         lines.append(entry)
     parts = _review_summary_parts(output)
-    parts.append("\n\n".join(lines) if lines else
-                 (output.get("summary") or "No actionable findings."))
+    if lines:
+        parts.append("\n\n".join(lines))
+    elif output.get("_existing_findings") or output.get("_recheck_notes"):
+        parts.append("No new inline findings.")
+    else:
+        parts.append(output.get("summary") or "No actionable findings.")
     overflow = output.get("_review_overflow") or []
     if overflow:
         # findings the comment budget cut — one line each, so a real (often
@@ -653,4 +670,4 @@ def _render_review_md(output: dict, pr_state: str = "") -> str:
                          f"{_clip(str(c.get('comment', '')).strip(), 900)}"
                          for c in _dedupe_comments(overflow)))
     body = "\n\n".join(parts)
-    return f"{body}\n\n**Verdict:** {_review_verdict(comments, pr_state)}"
+    return f"{body}\n\n**Verdict:** {verdict or _review_verdict(comments, pr_state)}"

@@ -21,6 +21,7 @@ requires: [repo.path]
 # declared adaptation surface: specs carrying only these params still resolve
 # as reuse (L0) — an undeclared param would demote to adapt (L1, review gate)
 params:
+  include_score: "optional boolean — report a revision-bound advisory score"
   review_depth: "optional light|standard|full|auto — pins the adaptive review
     depth for this run (see review/planner.py)"
 steps:

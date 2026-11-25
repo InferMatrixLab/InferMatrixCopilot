@@ -1,6 +1,6 @@
 # improve/ —— 规范（元改进引擎）
 
-<!-- verified-against: 2026-10-09 -->
+<!-- verified-against: 2026-11-25 -->
 
 `设计：/data/zhoutaichang/copilot/meta-improvement-engine-design.md v1（GPT-6 sol 批准 2026-09-29） · refactor-status: building (P0–P4 已落地)`
 
@@ -16,7 +16,8 @@
 
 Replay envelope 保留完整文件与引用，由 TraceStore 脱敏、压缩和按内容寻址；未压缩 UTF-8 JSON 上限为 64,000,000 bytes。超限只记录 `replay_capture_deferred` 的大小、上限和摘要并抛出专用 `ReplayCaptureLimit`，不保存截断输入，也不进入 replay 数据集。知识起草无活动进化工作流时继续原生固定生成器；活动工作流（含已禁用项）缺少完整 replay 时保持事件 pending。其他捕获错误不能走此延期路径。
 
-`runtime.py` 重新应用补丁核验实际评估树，原子采用本地不可变 release，原生 PR 评审、知识草稿、lint 和归因在活动制品的沙箱中运行。宿主记录运行指纹才更新部署基线。首次八个不同 item 与上一版比较，七日缺证据自动恢复；保留后每周最多八个新 item 持续比较。契约、凭据／隔离／预算、指纹失败或资源显著退化自动恢复上一版；恢复制品不可验证则禁用执行。执行／切换锁及持久化激活、回滚意图支持重启恢复。
+`runtime.py` 重新应用补丁核验实际评估树，原子采用本地不可变 release，原生 PR 评审、知识草稿、lint 和归因在活动制品的沙箱中运行。PR 评分和主张证据在宿主的真实评审版本上验证，沙箱重建的 Git SHA 不作为实际 PR 的标识。
+宿主记录运行指纹才更新部署基线。首次八个不同 item 与上一版比较，七日缺证据自动恢复；保留后每周最多八个新 item 持续比较。契约、凭据／隔离／预算、指纹失败或资源显著退化自动恢复上一版；恢复制品不可验证则禁用执行。执行／切换锁及持久化激活、回滚意图支持重启恢复。
 
 默认 `IMPROVE_EVALUATION_MODE=objective`、`IMPROVE_PROMOTION_MODE=automatic`，不要求人工标签、判官或 performance 模型。总开关仍关闭，固定模型取 `IMPROVE_EVOLVE_MODEL` 或 eco；每周一个候选、一次修复及共享 20 美元预算不变。`gold/pr` 模式保留原有双家族取证及人工流程。无隔离生产驱动的机械工作流仍可 lint，但不自动采用。当前主机命名空间关闭，代码候选实际执行延期。
 

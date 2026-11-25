@@ -1,6 +1,6 @@
 # contract.py —— 规范
 
-<!-- verified-against: 2026-09-30 -->
+<!-- verified-against: 2026-11-25 -->
 
 `旧版跨仓库契约兼容层 · refactor-status: compatibility-shim`
 
@@ -13,7 +13,7 @@
 
 ## 公开契约（`__all__`）
 `SDK_API_VERSION` / `DIRECT_API_VERSION` / `STRICT_API_VERSION` /
-`QUALITY_API_VERSION` / `KNOWLEDGE_API_VERSION`（SDK、Quality 为 `"1.0.0"`，Direct 为 `"1.1.0"`，Strict 为 `"1.4.0"`，Knowledge 为 `"1.1.0"`，且都从 `sdk.v1.models`
+`QUALITY_API_VERSION` / `KNOWLEDGE_API_VERSION`（SDK、Quality 为 `"1.0.0"`，Direct 为 `"1.1.0"`，Strict 为 `"1.5.0"`，Knowledge 为 `"1.1.0"`，且都从 `sdk.v1.models`
 取唯一值）。`capabilities(max_strict_workers=1,
 supports_file_locking=True) -> dict` 委托 SDK typed handshake 再投影为兼容
 dict；它包含 distribution/SDK/Direct/Strict/Quality/Knowledge 版本、resource
@@ -23,7 +23,8 @@ revision、supported repositories，以及 `supports_expected_head`、
 `max_strict_workers`（服务真实的并发 worker 数，即 `STRICT_MAX_WORKERS`，
 同一 checkout+PR 的 run 仍逐个执行）。其余兼容导出包括 `build_review_result(run_dir) -> dict`（结构化评审
 结果：`contract_version`、`run_id`、`state`、`reviewed_head_sha`、`verdict`、
-`summary_markdown`、`comments`、`finding_dispositions`、`findings`、
+`summary_markdown`、`comments`、`finding_dispositions`、`findings`、本次运行记录的
+`review_claim_evidence` 及按请求生成的 `review_score`、
 `stale`/`expected_head_sha`/`actual_head_sha`、`diagnostics`）；`unknown_run_result(run_id)`（显式
 `state: unknown`，绝不抛错 —— 丢响应和还在跑必须可区分）；
 `sanitize_comments` 与 `COMMENT_FIELDS`，以及 `finding_id` / `build_findings`；另有从 `direct_routing` 再导出的

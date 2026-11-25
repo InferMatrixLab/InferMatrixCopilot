@@ -88,12 +88,17 @@ def test_pr_context_mode_controls_discussion_exposure(settings, trace, tmp_path,
     class Ctx:
         def __init__(self, mode):
             self.settings = settings
-            self.state = {}
+            self.state = {"task_spec": {"kind": "pr_quality"}}
             settings.pr_context_mode = mode
 
     full = fetch_mod._pr_context_bundle(Ctx("full"), str(git_repo), 9)
     assert "DISCUSSION-MARKER" in full and "Linked issue #7" in full
     assert "do not repeat these concerns" in full
+
+    strict_ctx = Ctx("full")
+    strict_ctx.state["task_spec"]["kind"] = "pr_review"
+    strict = fetch_mod._pr_context_bundle(strict_ctx, str(git_repo), 9)
+    assert "DISCUSSION-MARKER" not in strict and "Linked issue #7" in strict
 
     bare = fetch_mod._pr_context_bundle(Ctx("no_discussion"), str(git_repo), 9)
     assert "DISCUSSION-MARKER" not in bare        # eval-leakage policy

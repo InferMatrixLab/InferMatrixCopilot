@@ -21,6 +21,15 @@ from .runner import run_agent_step
 from .utils import _build_evidence, _to_step_result
 
 
+def retain_review_assessments(previous: dict, current: dict) -> None:
+    """Carry investigation evidence through a zero-finding retry or escalation."""
+    for key in ("claim_checks", "dimension_ratings"):
+        prior = previous.get(key)
+        if isinstance(prior, list) and prior:
+            latest = current.get(key)
+            current[key] = prior + (latest if isinstance(latest, list) else [])
+
+
 def outcome_blocked(result: Any, output: dict | None) -> bool:
     """True when a pass returned nothing usable — no items and no tool work.
 
@@ -278,6 +287,7 @@ async def run_agent_step_ensemble(
                     effect="routed seat produced no output; retrying on "
                            + (f"the same route (model={member})" if route
                               else "the tier model (member proven dead)"))
+            first_output = output or {}
             retry_guidance = lens_guidance + (
                 "\n\nYour first pass produced NO USABLE FINAL — most "
                 "likely it ran past the reply ceiling. Investigate less "
@@ -308,6 +318,7 @@ async def run_agent_step_ensemble(
                     route = {}
                     result, output = await _attempt("/retry/tier",
                                                     retry_guidance, route)
+            retain_review_assessments(first_output, output)
         return str(lens["name"]), result, output
 
     # lenses (and repeat samples of each lens — a single sample's item list is
@@ -374,7 +385,8 @@ async def run_agent_step_ensemble(
         that the reducer does not judge."""
         out, seen = [], set()
         for _, o in samples:
-            for v in o.get(key) or []:
+            values = o.get(key)
+            for v in values if isinstance(values, list) else []:
                 sig = json.dumps(v, ensure_ascii=False, sort_keys=True) \
                     if isinstance(v, (dict, list)) else str(v)
                 if sig not in seen:
@@ -389,6 +401,11 @@ async def run_agent_step_ensemble(
     for key in ("findings", "files_read", "files_modified", "tests_requested",
                 "tests_run", "assumptions", "blockers"):
         merged[key] = _dedup_union(key)
+    for key in ("claim_checks", "dimension_ratings"):
+        if key in (output_extension or {}):
+            merged[key] = _dedup_union(key)
+    if "claim_checks" in (output_extension or {}):
+        merged["_assessment_incomplete"] = any(not result.ok for _, result, _ in runs)
     # the reducer judges ITEMS, not the step: models conflate the step's status
     # with the reviewed artifact's verdict, so status comes from the samples
     if any(o.get("status") == "success" for _, o in samples):
@@ -613,6 +630,8 @@ async def run_agent_step_ensemble(
                 if str(v.get("action", "")).lower() == "drop"
             ]
     else:
+        if "claim_checks" in (output_extension or {}):
+            merged["_assessment_incomplete"] = True
         merged["summary"] = (f"ensemble of {len(samples)} samples "
                              "(merge reduction failed; unverified union)")
     # near-dup guard (W2): the reducer occasionally re-emits the same finding

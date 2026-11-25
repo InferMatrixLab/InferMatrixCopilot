@@ -1,6 +1,6 @@
 # app/request_policy.py — request safety policy
 
-<!-- verified-against: 2026-09-26 -->
+<!-- verified-against: 2026-11-25 -->
 
 This headless application module validates untrusted read-only requests for
 the SDK, MCP transport, and reserved-run worker. It derives a new `TaskSpec`
@@ -11,7 +11,8 @@ reading `request.json`; persisted input alone is not an authority.
 `post=False`, limits repositories to the configured allowlist, checks positive
 PR/issue numbers, validates full expected-head SHAs, and strips unknown
 params. A bounded `deterministic_signals` list applies only to quality review;
-carried findings are validated for PR review. `authorize_repo_path` verifies
+carried findings are validated for PR review. PR review accepts boolean
+`include_score`. False and omission have the same idempotency fingerprint. `authorize_repo_path` verifies
 both checkout origin identity and containment under allowed roots.
 
 `enforce_strict_review_policy` accepts only PR review, forces eco mode, and

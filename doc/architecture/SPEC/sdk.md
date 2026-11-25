@@ -1,6 +1,6 @@
 # sdk/ —— 规范
 
-<!-- verified-against: 2026-11-04 -->
+<!-- verified-against: 2026-11-25 -->
 
 
 `Python SDK v1 · 跨仓库唯一 typed 边界 · refactor-status: ok`
@@ -157,9 +157,10 @@
   push、开 PR 或 schedule。ReviewBot 必须向 `KnowledgeCurator` 传 dedicated work
   checkout，并继续拥有重试、artifact 与本地补丁导出；SDK 也绝不写 packaged
   knowledge tree。自适应 DirectClient 仅管理知识上下文的运行账本，不代替知识出版治理。
-- SDK、Quality API 版本常量为 `1.0.0`；Direct 为 `1.1.0`，Strict 为 `1.4.0`
+- SDK、Quality API 版本常量为 `1.0.0`；Direct 为 `1.1.0`，Strict 为 `1.5.0`
   （1.1 新增 `finding_dispositions`；1.2 新增 `findings`；1.3 新增显式 recheck；
-  1.4 新增 `StrictRuntimeConfig.max_workers`），Knowledge 为 `1.1.0`
+  1.4 新增 `StrictRuntimeConfig.max_workers`；1.5 新增 `StrictReviewRequest.include_score`，
+  以及 `StrictReviewResult.review_claim_evidence` 与可选 `review_score`。读取旧结果时分别为空元组与 None），Knowledge 为 `1.1.0`
   （1.1 向后兼容地新增 `catalog_entries()` / `KnowledgeCatalogEntry` 与容量预检），
   distribution 为 `0.2.0`；`Capabilities.knowledge_api_version` 与
   `supports_knowledge_curation` 组成 ReviewBot 的 paired-release 握手，避免只按

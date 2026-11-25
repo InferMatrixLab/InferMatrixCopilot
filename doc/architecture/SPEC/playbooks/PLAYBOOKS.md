@@ -1,6 +1,6 @@
 # playbooks/*.yaml —— 规范
 
-<!-- verified-against: 2026-10-05 -->
+<!-- verified-against: 2026-11-25 -->
 
 `9 个文件 · 声明式编排数据 · refactor-status: ok`
 
@@ -23,6 +23,8 @@ success, steps[]`。
   **不要改它的 step 列表**。
 - `pr-rebase`/`pr-debug`/`pr-review`/`pr-quality`/`issue-answer`/`issue-triage` —— active，
   仓库中立（`repos: []`、`requires: [repo.path]`）。
+- `pr-review` 声明可选布尔参数 `include_score`。默认按固定版本输出发现和证据，
+  显式请求后附加参考分数。
 - `pr-debug` 的 report-only 模式跳过 checkout 和 push；修复模式在推送前审查
   已提交的变更。
 - `repo-profile` —— active，仓库中立（用于接入第二个仓库）。

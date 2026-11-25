@@ -1049,3 +1049,13 @@ def test_update_status_tool_reads_manager_and_running_release(monkeypatch):
     mcp, _core = _fake_mcp(monkeypatch)
     assert mcp.tools["get_update_status"]() == {
         "active_release": "next-release", "running_release": "this-server-release"}
+
+
+def test_score_request_reaches_strict_run_only(monkeypatch):
+    mcp, core = _fake_mcp(monkeypatch)
+    review = mcp.tools["review"]
+    review(target="17", mode="strict", include_score=True)
+    assert core.requests[-1]["params"] == {"include_score": True}
+    review(target="17", mode="strict")
+    assert "include_score" not in core.requests[-1].get("params", {})
+    assert "Strict" in review(target="17", mode="direct", include_score=True)["error"]

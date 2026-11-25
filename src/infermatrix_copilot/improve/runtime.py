@@ -314,10 +314,14 @@ def freeze_review(settings, state):
             total += p.stat().st_size
             if total > 16_000_000: raise artifacts.ArtifactError('knowledge snapshot exceeds replay bound')
             knowledge[p.relative_to(kroot).as_posix()] = p.read_text()
+    from ..engine.steps.review.feedback import independent_context
+    context = state.get('pr_context', '')
+    if not state.get('pr_context_independent'):
+        context = independent_context(context)
     spec = state['task_spec']
     return {'repo': spec['repo'], 'pr': spec['pr'], 'base_sha': revisions[0], 'head_sha': revisions[1],
             'base_files': trees[0], 'head_files': trees[1], 'diff': state['diff_text'], 'knowledge_files': knowledge,
-            'context_text': state.get('pr_context', ''), 'gate_report': state.get('gate_report', ''),
+            'context_text': context, 'pr_context_independent': True, 'gate_report': state.get('gate_report', ''),
             'task_params': spec.get('params', {}), 'pr_state': state.get('pr_state', '')}
 
 
@@ -342,14 +346,26 @@ async def review_step(ctx):
             return StepResult(False, FailureKind.BLOCKED, 'active review lacks a safe frozen replay input')
         return None
     if not is_active: return None
+    if not entry.get('disabled'):
+        publication = Path(entry['artifact']) / 'src/infermatrix_copilot/engine/steps/review/publication.py'
+        # Older workers cannot return independent candidates. Carried finding
+        # rechecks also require real commits, which a reconstructed tree lacks.
+        if not publication.is_file() or (data.get('task_params') or {}).get('carried_findings'):
+            return None
     import asyncio
     try:
         prediction = await asyncio.to_thread(execute, ctx.settings, store, workflow, data, ctx.llm)
     except Exception as exc:
         return StepResult(False, FailureKind.BLOCKED, 'autonomous review rolled back: ' + str(exc))
     if prediction is None: return None
-    outputs = {k: prediction.get(k) for k in ('review_text', 'review_comments', 'review_summary', 'review_verdict',
-                                             'review_finding_dispositions', 'review_carried_findings', 'review_finding_rechecks', 'review_recheck_missing')}
+    from ..engine.steps.review.claim_evidence import apply_review_evidence
+    from ..engine.steps.review.publication import finalize_review_publication
+    packet = prediction.get('review_publication_input')
+    if not isinstance(packet, dict):
+        return StepResult(False, FailureKind.BLOCKED, 'review worker omitted independent findings')
+    assessment = prediction.get('review_assessment_input') or {}
+    outputs = await finalize_review_publication(ctx, packet, [], [], [])
+    await apply_review_evidence(ctx, assessment, outputs, partial=bool(assessment.get('partial')))
     ctx.state.update(outputs)
     return StepResult(True, summary='review produced by verified autonomous source', outputs={**outputs, 'state_updates': outputs})
 
