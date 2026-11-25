@@ -1,6 +1,6 @@
 # engine/steps/review/ —— 规范
 
-<!-- verified-against: 2026-10-04 -->
+<!-- verified-against: 2026-11-25 -->
 
 `patch gate + PR review + quality（9 个源文件） · step 库（评审） · refactor-status: ok`
 

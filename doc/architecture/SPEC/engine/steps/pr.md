@@ -1,6 +1,6 @@
 # engine/steps/pr/ —— 规范
 
-<!-- verified-against: 2026-10-08 -->
+<!-- verified-against: 2026-11-25 -->
 
 `LOC ~1988（6 个文件） · step 库（PR） · refactor-status: ok`
 

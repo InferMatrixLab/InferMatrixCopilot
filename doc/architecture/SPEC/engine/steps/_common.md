@@ -1,6 +1,6 @@
 # engine/steps/_common.py —— 规范
 
-<!-- verified-against: 2026-09-26 -->
+<!-- verified-against: 2026-11-25 -->
 
 `LOC ~300 · step 库基础设施 · refactor-status: ok`
 
