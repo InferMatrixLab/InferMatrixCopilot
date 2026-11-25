@@ -52,6 +52,11 @@ or failures blocking the verdict.
   checks when compatible. If the preflight fails, continue source review and
   report skipped tests. For docs-only changes check diff hygiene and the live contract.
 
+For a performance, quality, model-support or user-visible behavior claim, identify
+the required evidence from the change and repository policy. Follow
+[verify claim evidence](references/claim-evidence.md) even when no score was
+requested. Distinguish what the contributor supplied from what you ran or inspected.
+
 Treat `execution_budget` as a hard ceiling. Use its one-time allowance only for a
 stated unresolved P1/high-risk contract. A separate durable allowance requires
 explicit human authorization and a server advertising `direct-continuation/1`
@@ -77,6 +82,12 @@ Give each actionable finding as a GitHub inline comment with the exact path and
 line/hunk, trigger or concrete maintenance cost, impact and smallest fix. Identify
 regressions, policy violations, design debt and inherited risk accurately. With no
 findings, say so and name material gaps. Show internal audit rows only on request.
+
+Recheck the reviewed head or local snapshot before reporting. If it changed, name
+the reviewed revision and limit the verdict to it. Only when the user requests a
+numerical score, append the [advisory review score](references/review-score.md)
+after the findings. Decide the verdict from the applicable acceptance requirements,
+findings and verification gaps independently of the score.
 
 ## Task completion learning
 

@@ -47,3 +47,18 @@ def test_feedback_dispositions_and_context_modes():
                   "50 thread-aware inline review threads"):
         assert limit in normalized
     assert "PR_CONTEXT_MODE=no_discussion" in feedback
+
+
+def test_claim_checks_precede_optional_scoring_in_the_delivered_workflow():
+    workflow = get_workflow("imreview")
+    prompt = workflow["content"]
+    assert prompt.index("references/claim-evidence.md") < prompt.index("Freeze independently")
+    assert prompt.index("Only when the user requests a") < prompt.index("references/review-score.md")
+
+    score = Path(workflow["references"]["references/review-score.md"]).read_text(encoding="utf-8")
+    rows = re.findall(r"^\| ([^|]+?) \| (\d+) \|", score, re.MULTILINE)
+    weights = {dimension: int(weight) for dimension, weight in rows}
+    assert weights == {
+        "Scope and intent": 15, "Correctness and safety": 25, "Validation": 20,
+        "Claim evidence": 30, "Simplicity": 10,
+    }
