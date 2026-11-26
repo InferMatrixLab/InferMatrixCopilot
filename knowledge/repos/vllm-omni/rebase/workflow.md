@@ -1,29 +1,26 @@
 ---
 title: "Rebase 工作流：分支、波次与失败路由"
 created: 2026-07-16
-updated: 2026-10-13
+updated: 2026-09-04
 type: guide
 tags: [vllm-omni, rebase]
-sources: ["PR #6606", "PR #8459", "vllm-omni-rebase-agent@122a9468:agent/config.py", "vllm-omni-rebase-agent@122a9468:config.sh", ".buildkite/cuda/rebase-pipeline.yml", docker/Dockerfile.ci]
+sources: ["PR #6606", "vllm-omni-rebase-agent@122a9468:agent/config.py", "vllm-omni-rebase-agent@122a9468:config.sh", ".buildkite/cuda/rebase-pipeline.yml", docker/Dockerfile.ci]
 ---
 
 # Rebase 工作流：分支、波次与失败路由
 
 运营事实来自 rebase-agent 配置快照（@122a9468，**可能漂移**）；仓库侧事实在
 `main @ 19da2382` 复核。运营系统以 rebase-agent 仓库为准，本页是知识树快照；
-upstream release baseline 为 `v0.31.0 @ db9527a46873454610df6dbedf79a36d6bf1a7f6`
-（v0.28/v0.29/v0.30/v0.31 各轮 rebase 均已合入，v0.31 为 PR #8459）。^[PR #8459]
+upstream release baseline 为 `v0.28.0 @ 2cf0a6915ce5`。^[PR #6606]
 
 ## 分支与管线
 
 - 对齐分支 `dev/vllm-align`（目标合回 `main`）；专用 Buildkite 管线
   `.buildkite/cuda/rebase-pipeline.yml`（仓库侧）+ 运营管线 `vllm-omni-rebase`
   （nightly 与 main CI）、`vllm-omni-release`（CI），org `vllm`；wheel 变体
-  `cu130`；v0.31 轮的 vLLM pin 是 tag `v0.31.0` 的 `db9527a468734`，v0.32 轮
-  （对齐 upstream main，发布分支 cut 出前）改为 commit-pinned nightly wheel
-  （`VLLM_PRECOMPILED_WHEEL_COMMIT`）。CUDA/CI/ROCm base image 和安装文档须同步
-  使用同一 release；只有对齐未发布 SHA 时才启用额外 wheel reinstall/ABI repair。
-  ^[PR #6606]
+  `cu130`；本轮 release-boundary rebase 的 vLLM pin 是 tag `v0.28.0` 的
+  `2cf0a6915ce5`。CUDA/CI/ROCm base image 和安装文档须同步使用同一 release；只有
+  对齐未发布 SHA 时才启用额外 wheel reinstall/ABI repair。^[PR #6606]
 - nightly 循环：定时 nightly 跑对齐分支全量套件；注意定时 nightly 与 API build
   的互杀陷阱（[ci-environment-gotchas](../ci/guides/ci-environment-gotchas.md)
   第 3 条）。
