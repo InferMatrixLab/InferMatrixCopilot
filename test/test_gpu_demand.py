@@ -118,6 +118,20 @@ def test_command_gpus_is_the_largest_cards_marker():
     assert command_gpus("pytest -m cards_99") == 0       # not a card count
 
 
+@pytest.mark.parametrize("expression, need", [
+    ("core_model and (cards_1 or cards_4)", 4),
+    ("cards_2", 2),
+    # an exclusion is not a need: the repository's own CPU job says so
+    ("core_model and cuda and L4 and not cards_2", 0),
+    ("core_model and cpu and not (cards_2 or cards_3 or cards_8)", 0),
+    ("full_model and cards_4 and not cards_2", 4),
+    ("not cards_4 and cards_2", 2),
+    ("cards_99", 0),                         # not a card count
+])
+def test_a_negated_cards_marker_is_not_a_need(expression, need):
+    assert command_gpus(f"pytest -m '{expression}'") == need
+
+
 @pytest.mark.parametrize("command, needs", [
     ("pytest -x tests/a", True),
     ("python -m pytest tests/a", True),
@@ -545,6 +559,13 @@ def test_command_gpus_reads_what_the_selected_tests_declare(tree):
     assert need("pytest tests/test_undeclared.py") == 1
     assert need("pytest tests/missing.py") == 1
     assert need("python -c 'import torch'") == 1
+
+
+def test_command_gpus_does_not_count_what_the_expression_excludes(tree):
+    cpu_job = "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_8)"
+    assert command_gpus(f"pytest tests/ -m '{cpu_job}'", 1, tree) == 1
+    # the module's four and the class's three; four is excluded
+    assert command_gpus("pytest tests/ -m 'core_model and not cards_4'", 1, tree) == 3
 
 
 def test_command_gpus_cap_never_dips_below_a_callers_minimum(tree):

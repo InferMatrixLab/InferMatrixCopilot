@@ -134,11 +134,14 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
   申请。`TestRunner` 缺省从环境读取（`GpuDemand.from_env`），测试可显式传
   `gpu_demand=`。
 - **卡数 = 需要。** `TestJob.gpus` 显式给出；否则 `command_gpus(command, minimum,
-  root, maximum)`：命令自己的 `-m` 表达式里有 `cards_N` 就以其中最大者为准
-  （manifest 的每个 job 都是 `hw: any`，卡数只在 marker 里）；没有时读取命令
-  所指定的测试文件，取其中**与命令同属一个运行级别**（`--run-level`，缺省
-  `core_model`）的测试所声明的最大卡数——`cards_N` 标记，或装饰器的 `num_cards=`。
-  其它级别的测试不计：卡不够时它们按自己的保护跳过，不会失败。没有声明算 1 张。
+  root, maximum)`：命令自己的 `-m` 表达式选中的 `cards_N` 以其中最大者为准
+  （manifest 的每个 job 都是 `hw: any`，卡数只在 marker 里）；被 `not` 否定的是
+  **排除**，不是需要——目标仓库自己的 CPU job 写的就是
+  `core_model and cpu and not (cards_2 or … or cards_8)`。没有选中任何 `cards_N`
+  时读取命令所指定的测试文件，取其中**与命令同属一个运行级别**（`--run-level`，
+  缺省 `core_model`）的测试所声明的最大卡数——`cards_N` 标记，或装饰器的
+  `num_cards=`。其它级别的、以及被表达式排除的卡数的测试不计：卡不够时它们按
+  自己的保护跳过，不会失败。没有声明算 1 张。
   结果不低于 `minimum`（取 GPU 锁的运行至少 1 张，`run_precommit` 为 0、不申请），
   不高于 `maximum`。agent 的 `run_pytest`/`reproduce`、`imx-<仓库>-pytest` 包装器
   与 agent 在 shell 里起的测试走同一套算法。
@@ -223,3 +226,9 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
 2 张的 14 个、4 张的 6 个；按模块，worker_runner / input_output / online_serving /
 model_config 需要 1 张（后者无声明），model_executor / scheduler / platform 的
 全量运行需要 4 张。AST 解析全树约 6 秒，单个模块目录 1–2 秒。
+
+2026-11-26，实机上发现并补上：`-m` 表达式里被 `not` 否定的 `cards_N` 曾被当成需要
+——卡数是对整条命令做正则取最大值。campaign 自己的 agent 跑
+`tests/distributed/ -m 'core_model and cuda and L4 and not cards_2'` 时因此申请了
+两张卡，而 manifest 里 CPU job 的排除表达式会申请八张。现在按表达式解析
+（`_expression_cards`）：`not` 作用于紧随其后的那一项，或一个括号组。

@@ -124,25 +124,28 @@ def command_gpus(command: str, minimum: int = 0,
                  maximum: int | None = None) -> int:
     """The cards one test command needs.
 
-    A `cards_N` in the command is the selection itself (every job of the
-    manifest says `hw: any`): its largest. Otherwise, and given the `root` the
-    command runs in, the tests it names are read: the largest number of cards
-    that a test of the command's run level declares in those files, with a
-    `cards_N` mark or with a decorator's `num_cards=`. Tests of other levels do
+    A `cards_N` that the command's `-m` expression selects is the selection
+    itself (every job of the manifest says `hw: any`): its largest. One the
+    expression negates (`not cards_2`) is an exclusion, not a need: the
+    repository's own jobs say `core_model and cpu and not (cards_2 or ... or
+    cards_8)`. Otherwise, and given the `root` the command runs in, the tests
+    it names are read: the largest number of cards that a test of the command's
+    run level declares in those files, with a `cards_N` mark or with a
+    decorator's `num_cards=`. Tests of other levels and of excluded counts do
     not count: they skip by their own guard when the cards are not there. A
     test that declares nothing needs one (`minimum`). `maximum` caps what the
     command and its tests say, never the caller's `minimum`.
     """
     command = command or ""
-    found = [int(n) for n in _CARDS.findall(command) if 1 <= int(n) <= 16]
-    if found or root is None:
-        return max(minimum, _capped(max(found, default=0), maximum))
+    selected, excluded = _expression_cards(_option(_words(command), "-m") or "")
+    if selected or root is None:
+        return max(minimum, _capped(max(selected, default=0), maximum))
     level = _run_level(command)
-    key = (str(root), tuple(_test_paths(command, Path(root))), level)
+    key = (str(root), tuple(_test_paths(command, Path(root))), level, tuple(excluded))
     now = time.monotonic()
     hit = _NEEDS.get(key)
     if hit is None or hit[0] < now:
-        need = max([_file_need(path, level) for path in key[1]] or [0])
+        need = max([_file_need(path, level, excluded) for path in key[1]] or [0])
         for stale in [k for k, v in _NEEDS.items() if v[0] < now]:
             del _NEEDS[stale]
         _NEEDS[key] = hit = (now + _NEED_TTL_SEC, need)
@@ -161,6 +164,34 @@ def _words(command: str) -> list[str]:
         return shlex.split(command, posix=True)
     except ValueError:                     # an unclosed quote
         return command.split()
+
+
+_TOKEN = re.compile(r"\(|\)|\bnot\b|[A-Za-z_][\w.]*")
+
+
+def _expression_cards(expression: str) -> tuple[set[int], set[int]]:
+    """What a `-m` expression says about cards: the counts it selects and the
+    counts it negates. `not` applies to the one term that follows it, or to a
+    bracketed group."""
+    selected: set[int] = set()
+    excluded: set[int] = set()
+    negated = [False]           # per bracket level
+    after_not = False
+    for token in _TOKEN.findall(expression):
+        if token == "not":
+            after_not = True
+        elif token == "(":
+            negated.append(after_not or negated[-1])
+            after_not = False
+        elif token == ")":
+            if len(negated) > 1:
+                negated.pop()
+            after_not = False
+        else:
+            if _CARDS.fullmatch(token) and 1 <= int(token[6:]) <= 16:
+                (excluded if after_not or negated[-1] else selected).add(int(token[6:]))
+            after_not = False
+    return selected, excluded
 
 
 def _option(words: list[str], name: str) -> str | None:
@@ -225,9 +256,9 @@ def _test_files(directory: Path) -> list[Path]:
     return out
 
 
-def _file_need(path: Path, level: str) -> int:
+def _file_need(path: Path, level: str, excluded: frozenset[int] = frozenset()) -> int:
     """The largest number of cards that a test of `level` in one test file
-    declares. Read from the source: names inside strings are not needs (the
+    declares, other than the counts a command excludes. Read from the source: names inside strings are not needs (the
     repository's own tests quote CI commands that say `cards_8`)."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
@@ -235,14 +266,23 @@ def _file_need(path: Path, level: str) -> int:
         return 0
     need = 0
     module_marks = _pytestmark(tree)
+    for fn, inherited in _tests(tree, module_marks):
+        declared = _test_need(fn, inherited, level)
+        if declared not in excluded:
+            need = max(need, declared)
+    return need
+
+
+def _tests(tree: ast.Module, module_marks: list[str]):
+    """Every test function of one file with the marks it inherits."""
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             own = module_marks + _pytestmark(node)
-            need = max(need, max((_test_need(fn, own, level) for fn in node.body
-                                  if isinstance(fn, ast.FunctionDef)), default=0))
+            for fn in node.body:
+                if isinstance(fn, ast.FunctionDef):
+                    yield fn, own
         elif isinstance(node, ast.FunctionDef):
-            need = max(need, _test_need(node, module_marks, level))
-    return need
+            yield node, module_marks
 
 
 def _pytestmark(scope: ast.Module | ast.ClassDef) -> list[str]:
