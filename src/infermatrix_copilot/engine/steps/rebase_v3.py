@@ -354,7 +354,8 @@ def build_backends(*, settings, state, run_dir: Path, trace,
         outcome = runner.run(
             TestJob(key=f"{key}_{abs(hash(cmd)) % 10 ** 8}", command=cmd,
                     timeout_sec=float(kw.get("timeout") or 1800),
-                    min_gpus=0, gpu_lock=True, gpus=1),
+                    # as many cards as the command's tests declare, one at least
+                    min_gpus=0, gpu_lock=True, gpus=None),
             _target_test_env(settings, manifest, host_env=host_env))
         tail = ""
         try:

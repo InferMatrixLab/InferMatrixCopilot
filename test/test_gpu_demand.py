@@ -61,6 +61,10 @@ if [ -f "$IMX_GPU_STUB_REFUSE" ]; then
     printf 'Error: wait timeout exceeded\n' >&2
     exit 1
 fi
+if [ -f "$(dirname "$IMX_GPU_STUB_REFUSE")/slow" ]; then
+    printf 'Waiting for GPUs... (queue position: 2)\n'
+    sleep "${IMX_GPU_STUB_DELAY:-4}"
+fi
 printf 'Waiting for GPUs... (queue position: 2)\n'
 printf 'Reserved %s GPU(s): [7] for command execution (timeout: 1h 0m 0s)\n' "$gpus"
 printf 'Warning: failed to activate booking abc: failed to stop run task x\n' >&2
@@ -69,7 +73,8 @@ CUDA_VISIBLE_DEVICES=7 exec "$@"
 _PYTEST_STUB = """#!/bin/sh
 printf 'STUB-PYTEST cards=%s\\n' "$CUDA_VISIBLE_DEVICES"
 """
-_DEMAND = GpuDemand(enabled=True, wait="5s")
+_DEMAND = GpuDemand(enabled=True, wait="5s")      # a bounded wait: the opt-in
+_UNBOUNDED = GpuDemand(enabled=True)              # the rule since 2026-11-26
 _PROBE = ("printf 'hello\\n'\n"
           "printf 'cards=%s\\n' \"$CUDA_VISIBLE_DEVICES\"\n"
           "printf 'held=%s\\n' \"$IMX_GPU_HELD\"")
@@ -89,7 +94,7 @@ def scheduler(tmp_path, monkeypatch):
     env = {"PATH": str(stubs) + os.pathsep + os.environ["PATH"],
            "IMX_GPU_STUB_LOG": str(calls),
            "IMX_GPU_STUB_REFUSE": str(refuse)}
-    for key in ("IMX_GPU_MODE", "IMX_GPU_HELD", "IMX_GPU_WAIT"):
+    for key in ("IMX_GPU_MODE", "IMX_GPU_HELD", "IMX_GPU_WAIT", "IMX_GPU_MAX"):
         monkeypatch.delenv(key, raising=False)
     return env, calls, refuse
 
@@ -111,6 +116,20 @@ def test_command_gpus_is_the_largest_cards_marker():
     assert command_gpus("pytest tests/x") == 0
     assert command_gpus("pytest tests/x", 1) == 1
     assert command_gpus("pytest -m cards_99") == 0       # not a card count
+
+
+@pytest.mark.parametrize("expression, need", [
+    ("core_model and (cards_1 or cards_4)", 4),
+    ("cards_2", 2),
+    # an exclusion is not a need: the repository's own CPU job says so
+    ("core_model and cuda and L4 and not cards_2", 0),
+    ("core_model and cpu and not (cards_2 or cards_3 or cards_8)", 0),
+    ("full_model and cards_4 and not cards_2", 4),
+    ("not cards_4 and cards_2", 2),
+    ("cards_99", 0),                         # not a card count
+])
+def test_a_negated_cards_marker_is_not_a_need(expression, need):
+    assert command_gpus(f"pytest -m '{expression}'") == need
 
 
 @pytest.mark.parametrize("command, needs", [
@@ -153,7 +172,8 @@ def test_shell_needs_gpu(command, needs):
 
 
 def test_duration_seconds_reads_the_scheduler_formats():
-    assert DEFAULT_WAIT == "30m" and duration_seconds(DEFAULT_WAIT) == 1800
+    assert DEFAULT_WAIT == ""                     # no bound (owner decision, 2026-11-26)
+    assert duration_seconds("30m") == 1800
     assert duration_seconds("2h") == 7200
     assert duration_seconds("90s") == 90
     assert duration_seconds("1h30m") == 5400
@@ -175,9 +195,14 @@ def test_idle_timeout_is_one_unit_within_the_schedulers_cap(seconds, text):
 
 
 def test_mode_comes_from_the_environment(monkeypatch):
-    assert GpuDemand.from_env({}) == GpuDemand(enabled=False, wait="30m")
+    assert GpuDemand.from_env({}) == GpuDemand(enabled=False)
     demand = {gpu_demand.MODE_ENV: "demand", gpu_demand.WAIT_ENV: "2m"}
     assert GpuDemand.from_env(demand) == GpuDemand(enabled=True, wait="2m")
+    # a wait is a bound someone sets; the cap on cards is the same kind of knob
+    assert GpuDemand.from_env({gpu_demand.MODE_ENV: "demand"}).wait == ""
+    assert GpuDemand.from_env({gpu_demand.MAX_ENV: "4"}).maximum == 4
+    assert GpuDemand.from_env({gpu_demand.MAX_ENV: "four"}).maximum is None
+    assert GpuDemand.from_env({gpu_demand.MAX_ENV: "0"}).maximum is None
     assert GpuDemand.from_env({gpu_demand.MODE_ENV: "reserved"}).enabled is False
     # inside a command tree that already holds the cards nothing asks again
     assert GpuDemand.from_env(
@@ -217,6 +242,19 @@ def test_wrapper_routes_the_schedulers_output_and_the_commands(scheduler, tmp_pa
     assert "Reserved 2 GPU(s): [7]" in spoken
     assert "failed to activate booking" in spoken     # never in the command's streams
     assert granted_gpus(side) == ["7"] and scheduler_error(side) == ""
+
+
+def test_wrapper_without_a_bound_waits_for_the_cards(scheduler, tmp_path):
+    env, _, refuse = scheduler
+    (tmp_path / "slow").touch()
+    env = dict(env, IMX_GPU_STUB_DELAY="3")
+    side = tmp_path / "side.log"
+    program = scheduler_wrap("printf 'ran\\n'", gpus=1, timeout_sec=600,
+                             wait="", note="a test", side_log=side)
+    assert "--wait" not in program
+    done = subprocess.run(["bash", "--norc", "-c", program], env=env,
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and done.stdout == "ran\n"
 
 
 def test_wrapper_reports_an_expired_wait_with_its_own_status(scheduler, tmp_path):
@@ -262,6 +300,74 @@ def test_runner_asks_for_the_jobs_cards_and_bounds_the_wait(scheduler, tmp_path)
     assert "--wait 50s" in program
     assert f"--timeout {int(100 + SCHEDULER_TIMEOUT_MARGIN_SEC)}s" in program
     assert "--idle-timeout 17m" in program
+
+
+def test_runner_waits_for_cards_and_times_the_test_from_the_grant(scheduler, tmp_path):
+    env, calls, refuse = scheduler
+    (tmp_path / "slow").touch()
+    # 4 s in the queue, a test allowed 2 s: timed from the spawn it would be
+    # killed in the queue; timed from the grant it runs to its end
+    job = TestJob(key="queued", command="printf 'ran\\n'", timeout_sec=2)
+    outcome = _runner(tmp_path, _UNBOUNDED).run(job, dict(env))
+    assert outcome.rc == 0 and not outcome.timed_out, outcome
+    program = outcome.plan.argv[-1]
+    assert "--wait" not in program                # nothing gives up on cards
+    log = Path(outcome.log_file).read_text()
+    assert "[gpu] queued for the scheduler's cards" in log
+    assert "[gpu] granted after" in log and "[gpu] 1 card(s) from the scheduler: [7]" in log
+    assert "\nran\n" in log
+
+
+def test_runner_a_refusal_is_not_a_wait(scheduler, tmp_path):
+    env, _, _ = scheduler
+    (tmp_path / "deny").touch()
+    job = TestJob(key="probe", command="printf 'ran\\n'", timeout_sec=600)
+    outcome = _runner(tmp_path, _UNBOUNDED).run(job, dict(env))
+    assert outcome.rc == 1 and not outcome.skipped and not outcome.timed_out
+    log = Path(outcome.log_file).read_text()
+    assert "[gpu] not run: the scheduler named no card(s) and said:" in log
+    assert "\nran\n" not in log
+
+
+def test_runner_lock_keeps_its_bounded_wait_whatever_the_queue(scheduler, tmp_path, monkeypatch):
+    import infermatrix_copilot.testing.runner as module
+
+    seen = []
+
+    class FakeLock:
+        def __init__(self, lock_dir, **kwargs):
+            seen.append(kwargs)
+
+        def acquire(self):
+            return self
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(module, "GpuLock", FakeLock)
+    job = TestJob(key="cpu", command="printf 'cpu\\n'", timeout_sec=30,
+                  min_gpus=0, gpu_lock=True, gpus=0)
+    locked = lambda demand: TestRunner(   # noqa: E731
+        repo_root=tmp_path, tests_dir=tmp_path / "tests",
+        gpu_lock_dir=tmp_path / "gpu_lock", gpu_demand=demand)
+    locked(_UNBOUNDED).run(job, dict(scheduler[0]))
+    locked(_DEMAND).run(job, dict(scheduler[0]))
+    # a run holding the lock may itself be queued for cards without a bound:
+    # the next one still gives up on the lock after its hour, as feedback
+    assert seen == [{}, {}]
+
+
+def test_runner_asks_for_what_the_jobs_tests_declare(scheduler, tmp_path):
+    env, calls, _ = scheduler
+    (tmp_path / "tests_x").mkdir()
+    (tmp_path / "tests_x" / "test_need.py").write_text(
+        "import pytest\npytestmark = [pytest.mark.core_model, pytest.mark.cards_4]\n"
+        "def test_a():\n    pass\n")
+    command = _PROBE + "\nprintf '%s\\n' pytest tests_x/test_need.py"
+    job = TestJob(key="need", command=command, timeout_sec=60, min_gpus=0, gpu_lock=True)
+    outcome = _runner(tmp_path).run(job, dict(env))
+    assert outcome.rc == 0 and _requests(calls) == ["gpus=4"]
+    assert "--gpus 4" in outcome.plan.argv[-1]
 
 
 def test_runner_caps_the_idle_release_of_a_long_job(scheduler, tmp_path):
@@ -366,6 +472,25 @@ def test_shell_tells_the_agent_when_no_card_was_granted(scheduler, monkeypatch):
     assert _requests(calls) == ["gpus=1"]
 
 
+def test_shell_asks_for_what_the_test_declares(scheduler, tmp_path, monkeypatch):
+    env, calls, _ = scheduler
+    monkeypatch.setenv(gpu_demand.MODE_ENV, "demand")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_need.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.core_model\n"
+        "@hardware_test(res={\"cuda\": \"L20\"}, num_cards=2)\n"
+        "def test_a():\n    pass\n")
+    tools = build_rebase_tools(
+        [{"name": "run_shell", "description": "Run a command",
+          "input_schema": {"type": "object"}}],
+        RebasePaths(omni_path=str(tmp_path), vllm_path="/", env=env))
+    result = json.loads(tools["run_shell"].handler(command="pytest tests/test_need.py",
+                                                   timeout=60))
+    assert result["exit_code"] == 0, result
+    assert _requests(calls) == ["gpus=2"]
+
+
 def test_shell_outside_demand_mode_never_asks(scheduler, tmp_path):
     env, calls, _ = scheduler
     result = _shell(env)("pytest -k x")
@@ -374,11 +499,95 @@ def test_shell_outside_demand_mode_never_asks(scheduler, tmp_path):
     assert _requests(calls) == []
 
 
+# -- what the selected tests declare ---------------------------------------------
+
+_TREE = {
+    "test_decorator.py": (
+        "import pytest\n"
+        "@pytest.mark.core_model\n"
+        "@hardware_test(res={\"cuda\": \"L20\"}, num_cards=2)\n"
+        "def test_a():\n    pass\n"),
+    "test_module.py": (
+        "import pytest\n"
+        "pytestmark = [pytest.mark.core_model, pytest.mark.cards_4]\n"
+        "def test_b():\n    pass\n"),
+    "test_class.py": (
+        "import pytest\n"
+        "class TestGroup:\n"
+        "    pytestmark = pytest.mark.core_model\n"
+        "    @hardware_marks(res={\"cuda\": \"L20\"}, num_cards={\"cuda\": 3, \"rocm\": 1})\n"
+        "    def test_c(self):\n        pass\n"),
+    "test_other_level.py": (
+        "import pytest\n"
+        "@pytest.mark.advanced_model\n"
+        "@hardware_test(res={\"cuda\": \"H100\"}, num_cards=8)\n"
+        "def test_d():\n    pass\n"),
+    "test_strings.py": (
+        "def test_quote():\n"
+        "    assert '-m \"cards_8\"' in buildkite()\n"),
+    "test_undeclared.py": "def test_e():\n    pass\n",
+}
+
+
+@pytest.fixture
+def tree(tmp_path):
+    (tmp_path / "tests").mkdir()
+    for name, text in _TREE.items():
+        (tmp_path / "tests" / name).write_text(text)
+    gpu_demand._NEEDS.clear()
+    return tmp_path
+
+
+def test_command_gpus_reads_what_the_selected_tests_declare(tree):
+    need = lambda command, **kw: command_gpus(command, 1, tree, **kw)   # noqa: E731
+    # the command's own expression is the selection
+    assert command_gpus("pytest -m 'core_model and cards_2'", 1, tree) == 2
+    # decorators, module marks, class marks, a per-platform number
+    assert need("pytest tests/test_decorator.py") == 2
+    assert need("pytest tests/test_module.py") == 4
+    assert need("pytest tests/test_class.py::TestGroup::test_c") == 3
+    # a test of another run level does not count at the default level
+    assert need("pytest tests/test_other_level.py") == 1
+    assert need("pytest tests/test_other_level.py --run-level advanced_model") == 8
+    # names inside strings are not needs, and a directory is all of its files
+    assert need("pytest tests/test_strings.py") == 1
+    assert need("pytest tests/ --run-level core_model") == 4
+    assert need("pytest tests/ --run-level advanced_model") == 8
+    # the level the command selects: its option, else the one level it names
+    assert need("pytest tests/test_other_level.py -m 'advanced_model and cuda'") == 8
+    # nothing declared: one card
+    assert need("pytest tests/test_undeclared.py") == 1
+    assert need("pytest tests/missing.py") == 1
+    assert need("python -c 'import torch'") == 1
+
+
+def test_command_gpus_does_not_count_what_the_expression_excludes(tree):
+    cpu_job = "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_8)"
+    assert command_gpus(f"pytest tests/ -m '{cpu_job}'", 1, tree) == 1
+    # the module's four and the class's three; four is excluded
+    assert command_gpus("pytest tests/ -m 'core_model and not cards_4'", 1, tree) == 3
+
+
+def test_command_gpus_cap_never_dips_below_a_callers_minimum(tree):
+    assert command_gpus("pytest tests/ --run-level advanced_model", 1, tree, 4) == 4
+    assert command_gpus("pytest tests/", 6, tree, 4) == 6
+    assert command_gpus("pytest -m 'full_model and cards_8'", 1, None, 4) == 4
+    assert command_gpus("pytest tests/", 0, tree, 4) == 4
+
+
+def test_command_gpus_rereads_edited_tests(tree):
+    assert command_gpus("pytest tests/test_undeclared.py", 1, tree) == 1
+    (tree / "tests" / "test_undeclared.py").write_text(
+        "import pytest\npytestmark = pytest.mark.core_model\n"
+        "@pytest.mark.cards_2\ndef test_e():\n    pass\n")
+    assert command_gpus("pytest tests/test_undeclared.py", 1, tree) == 1   # kept briefly
+    gpu_demand._NEEDS.clear()
+    assert command_gpus("pytest tests/test_undeclared.py", 1, tree) == 2
+
+
 # -- the module test wrapper --------------------------------------------------------
 
-def test_module_wrapper_asks_for_one_card_and_says_so_when_nothing_ran(
-        tmp_path, monkeypatch, capsys):
-    repo = tmp_path / "repo"
+def _wrapper_env(repo, tmp_path, monkeypatch):
     repo.mkdir()
     for name in ("IMX_ADAPTER_REBASE", "IMX_WATCHDOG_OVERLAY"):
         monkeypatch.delenv(name, raising=False)
@@ -388,6 +597,10 @@ def test_module_wrapper_asks_for_one_card_and_says_so_when_nothing_ran(
                        "IMX_GPU_MUTEX": "0", "CUDA_VISIBLE_DEVICES": "",
                        "TEST_TIMEOUT_SEC": "10"}.items():
         monkeypatch.setenv(key, value)
+    gpu_demand._NEEDS.clear()
+
+
+def _capturing_wrapper(monkeypatch):
     seen = {}
 
     class CapturingRunner:
@@ -400,6 +613,13 @@ def test_module_wrapper_asks_for_one_card_and_says_so_when_nothing_ran(
                 rc=0, skipped=True, log_file="", skip_reason="needs 1 GPU(s)")
 
     monkeypatch.setattr(module_pytest, "TestRunner", CapturingRunner)
+    return seen
+
+
+def test_module_wrapper_asks_for_one_card_and_says_so_when_nothing_ran(
+        tmp_path, monkeypatch, capsys):
+    _wrapper_env(tmp_path / "repo", tmp_path, monkeypatch)
+    seen = _capturing_wrapper(monkeypatch)
     # The wrapper keeps the outcome's own rc (its contract); a run that did
     # not happen is said on both streams, so no reader takes it for a pass.
     assert module_pytest.main(["-vv", "-s", "tests/worker/"]) == 0
@@ -407,3 +627,16 @@ def test_module_wrapper_asks_for_one_card_and_says_so_when_nothing_ran(
     captured = capsys.readouterr()
     for stream in (captured.out, captured.err):
         assert "skipped — needs 1 GPU(s)" in stream
+
+
+def test_module_wrapper_asks_for_what_its_tests_declare(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _wrapper_env(repo, tmp_path, monkeypatch)
+    (repo / "tests" / "worker").mkdir(parents=True)
+    # the wrapper selects core_model by default: the test says it needs two
+    (repo / "tests" / "worker" / "test_need.py").write_text(
+        "import pytest\npytestmark = pytest.mark.core_model\n"
+        "@pytest.mark.cards_2\ndef test_a():\n    pass\n")
+    seen = _capturing_wrapper(monkeypatch)
+    assert module_pytest.main(["-vv", "-s", "tests/worker/"]) == 0
+    assert seen["job"].gpus == 2

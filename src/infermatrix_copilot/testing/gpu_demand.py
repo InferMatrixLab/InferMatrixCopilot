@@ -9,8 +9,14 @@ the cards it needs and holds them exactly as long as it runs.
                            holds the cards and commands inherit them.
     IMX_GPU_HELD=1         set inside a command tree that already holds its cards;
                            nothing below asks the scheduler again.
-    IMX_GPU_WAIT=30m       how long a command waits in the scheduler's queue
-                           before it is reported as not run.
+    IMX_GPU_WAIT=30m       bounds the time a command waits in the scheduler's
+                           queue before it is reported as not run. Unset, it
+                           waits until the cards are granted (owner decision,
+                           2026-11-26: nothing gives up on cards).
+
+How many cards a command asks for is what it needs (the same decision: never
+which cards, only how many): `command_gpus`. `IMX_GPU_MAX` caps it; a test that
+declares more skips by its own guard, as it did whenever fewer cards were visible.
 
 Measured on the scheduler (2026-11-25): `gpu run` prints its progress to stdout
 and its errors to stderr ("Error: wait timeout exceeded"), exits 1 when it gave
@@ -23,9 +29,11 @@ command timeout takes any duration in seconds.
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -33,7 +41,9 @@ from typing import Mapping
 MODE_ENV = "IMX_GPU_MODE"
 HELD_ENV = "IMX_GPU_HELD"
 WAIT_ENV = "IMX_GPU_WAIT"
-DEFAULT_WAIT = "30m"
+MAX_ENV = "IMX_GPU_MAX"
+#: No bound: a command waits in the scheduler's queue until it gets its cards.
+DEFAULT_WAIT = ""
 #: The scheduler stops a command this long after the runner's own timers
 #: would have, so the runner's timeout stays the one that fires.
 SCHEDULER_TIMEOUT_MARGIN_SEC = 900
@@ -42,6 +52,14 @@ SCHEDULER_TIMEOUT_MARGIN_SEC = 900
 IDLE_MAX_SEC = 3 * 3600
 #: The wrapper's own status for "the scheduler granted no cards in time".
 NO_GPU_RC = 97
+#: The run level a test command selects, and the levels there are. A test of
+#: another level skips by its own guard when the cards are not there.
+RUN_LEVEL_OPTION = "--run-level"
+RUN_LEVELS = ("core_model", "advanced_model", "full_model")
+DEFAULT_RUN_LEVEL = "core_model"
+#: A declared need is read from the test files' source; agents edit tests while
+#: they work, so it is kept only briefly.
+_NEED_TTL_SEC = 300.0
 
 _CARDS = re.compile(r"\bcards_(\d{1,2})\b")
 _WAIT_EXPIRED = "wait timeout exceeded"
@@ -74,16 +92,22 @@ _COMMAND_START = ";|&()\n"
 
 @dataclass(frozen=True)
 class GpuDemand:
-    """Whether to ask the scheduler per command, and how long to wait for it."""
+    """Whether to ask the scheduler per command, how long to wait for it, and
+    the most cards one command asks for."""
     enabled: bool = False
     wait: str = DEFAULT_WAIT
+    maximum: int | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "GpuDemand":
         env = os.environ if env is None else env
+        try:
+            maximum = int(env.get(MAX_ENV, "") or 0) or None
+        except ValueError:
+            maximum = None
         return cls(enabled=env.get(MODE_ENV, "") == "demand"
                    and not env.get(HELD_ENV),
-                   wait=env.get(WAIT_ENV) or DEFAULT_WAIT)
+                   wait=(env.get(WAIT_ENV) or "").strip(), maximum=maximum)
 
 
 def duration_seconds(text: str, default: float = 0.0) -> float:
@@ -95,11 +119,218 @@ def duration_seconds(text: str, default: float = 0.0) -> float:
     return h * 3600 + minute * 60 + s
 
 
-def command_gpus(command: str, minimum: int = 0) -> int:
-    """Cards a test command needs: the largest `cards_N` pytest marker it
-    selects (every job of the manifest says `hw: any`), else `minimum`."""
-    found = [int(n) for n in _CARDS.findall(command or "") if 1 <= int(n) <= 16]
-    return max([minimum, *found])
+def command_gpus(command: str, minimum: int = 0,
+                 root: Path | str | None = None,
+                 maximum: int | None = None) -> int:
+    """The cards one test command needs.
+
+    A `cards_N` that the command's `-m` expression selects is the selection
+    itself (every job of the manifest says `hw: any`): its largest. One the
+    expression negates (`not cards_2`) is an exclusion, not a need: the
+    repository's own jobs say `core_model and cpu and not (cards_2 or ... or
+    cards_8)`. Otherwise, and given the `root` the command runs in, the tests
+    it names are read: the largest number of cards that a test of the command's
+    run level declares in those files, with a `cards_N` mark or with a
+    decorator's `num_cards=`. Tests of other levels and of excluded counts do
+    not count: they skip by their own guard when the cards are not there. A
+    test that declares nothing needs one (`minimum`). `maximum` caps what the
+    command and its tests say, never the caller's `minimum`.
+    """
+    command = command or ""
+    selected, excluded = _expression_cards(_option(_words(command), "-m") or "")
+    if selected or root is None:
+        return max(minimum, _capped(max(selected, default=0), maximum))
+    level = _run_level(command)
+    key = (str(root), tuple(_test_paths(command, Path(root))), level, tuple(excluded))
+    now = time.monotonic()
+    hit = _NEEDS.get(key)
+    if hit is None or hit[0] < now:
+        need = max([_file_need(path, level, excluded) for path in key[1]] or [0])
+        for stale in [k for k, v in _NEEDS.items() if v[0] < now]:
+            del _NEEDS[stale]
+        _NEEDS[key] = hit = (now + _NEED_TTL_SEC, need)
+    return max(minimum, _capped(hit[1], maximum))
+
+
+def _capped(need: int, maximum: int | None) -> int:
+    return min(need, maximum) if maximum and need else need
+
+
+_NEEDS: dict[tuple, tuple[float, int]] = {}
+
+
+def _words(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:                     # an unclosed quote
+        return command.split()
+
+
+_TOKEN = re.compile(r"\(|\)|\bnot\b|[A-Za-z_][\w.]*")
+
+
+def _expression_cards(expression: str) -> tuple[set[int], set[int]]:
+    """What a `-m` expression says about cards: the counts it selects and the
+    counts it negates. `not` applies to the one term that follows it, or to a
+    bracketed group."""
+    selected: set[int] = set()
+    excluded: set[int] = set()
+    negated = [False]           # per bracket level
+    after_not = False
+    for token in _TOKEN.findall(expression):
+        if token == "not":
+            after_not = True
+        elif token == "(":
+            negated.append(after_not or negated[-1])
+            after_not = False
+        elif token == ")":
+            if len(negated) > 1:
+                negated.pop()
+            after_not = False
+        else:
+            if _CARDS.fullmatch(token) and 1 <= int(token[6:]) <= 16:
+                (excluded if after_not or negated[-1] else selected).add(int(token[6:]))
+            after_not = False
+    return selected, excluded
+
+
+def _option(words: list[str], name: str) -> str | None:
+    for index, word in enumerate(words):
+        if word == name and index + 1 < len(words):
+            return words[index + 1]
+        if word.startswith(name + "="):
+            return word.split("=", 1)[1]
+    return None
+
+
+def _run_level(command: str) -> str:
+    """What a test command selects: its `--run-level`, else the one level its
+    `-m` expression names, else the default."""
+    words = _words(command)
+    level = _option(words, RUN_LEVEL_OPTION)
+    if level:
+        return level
+    expression = _option(words, "-m") or ""
+    named = [name for name in RUN_LEVELS if re.search(rf"\b{name}\b", expression)]
+    return named[0] if len(named) == 1 else DEFAULT_RUN_LEVEL
+
+
+def _test_paths(command: str, root: Path) -> list[Path]:
+    """The test files a command names: a file itself, or the test files under
+    a directory it names that lies inside `root`, below it, and is named like
+    a test directory (`tests`, `testing`, `test_*`). A node id counts as its
+    file. Nothing else is walked: a command may say `cd /tmp`."""
+    out: list[Path] = []
+    for word in _words(command):
+        if word.startswith("-"):
+            continue
+        path = root / re.split(r"::|\[", word, maxsplit=1)[0]
+        try:
+            inside = path.resolve().is_relative_to(root.resolve()) and path.resolve() != root.resolve()
+        except OSError:
+            continue
+        if not inside:
+            continue
+        if path.is_file() and path.suffix == ".py":
+            out.append(path)
+        elif path.is_dir() and any(part.startswith("test")
+                                   for part in path.relative_to(root).parts):
+            out.extend(_test_files(path))
+    return out
+
+
+#: Never read more test files than this for one command, nor walk these.
+_MAX_TEST_FILES = 4000
+_SKIP_DIRS = {".git", ".hg", ".venv", "venv", "node_modules", "__pycache__", ".tox", "build"}
+
+
+def _test_files(directory: Path) -> list[Path]:
+    out: list[Path] = []
+    for here, dirs, files in os.walk(directory):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not d.startswith("."))
+        for name in sorted(files):
+            if (name.startswith("test_") or name.endswith("_test.py")) and name.endswith(".py"):
+                out.append(Path(here) / name)
+                if len(out) >= _MAX_TEST_FILES:
+                    return out
+    return out
+
+
+def _file_need(path: Path, level: str, excluded: frozenset[int] = frozenset()) -> int:
+    """The largest number of cards that a test of `level` in one test file
+    declares, other than the counts a command excludes. Read from the source: names inside strings are not needs (the
+    repository's own tests quote CI commands that say `cards_8`)."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, SyntaxError, RecursionError):
+        return 0
+    need = 0
+    module_marks = _pytestmark(tree)
+    for fn, inherited in _tests(tree, module_marks):
+        declared = _test_need(fn, inherited, level)
+        if declared not in excluded:
+            need = max(need, declared)
+    return need
+
+
+def _tests(tree: ast.Module, module_marks: list[str]):
+    """Every test function of one file with the marks it inherits."""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            own = module_marks + _pytestmark(node)
+            for fn in node.body:
+                if isinstance(fn, ast.FunctionDef):
+                    yield fn, own
+        elif isinstance(node, ast.FunctionDef):
+            yield node, module_marks
+
+
+def _pytestmark(scope: ast.Module | ast.ClassDef) -> list[str]:
+    """The marks a module or a class applies through `pytestmark`."""
+    return [name for stmt in scope.body
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "pytestmark"
+                for target in stmt.targets)
+            for name in _mark_names(stmt.value)]
+
+
+def _mark_names(node: ast.expr) -> list[str]:
+    """`pytest.mark.cards_2` is `cards_2`; a list of marks is each of them; a
+    mark called with arguments is the mark's own name."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [name for item in node.elts for name in _mark_names(item)]
+    if isinstance(node, ast.Call):
+        return _mark_names(node.func)
+    if isinstance(node, ast.Attribute):
+        return [node.attr]
+    return []
+
+
+def _test_need(fn: ast.FunctionDef, inherited: list[str], level: str) -> int:
+    own = [name for d in fn.decorator_list for name in _mark_names(d)]
+    if not fn.name.startswith("test") or level not in inherited + own:
+        return 0
+    need = max((int(name[6:]) for name in inherited + own if _CARDS.fullmatch(name)),
+               default=0)
+    for decorator in fn.decorator_list:
+        if isinstance(decorator, ast.Call):
+            for keyword in decorator.keywords:
+                if keyword.arg == "num_cards":
+                    need = max(need, _num_cards(keyword.value))
+    return need
+
+
+def _num_cards(node: ast.expr) -> int:
+    """A decorator's `num_cards=`: one number for every platform, or the one
+    for CUDA."""
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.Dict):
+        for key, value in zip(node.keys, node.values):
+            if (isinstance(key, ast.Constant) and key.value == "cuda"
+                    and isinstance(value, ast.Constant) and type(value.value) is int):
+                return value.value
+    return 0
 
 
 def shell_needs_gpu(command: str) -> bool:
@@ -164,8 +395,9 @@ def scheduler_wrap(command: str, *, gpus: int, timeout_sec: float, wait: str,
     """A shell program (for `bash --norc -c`) that runs `command` under the
     scheduler. The command's stdout and stderr stay where the caller put them
     and the scheduler's own output goes to `side_log`. The program exits with
-    the command's status once the cards were granted, with NO_GPU_RC when the
-    wait expired, and with the scheduler's status for its other failures."""
+    the command's status once the cards were granted, with NO_GPU_RC when a
+    bounded `wait` expired, and with the scheduler's status for its other
+    failures."""
     ask = shlex.join([
         "gpu", "run", "--gpus", str(gpus),
         "--timeout", f"{int(timeout_sec)}s",
@@ -173,7 +405,9 @@ def scheduler_wrap(command: str, *, gpus: int, timeout_sec: float, wait: str,
         # may take longer before its first kernel (a model download), and the
         # timeout already bounds this reservation
         "--idle-timeout", idle_timeout(timeout_sec),
-        "--wait", wait, "--note", note, "--",
+        # no bound: the scheduler queues the command until it gets its cards
+        *(["--wait", wait] if wait else []),
+        "--note", note, "--",
         "bash", "--norc", "-c", "exec >&3 2>&4\n" + command])
     side = shlex.quote(str(side_log))
     return "\n".join([
