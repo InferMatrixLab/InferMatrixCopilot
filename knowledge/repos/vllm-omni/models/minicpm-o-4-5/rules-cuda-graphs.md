@@ -11,7 +11,7 @@ confidence: high
 # MiniCPM-o 4.5 Code2Wav CUDA graph 规则
 
 本页的 MCPMO-1d/1e 记录 CUDA HiFT 与 legacy CFM step 实现的合同，不是非 CUDA 的能力矩阵。
-支持的 Ascend 内部 graph、启动门禁与 fallback 查 [Code2Wav 运行时合同（MCPMO-1f）](rules-code2wav-runtime.md)。
+支持的 Ascend 内部 graph、启动门禁与 fallback 查 [Code2Wav 运行时合同（MCPMO-1f）](rules-code2wav-runtime.md#mcpmo-1f--ascend-code2wav-保持-outer-eager按实际-inner-graph-路径验收)。
 
 ## MCPMO-1d — HiFT graph 只捕获稳定 pre-iSTFT 子图并限界 shape cache
 
