@@ -181,11 +181,13 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
         import tempfile
 
         from ..testing.gpu_demand import (
-            HELD_ENV, MODE_ENV, NO_GPU_RC, GpuDemand, scheduler_error,
-            scheduler_wrap, shell_needs_gpu)
+            HELD_ENV, MODE_ENV, NO_GPU_RC, GpuDemand, command_gpus,
+            scheduler_error, scheduler_wrap, shell_needs_gpu)
 
         env, side_log, wait = (dict(paths.env) or None), None, ""
-        if GpuDemand.from_env(os.environ).enabled:
+        root = workdir or paths.omni_path      # where the command runs
+        demand = GpuDemand.from_env(os.environ)
+        if demand.enabled:
             # The mode is this process's (a bridge learns it from its env)
             # and must reach what the command starts: the test wrapper asks
             # for its own cards.
@@ -201,10 +203,12 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
                 os.close(fd)
                 side_log, wait = Path(name), f"{max(int(timeout / 2), 1)}s"
                 command = scheduler_wrap(
-                    command, gpus=1, timeout_sec=timeout + 60, wait=wait,
+                    command, gpus=command_gpus(command, 1, root=root,
+                                               maximum=demand.maximum),
+                    timeout_sec=timeout + 60, wait=wait,
                     note=f"imx agent shell {os.getpid()}", side_log=side_log)
         try:
-            result = _run_shell(command, workdir, timeout, env)
+            result = _run_shell(command, root, timeout, env)
         finally:
             scheduler = scheduler_error(side_log) if side_log else ""
             if side_log:
@@ -225,7 +229,7 @@ def build_rebase_tools(tool_defs: list[dict], paths: RebasePaths,
         from ..testing.process_tree import collect_descendants, kill_tree
         from ..testing.runner import TestRunner, _record_walk
 
-        cwd = workdir or paths.omni_path
+        cwd = workdir                          # resolved by the caller
         try:
             with subprocess.Popen(
                     # Match TestRunner's runtime protection: inherited SSH

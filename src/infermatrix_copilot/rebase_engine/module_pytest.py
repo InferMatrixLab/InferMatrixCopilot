@@ -54,6 +54,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from ..testing.gpu_demand import GpuDemand, command_gpus
 from ..testing.runner import TestJob, TestOutcome, TestRunner
 from ..testing.watchdog import WatchdogPatterns
 
@@ -459,9 +460,11 @@ def main(argv: list[str] | None = None, *,
     # pass), while gpu_lock=True holds the lock for the run
     job = TestJob(key=_job_key(args), command=command, timeout_sec=timeout,
                   min_gpus=0, gpu_lock=_needs_gpu_lock(args), index=0,
-                  # the tests may use a card, as they could under the
+                  # as many cards as the tests it runs declare, and one at
+                  # least: they may use a card, as they could under the
                   # campaign-wide reservation this wrapper used to run in
-                  gpus=1)
+                  gpus=command_gpus(command, 1, root=repo,
+                                    maximum=GpuDemand.from_env().maximum))
     if process_setup:
         process.install_signal_handlers(runner)
     outcome = runner.run(job, dict(os.environ))

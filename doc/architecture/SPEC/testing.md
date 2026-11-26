@@ -1,8 +1,8 @@
 # testing/ —— 规范
 
-<!-- verified-against: 2026-11-25 -->
+<!-- verified-against: 2026-11-26 -->
 
-`LOC ~2190（9 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
+`LOC ~2450（9 个文件） · 测试执行底座（rebase agent shell 测试层的 Python 移植） · refactor-status: ok`
 
 ## 职责
 仓库中立的测试执行底座：gpu_lock.sh / kill_test_tree.sh / test_watchdog.sh /
@@ -42,8 +42,8 @@ test_runner.sh 的 Python 移植。仓库专属数据（watchdog 模式、artifa
 - `gpu_demand`：`GpuDemand`（`.from_env`）、`command_gpus`、`shell_needs_gpu`、
   `scheduler_wrap`、`idle_timeout`、`granted_gpus`、`scheduler_error`、
   `duration_seconds`、`session_devices`、`prompt_devices`；常量 `MODE_ENV`、
-  `HELD_ENV`、`WAIT_ENV`、`NO_GPU_RC`、`SCHEDULER_TIMEOUT_MARGIN_SEC`、
-  `IDLE_MAX_SEC`。
+  `HELD_ENV`、`WAIT_ENV`、`MAX_ENV`、`NO_GPU_RC`、`SCHEDULER_TIMEOUT_MARGIN_SEC`、
+  `IDLE_MAX_SEC`、`RUN_LEVEL_OPTION`、`RUN_LEVELS`、`DEFAULT_RUN_LEVEL`。
 - `watchdog`：`WatchdogPatterns(.from_yaml)`、`LogWatchdog(.start/.stop/.check_once/.result)`、`WatchdogResult`。
 - `watchdog_learn`：`record`、`harvest`、`eligible_patterns`、`promote`、
   `read_decisions`、`normalize_pattern`、`repair_tail`。
@@ -96,10 +96,11 @@ env 前缀 → `scrub_agent_shell_env(extra_safe_prefixes=…)`（manifest 数�
 （TestRunner 对 shell 的 command-echo 金样）、`test_module_pytest_signals.py`
 （经包装器：`terminate_active` 停树、stdin=/dev/null）；`watchdog_learn` 另由
 `test_curator.py`（harvest exactly-once）与 `test_knowledge_foundation.py`
-（record 身份字段、撕尾修复）钉住。`test_gpu_demand.py`（64 个）以一个替身 `gpu`
-可执行文件覆盖按需模式：卡数、shell 命令的判定、包装程序的输出路由与等待到期、
-空闲回收的单位与上限、调度器拒绝请求时的日志行、`TestRunner` 的 skip，以及 agent
-shell 与模块测试包装器。
+（record 身份字段、撕尾修复）钉住。`test_gpu_demand.py`（74 个）以一个替身 `gpu`
+可执行文件覆盖按需模式：卡数（含测试声明的读取与上限）、shell 命令的判定、
+包装程序的输出路由、不限等待与有界等待到期、给卡后才计时、锁仍有界、
+空闲回收的单位与上限、调度器拒绝请求时的日志行、`TestRunner` 的 skip，以及
+agent shell 与模块测试包装器。
 
 ## 重构备注
 `runner.py`（643L）是包内最重的一块：`_spawn` 把快照线程、双定时器、watchdog
@@ -127,19 +128,26 @@ GPU 锁下一次只跑一个，52 个只用 1 张卡。负责人决定：不再�
 campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在运行期间持有。
 
 - **开关。** `IMX_GPU_MODE=demand` 选择按需模式；未设置时行为不变（调用方已
-  持有卡，命令继承）。`IMX_GPU_WAIT`（缺省 `30m`）是命令在调度器队列里的等待
+  持有卡，命令继承）。`IMX_GPU_WAIT` 给命令在调度器队列里的等待设上限；不设则
+  一直等到拿到卡（2026-11-26 起，见下文）。`IMX_GPU_MAX` 是一条命令申请卡数的
   上限。`IMX_GPU_HELD=1` 表示所在命令树已持有卡，其下任何 `TestRunner` 都不再
   申请。`TestRunner` 缺省从环境读取（`GpuDemand.from_env`），测试可显式传
   `gpu_demand=`。
-- **卡数。** `TestJob.gpus` 显式给出；缺省取三者最大值：`min_gpus`、命令里最大
-  的 `cards_N` pytest marker（manifest 的每个 job 都是 `hw: any`，卡数只在 marker
-  里）、以及"取 GPU 锁的运行算 1 张"。0 表示不申请（`run_precommit`）。agent 的
-  `run_pytest`/`reproduce` 与 `imx-omni-pytest` 包装器各要 1 张。
+- **卡数 = 需要。** `TestJob.gpus` 显式给出；否则 `command_gpus(command, minimum,
+  root, maximum)`：命令自己的 `-m` 表达式里有 `cards_N` 就以其中最大者为准
+  （manifest 的每个 job 都是 `hw: any`，卡数只在 marker 里）；没有时读取命令
+  所指定的测试文件，取其中**与命令同属一个运行级别**（`--run-level`，缺省
+  `core_model`）的测试所声明的最大卡数——`cards_N` 标记，或装饰器的 `num_cards=`。
+  其它级别的测试不计：卡不够时它们按自己的保护跳过，不会失败。没有声明算 1 张。
+  结果不低于 `minimum`（取 GPU 锁的运行至少 1 张，`run_precommit` 为 0、不申请），
+  不高于 `maximum`。agent 的 `run_pytest`/`reproduce`、`imx-<仓库>-pytest` 包装器
+  与 agent 在 shell 里起的测试走同一套算法。
 - **包装程序。** `scheduler_wrap(command, gpus, timeout_sec, wait, note, side_log)`
   返回一段给 `bash --norc -c` 的 shell：命令的 stdout/stderr 留在调用方给的描述符
   （fd 3/4），调度器自己的输出写进 `<日志>.scheduler`。实测调度器把进度打到
-  stdout、把 `Error: wait timeout exceeded` 打到 stderr，等待到期时退出码为 1；
-  包装程序把它换成 `NO_GPU_RC`（97），其余失败保留调度器的退出码。调度器的超时设为
+  stdout、把 `Error: wait timeout exceeded` 打到 stderr，有界等待到期时退出码为 1；
+  包装程序把它换成 `NO_GPU_RC`（97），其余失败保留调度器的退出码。`wait` 为空时
+  不传 `--wait`，调度器一直排队。调度器的超时设为
   `timeout_sec + SCHEDULER_TIMEOUT_MARGIN_SEC`（秒），让运行器自己的定时器先触发。
   空闲回收由 `idle_timeout()` 给出：同一个时长向上取整到**单一单位**（秒、分或小时），
   且不超过 `IDLE_MAX_SEC`（3 小时）。实测（2026-11-25）调度器只解析单一单位的空闲
@@ -153,9 +161,10 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
   命令失败且调度器报了错时才附上它的错误文本。日志里没有 `Reserved …` 可依时写
   `[gpu] not run: the scheduler named no card(s) and said: …`——没有卡，命令就没跑；
   错误文本在它随后的 `Usage:` 处截断。
-- **排队到期是一次显式 skip。** `TestRunner.run` 返回 `rc=0, skipped=True`，
-  `skip_reason` 写明要几张、等了多久；命令没有运行，也不写 pass marker。等待
-  上限不超过 `timeout_sec` 的一半：运行器的定时器从 spawn 起算，排队时间也在内。
+- **有界等待到期是一次显式 skip**（只在设了 `IMX_GPU_WAIT` 时）。`TestRunner.run`
+  返回 `rc=0, skipped=True`，`skip_reason` 写明要几张、等了多久；命令没有运行，
+  也不写 pass marker。上限不超过 `timeout_sec` 的一半：那时运行器的定时器从
+  spawn 起算，排队时间也在内。
 - **按需模式下由调度器决定有没有卡**：不做硬件门槛，丢掉继承的
   `CUDA_VISIBLE_DEVICES`（调度器授权时自己命名），并给子进程设 `IMX_GPU_HELD=1`。
 - **命令结束后不在已释放的卡上清理进程。** 外层预约时代
@@ -178,3 +187,39 @@ campaign，改为每条 GPU 命令向调度器申请自己需要的卡、只在�
 
 实测（2026-11-25）：一条 `TestRunner` 命令在真实调度器下恰好持有 1 张卡 35 秒，
 前后都是 0；torch 看到 1 张卡；import vllm 及其编译扩展不建立 CUDA 上下文。
+
+## 一直等到有卡、按需要申请（2026-11-26）
+
+负责人在 2026-11-26 定了三条：排不到卡就一直等，不放弃也不跳过；不指定要哪几张
+卡，申请的数量与需要的一致；不做任何 reserve，只走调度器的队列。
+
+- **一直等。** `IMX_GPU_WAIT` 不再设缺省值：`gpu run` 不带 `--wait`。运行器的
+  定时器与看门狗改为在调度器给卡之后才启动——`_await_grant` 每秒读一次旁路文件，
+  直到出现 `Reserved …` 或进程退出。排队时间因此不计入测试的超时；此前定时器从
+  spawn 起算，一条排了两小时的命令会在队列里被自己的超时杀掉。旁路文件在启动前
+  清空：上一次运行留下的给卡记录不能让这一次的等待提前结束。日志里写两行：
+  `[gpu] queued for the scheduler's cards at …` 与 `[gpu] granted after N s in the
+  queue: [..]`——空了几小时的日志在读的人看来是挂死。调度器**拒绝**请求不是等待：
+  进程退出，日志照旧写 `not run`。GPU 锁保持它一小时的有界等待，没有跟着放开：
+  持锁的那个运行自己可能在队列里排几个小时，后面等锁的若不设上限，agent 的会话
+  就会无声地卡住；锁超时是它能据以行动的反馈。"一直等"说的是卡，锁是自己的串行。
+- **按需要。** 模块测试此前固定申请 1 张，而以前外层预约时代每个模块的测试都能
+  看到 4 张卡：`tests/diffusion/models/hy_nomas/test_pixelumm_parallel.py` 按
+  2、4 个进程 `mp.spawn`，没有 `cards_N` 标记也没有保护，1 张卡下必然失败。
+  卡数于是改为读测试自己的声明：`command_gpus` 的规则见上文"卡数 = 需要"。读取
+  用 AST，不认字符串里的名字——目标仓库自己的测试会引用写着 `cards_8` 的 CI 命令。
+  只扫仓库根目录之内、路径名以 `test` 开头的目录，至多 4000 个文件；命令里出现的
+  别的目录一律不碰（一个以 `/` 为根的测试里，命令说了 `cd /tmp`）。结果缓存 5 分钟：
+  agent 一边工作一边改测试。
+- **上限。** `tests/e2e --run-level advanced_model` 声明的需求是 8 张，也就是整台
+  机器；配上"一直等"，这样一条命令可能永远排不上。`IMX_GPU_MAX` 封顶，launcher
+  里取 4——以往每个 campaign 的配置，也是 `core_model` 级别上声明的最大需求。
+  超出部分的测试按它们自己的保护跳过，和以前只看得到 4 张卡时一样。
+- **仍然有界的一处。** agent 在 `run_shell` 里同步起的测试，等待不超过该次工具
+  调用超时的一半：工具调用的期限是 harness 定的，超了它等不下去；到期时返回
+  `gpu_unavailable`，提示词本就要求长验证走包装器的分离运行。
+
+实测（2026-11-25/26）：`tests/` 全树在 `core_model` 级别上声明 1 张的 196 个文件、
+2 张的 14 个、4 张的 6 个；按模块，worker_runner / input_output / online_serving /
+model_config 需要 1 张（后者无声明），model_executor / scheduler / platform 的
+全量运行需要 4 张。AST 解析全树约 6 秒，单个模块目录 1–2 秒。

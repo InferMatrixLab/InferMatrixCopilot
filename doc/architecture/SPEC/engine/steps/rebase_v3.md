@@ -1,6 +1,6 @@
 # engine/steps/rebase_v3.py —— 规范
 
-<!-- verified-against: 2026-11-25 -->
+<!-- verified-against: 2026-11-26 -->
 
 `LOC ~2660 · step 库（v3 rebase 装配层） · refactor-status: oversized`
 
@@ -172,7 +172,9 @@ campaign 改为按命令向调度器取卡之后（`testing` 规范的"按命令
 经本文件启动的 GPU 命令各自声明要几张：
 
 - `run_pytest`/`reproduce`（`_run_tests`）以 `TestJob(min_gpus=0, gpu_lock=True,
-  gpus=1)` 运行，向调度器要 1 张卡。返回值新增 `skipped` 与 `skip_reason`；
+  gpus=None)` 运行：卡数由 `TestRunner` 按 `command_gpus` 从命令及其测试的声明推导，
+  至少 1 张（2026-11-26 起"按需要申请"，此前固定 1 张）。返回值新增 `skipped` 与
+  `skip_reason`；
   `passed` 只在 `rc == 0 and not skipped` 时为真——调度器没给卡的运行没有通过。
 - `run_precommit` 以 `gpus=0` 运行，不申请。
 - 两处 `ModuleRunConfig` 的 `cuda_devices` 改取 `testing.gpu_demand.session_devices()`：

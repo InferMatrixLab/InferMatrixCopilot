@@ -22,6 +22,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -359,6 +360,9 @@ class TestRunner:
         gpus = self._job_gpus(job) if self.gpu_demand.enabled else 0
         side_log = (log_file.with_name(log_file.name + ".scheduler")
                     if gpus else None)
+        # unbounded queue wait: the command's timers start when the scheduler
+        # grants its cards, so time in the queue is not time off the test
+        queue = side_log if gpus and self._waits_for_cards() else None
         plan = RunPlan(
             argv=["bash", "--norc", "-c",
                   self._command(job, job.command, side_log)],
@@ -432,6 +436,9 @@ class TestRunner:
         # before touching the GPU and the fallback does the real workload.
         lock: GpuLock | None = None
         if plan.needs_gpu_lock and self.gpu_lock_dir is not None:
+            # the lock keeps its bounded wait: a run holding it may sit in the
+            # scheduler's queue for hours, and a silent wait behind it would
+            # stall the agent's session; a lock timeout is feedback it can act on
             lock = GpuLock(self.gpu_lock_dir).acquire()
         try:
             # append: backup_prev_log already truncated this attempt's log,
@@ -443,12 +450,12 @@ class TestRunner:
                 primary_offset = 0
             rc, wd_hit, timed_out = self._spawn(
                 self._command(job, job.command, side_log), job, run_env,
-                log_file, append=True)
+                log_file, append=True, queue=queue)
             if gpus:
                 self._note_scheduler(job, side_log, rc, log_file)
             if rc == NO_GPU_RC:
-                # The queue outlasted the wait. An explicit skip, like the
-                # hardware gate: never a failure, never a silent pass.
+                # A bounded wait (IMX_GPU_WAIT) expired. An explicit skip, like
+                # the hardware gate: never a failure, never a silent pass.
                 return TestOutcome(rc=0, skipped=True, log_file=str(log_file),
                                    plan=plan, skip_reason=(
                                        f"needs {self._job_gpus(job)} GPU(s); the "
@@ -495,6 +502,28 @@ class TestRunner:
                            timed_out=timed_out, log_file=str(log_file),
                            plan=plan)
 
+    def _await_grant(self, proc: subprocess.Popen, side_log: Path,
+                     log_file: Path, stop: threading.Event) -> None:
+        """Wait, for as long as it takes, for the scheduler to grant the cards
+        (owner decision, 2026-11-26: nothing gives up on cards). The attempt's
+        timers and watchdog start after this. The log says the command is
+        queued: an empty log for hours reads as a hang to whoever polls it."""
+        queued = time.time()
+        with open(log_file, "a", encoding="utf-8") as lf:
+            lf.write(f"\n[gpu] queued for the scheduler's cards at "
+                     f"{time.strftime('%H:%M:%S', time.localtime(queued))}; "
+                     "the test's own timeout starts when they are granted.\n")
+        granted: list[str] = []
+        while proc.poll() is None and not granted:
+            granted = granted_gpus(side_log)
+            if not granted:
+                stop.wait(1.0)
+        granted = granted or granted_gpus(side_log)   # it may have run and gone
+        if granted:
+            with open(log_file, "a", encoding="utf-8") as lf:
+                lf.write(f"[gpu] granted after {int(time.time() - queued)} s in the queue: "
+                         f"[{' '.join(granted)}]\n")
+
     # -- cards on demand ------------------------------------------------------
     def _job_gpus(self, job: TestJob) -> int:
         """What one job asks the scheduler for (TestJob.gpus)."""
@@ -503,11 +532,20 @@ class TestRunner:
         takes_gpu = (job.gpu_lock if job.gpu_lock is not None
                      else job.min_gpus > 0)
         return command_gpus(job.command,
-                            max(job.min_gpus, 1 if takes_gpu else 0))
+                            max(job.min_gpus, 1 if takes_gpu else 0),
+                            root=self.repo_root, maximum=self.gpu_demand.maximum)
+
+    def _waits_for_cards(self) -> bool:
+        """Demand mode with no bound on the queue: a command waits for its
+        cards until it gets them."""
+        return self.gpu_demand.enabled and not self.gpu_demand.wait
 
     def _wait(self, job: TestJob) -> str:
-        """The queue wait: the configured one, but never more than half of the
-        job's timeout, because the runner's own timer starts at the spawn."""
+        """The queue wait as the scheduler takes it: "" when nothing bounds
+        it. A bound is capped at half of the job's timeout, because the
+        runner's own timer starts at the spawn then."""
+        if not self.gpu_demand.wait:
+            return ""
         seconds = min(duration_seconds(self.gpu_demand.wait, 1800.0),
                       job.timeout_sec / 2)
         return f"{max(int(seconds), 1)}s"
@@ -599,7 +637,8 @@ class TestRunner:
                 pass
 
     def _spawn(self, exec_cmd: str, job: TestJob, env: dict[str, str],
-               log_file: Path, *, append: bool) -> tuple[int, bool, bool]:
+               log_file: Path, *, append: bool,
+               queue: Path | None = None) -> tuple[int, bool, bool]:
         timed_out = threading.Event()
         # scope this attempt's watchdog to bytes IT produces — setup output
         # and previous-attempt tails are not this attempt's evidence
@@ -607,6 +646,10 @@ class TestRunner:
             attempt_offset = log_file.stat().st_size if append else 0
         except OSError:
             attempt_offset = 0
+        if queue is not None:
+            # the side log is reused between attempts: a grant recorded by the
+            # previous one would end this attempt's wait before it began
+            queue.write_text("")
         with open(log_file, "a" if append else "w", encoding="utf-8") as lf:
             # Bash can source ~/.bashrc for a noninteractive SSH-launched
             # shell at SHLVL=0. That can put a foreign CLI ahead of the
@@ -671,28 +714,37 @@ class TestRunner:
                 self._active_kill = _kill_snapshot
 
             watchdog = None
-            if self.patterns is not None:
-                watchdog = LogWatchdog(
-                    self.patterns, log_file, proc.pid, job.key,
-                    check_interval=self.watchdog_interval,
-                    review_fn=self.review_fn, record_fn=self.record_fn,
-                    report_fn=self.report_fn, start_offset=attempt_offset,
-                    kill_fn=lambda pid: _kill_snapshot()).start()
-
-            def primary():
-                timed_out.set()
-                _snapshot()  # leader still alive here: refresh before killing
-                self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
-
-            def safety():  # only matters if the primary path wedged
-                _kill_group(pgid, signal.SIGKILL)
-
-            t_primary = threading.Timer(job.timeout_sec, primary)
-            t_safety = threading.Timer(job.timeout_sec + PY_TIMEOUT_MARGIN_SEC,
-                                       safety)
-            t_primary.start()
-            t_safety.start()
+            timers: list[threading.Timer] = []
             try:
+                if queue is not None:
+                    self._await_grant(proc, queue, log_file, stop_snap)
+                    # the queue lines are the runner's, not this attempt's evidence
+                    try:
+                        attempt_offset = log_file.stat().st_size
+                    except OSError:
+                        pass
+                if self.patterns is not None:
+                    watchdog = LogWatchdog(
+                        self.patterns, log_file, proc.pid, job.key,
+                        check_interval=self.watchdog_interval,
+                        review_fn=self.review_fn, record_fn=self.record_fn,
+                        report_fn=self.report_fn, start_offset=attempt_offset,
+                        kill_fn=lambda pid: _kill_snapshot()).start()
+
+                def primary():
+                    timed_out.set()
+                    _snapshot()  # leader still alive here: refresh before killing
+                    self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
+
+                def safety():  # only matters if the primary path wedged
+                    _kill_group(pgid, signal.SIGKILL)
+
+                t_primary = threading.Timer(job.timeout_sec, primary)
+                t_safety = threading.Timer(
+                    job.timeout_sec + PY_TIMEOUT_MARGIN_SEC, safety)
+                timers = [t_primary, t_safety]
+                t_primary.start()
+                t_safety.start()
                 try:
                     rc = proc.wait()
                 except BaseException:
@@ -702,6 +754,12 @@ class TestRunner:
                     _snapshot()
                     self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
                     raise
+            except BaseException:
+                # unwound before the wait above, while still queued for cards:
+                # the same rule — the tree must not outlive it
+                _snapshot()
+                self._terminate_tree(proc.pid, pgid, snapshot=tree["idmap"])
+                raise
             finally:
                 with self._active_lock:
                     self._active_kill = None
@@ -710,10 +768,10 @@ class TestRunner:
                 # cancel then JOIN: a fired primary timer is mid-escalation in
                 # its own thread — returning before it finishes would let the
                 # next job start while own-pgroup descendants still hold GPUs
-                t_primary.cancel()
-                t_safety.cancel()
-                t_primary.join()
-                t_safety.join()
+                for timer in timers:
+                    timer.cancel()
+                for timer in timers:
+                    timer.join()
                 if watchdog is not None:
                     watchdog.stop()
                     # final scan: a job shorter than the poll interval (or a

@@ -1,6 +1,6 @@
 # rebase_engine/ —— 规范
 
-<!-- verified-against: 2026-11-25 -->
+<!-- verified-against: 2026-11-26 -->
 
 `LOC ~9530（30 个模块） · repo-rebase-v3 的原生 rebase 引擎 · refactor-status: ok`
 
@@ -269,14 +269,17 @@ campaign 不再从头到尾持有一份外层预约，每条 GPU 命令向调度
   `_run_shell`（原有的 Popen、后代快照与超时逻辑未变）。按需模式（读本进程环境的
   `IMX_GPU_MODE`）下，它把模式写进子进程环境，使命令启动的 `imx-omni-pytest`
   自己去申请；`testing.gpu_demand.shell_needs_gpu` 判定会起测试或 CUDA 代码的命令，
-  用 `scheduler_wrap` 向调度器要 1 张卡（等待上限是工具超时的一半），并给子进程设
+  用 `scheduler_wrap` 向调度器要卡，张数取 `command_gpus(command, 1, root)`——
+  命令的实际 cwd，缺省是目标仓库；至少 1 张（等待上限是工具超时的一半），并给子进程设
   `IMX_GPU_HELD=1`，命令启动的东西不再申请。等待到期时返回
   `{"exit_code": 1, "gpu_unavailable": true, "stderr": "Not run: …"}`；其余失败
   在 stderr 前附上调度器的错误文本。2026-11-24/25 的 campaign 里，agent 的 1039 次
   工具调用有 882 次走 `run_shell`（计划评审之前 `run_pytest` 是锁住的），其中绝大多数
   是 `git`、`grep` 与读取，不受影响。
-- **`module_pytest.py`。** 包装器的 `TestJob` 带 `gpus=1`：测试可能用到卡，如同它
-  过去在外层预约下运行时那样。包装器仍返回结果自己的 rc（既有契约，由
+- **`module_pytest.py`。** 包装器的 `TestJob` 带
+  `gpus=command_gpus(command, 1, root=repo, maximum=…)`：以它所选测试声明的需要
+  为准（`testing` 规范的"卡数 = 需要"），至少 1 张——测试可能用到卡，如同它过去在
+  外层预约下运行时那样。包装器仍返回结果自己的 rc（既有契约，由
   `test_module_pytest_outcomes.py` 钉住），所以跳过时把
   `imx-omni-pytest: skipped — <原因>` 同时写到 stdout 和 stderr。
 - **提示词。** `build_module_prompt(..., cuda_devices=prompt_devices(config.cuda_devices))`：
@@ -295,3 +298,9 @@ campaign 不再从头到尾持有一份外层预约，每条 GPU 命令向调度
 final 只有 `cu130`。按目标的 variant 去取，测试循环用来区分既有失败与回归的基线
 运行时就建不出来，退回到让基线也跑在 campaign 的 venv 上。vllm-omni adapter 把
 `baseline_variant` 设为 `cu130`。测试：`test_rebase_release_target.py`。
+
+2026-11-26：负责人定了"一直等到有卡、按需要申请、不做 reserve"。两处的卡数从固定
+1 张改为按需要推导：此前模块测试只申请 1 张，而外层预约时代每个模块的测试都看得到
+4 张卡，需要多张卡的测试因此失败（`tests/diffusion/models/hy_nomas/
+test_pixelumm_parallel.py`）。等待不再有缺省上限（`run_shell` 里同步起的测试除外，
+见 `testing` 规范）。
