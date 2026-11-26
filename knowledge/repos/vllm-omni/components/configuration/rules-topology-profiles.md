@@ -1,10 +1,10 @@
 ---
 title: "topology 与部署 profile 合同"
 created: 2026-09-04
-updated: 2026-10-06
+updated: 2026-11-26
 type: rule
 tags: [vllm-omni, components, config]
-sources: ["PR #4222", "PR #4795", "PR #5604", "PR #5842", "PR #5885", "PR #6082", vllm_omni/config/stage_config.py, vllm_omni/config/config_factory.py, vllm_omni/engine/stage_init_utils.py, vllm_omni/engine/stage_runtime.py, tests/engine/test_async_omni_engine_stage_init.py, vllm_omni/deploy/, "PR #6186", "PR #6813", "PR #6291", "PR #6829", vllm_omni/config/pipeline_registry.py, tests/config/test_config_factory.py, tests/config/test_omni_config.py, tests/config/test_pipeline_registry.py, tests/utils/test_tracking_parser.py, "PR #6230", vllm_omni/entrypoints/utils.py, tests/entrypoints/test_serve.py, tests/entrypoints/test_utils.py, "PR #7272", "PR #8184"]
+sources: ["PR #4222", "PR #4795", "PR #5604", "PR #5842", "PR #5885", "PR #6082", vllm_omni/config/stage_config.py, vllm_omni/config/config_factory.py, vllm_omni/engine/stage_init_utils.py, vllm_omni/engine/stage_runtime.py, tests/engine/test_async_omni_engine_stage_init.py, vllm_omni/deploy/, "PR #6186", "PR #6813", "PR #6291", "PR #6829", vllm_omni/config/pipeline_registry.py, tests/config/test_config_factory.py, tests/config/test_omni_config.py, tests/config/test_pipeline_registry.py, tests/utils/test_tracking_parser.py, "PR #6230", vllm_omni/entrypoints/utils.py, tests/entrypoints/test_serve.py, tests/entrypoints/test_utils.py, "PR #7272", "PR #8184", "PR #10595"]
 confidence: high
 ---
 
@@ -50,9 +50,12 @@ confidence: high
 - 验收：用 bare `config.json` 和三个 architecture 分别验证 model type、pipeline、stage config 与默认 deploy 名称；sync/async 配置只切换 processor wiring，并保持三 stage 顺序与 stage architecture 一致。
 ^[PR #5842]
 
-## CONF-5e — MiniCPM-o 部署 profile 必须一致传递 CFM Graph 开关
+## CONF-5e — MiniCPM-o CFM Graph 参数必须投影到实际平台与 profile
 
-- 触发：修改 MiniCPM-o 4.5 bundled deploy YAML 或 Code2Wav connector extra 中的 CFM CUDA Graph 开关、缓存上限或配置传递。\n- 强制：`minicpmo_4_5.yaml`、`minicpmo_4_5_2gpu.yaml`、`minicpmo_4_5_3gpu.yaml` 和 `minicpmo_4_5_8x4090.yaml` 必须一致声明 `enable_cfm_graph` 与 `cfm_max_graphs`；当前默认值为 `true` 与 `32`，并传入 `MiniCPMO45Code2Wav` 的 `_cfm_graph_config` 和 `BatchedToken2Wav`。非 CUDA 设备仍必须回退 eager。\n- 禁止：只更新一个 deploy profile、依赖未记录的默认值，或把配置存在误认为 graph 已在非 CUDA 环境生效；不得把模型专有开关扩展成所有模型的通用配置合同。\n- 验收：解析四份 deploy 配置并断言开关和上限一致，追踪非默认值到 `_cfm_graph_config` 与 `BatchedToken2Wav`；覆盖开关关闭和非 CUDA fallback，并确认 stage topology 未发生额外变化。\n^[PR #6082]
+- 触发：修改 MiniCPM-o 4.5 bundled deploy YAML 或 Code2Wav connector extra 中的 CFM graph 开关、预算或配置传递。
+- 强制：按目标 revision 展开 `base_config`、平台及 stage 覆盖，跟踪 connector CFM 参数到 `MiniCPMO45Code2Wav` / `BatchedToken2Wav`；Ascend 的 Stage 2 本地开关和上限按 CONF-5g 验证。
+- 禁止：要求派生 YAML 重复声明继承字段、所有 profile 使用同一预算，或把 #6082 的 CUDA 路径解释为所有非 CUDA 设备永远 eager；配置存在不等于捕获、重放或测量已经发生。
+- 验收：对支持的 profile 检查展开后的启停、默认/覆盖值和非默认配置确实到达 consumer；分别覆盖支持的平台与不支持的 eager 路径，不从 connector 改动推断 stage topology 改变。 ^[PR #6082] ^[PR #10595]
 
 ## CONF-5f — π0 的 checkpoint、registry 与 deploy 必须闭合为单 diffusion stage
 
@@ -63,10 +66,10 @@ confidence: high
 
 ## CONF-5g — MiniCPM-o NPU Code2Wav 开关必须按 Stage 2 传递
 
-- 触发：修改 MiniCPM-o 4.5 bundled deploy YAML，或新增/调整 `code2wav_enable_npu_graph`、`code2wav_max_npu_graphs` 这类 Ascend Code2Wav graph 配置。
-- 强制：`minicpmo_4_5.yaml`、`minicpmo_4_5_2gpu.yaml` 和 `minicpmo_4_5_3gpu.yaml` 必须在 `platforms.npu.stages` 中按 stage 声明配置；Stage 0/1 保持 `compilation_config.cudagraph_mode: PIECEWISE`，Stage 2 只通过 `additional_config` 传递 graph 开关和上限，默认值为 `true` 与 `32`，并保持最终 runner 的 outer eager 语义。所有断言必须基于 `_apply_platform_overrides` 与 `merge_pipeline_deploy` 展开的最终 stage config。
-- 禁止：把 Code2Wav NPU 开关放入 shared connector extra、全局配置或其他 stage；只修改一个 profile；以 YAML 原文或字段存在推断配置已到达 Code2Wav consumer；用全局 eager override 破坏 Stage 0/1 的 `PIECEWISE` 配置。
-- 验收：逐一解析三个 profile，断言 connector extra 不含两个 Code2Wav key，NPU 展开结果包含 Stage 0/1 的 `PIECEWISE`、Stage 2 的 `enforce_eager: true`、`code2wav_enable_npu_graph: true` 和 `code2wav_max_npu_graphs: 32`，并覆盖开关关闭和缓存上限为 0 的路径。^[PR #5604]
+- 触发：修改 MiniCPM-o 4.5 bundled deploy YAML 或调整 `code2wav_enable_npu_graph`、`code2wav_max_npu_graphs`。
+- 强制：Ascend 通过 Stage 2 的 `additional_config` 投影这两个 key，并保持最终 runner outer eager；encoder/CFM/HiFT 子图边界见 [MCPMO-1f](../../models/minicpm-o-4-5/rules-code2wav-runtime.md#mcpmo-1f-ascend-code2wav-保持-outer-eager-按实际-inner-graph-路径验收)。用 `_apply_platform_overrides` 与 `merge_pipeline_deploy` 核对实际 profile，包括替换而非深合并的 `additional_config` 和继承的 connector 设置。
+- 禁止：把这两个 key 放进 shared connector extra、全局配置或其他 stage；用全局 eager 改变 Stage 0/1；对所有 revision 和 profile 硬编码 `PIECEWISE` 或统一 graph cap。
+- 验收：按 revision 断言最终 Stage 0/1 runner 模式、Stage 2 outer eager、开关及 cap，覆盖关闭和 cap 0。含 #10595 的配置见[基底 YAML](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/vllm_omni/deploy/minicpmo_4_5.yaml#L253-L376)与[双卡 overlay](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/vllm_omni/deploy/minicpmo_4_5_2gpu.yaml#L25-L91)：Stage 0/1 为 `FULL_DECODE_ONLY`；Stage 2 基底 cap=32，双 NPU overlay cap=96，Talker/Code2Wav 各两副本。断言继承后的五步 CFM 与副本/设备映射，参照[部署配置测试](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py#L84-L117)。配置解析只证明投影，不是硬件资格。 ^[PR #5604] ^[PR #10595]
 
 部署 YAML 的展开顺序见 [deploy-yaml](deploy-yaml.md)；stage 执行合同见 [model-executor 规则](../model-executor/rules.md)。
 
