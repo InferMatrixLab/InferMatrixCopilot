@@ -12,7 +12,7 @@ confidence: high
 
 入口与其他规则见 [共享规则](rules.md)。
 
-## MCPMO-1f — Ascend Code2Wav 保持 outer eager，按实际 inner graph 路径验收
+## MCPMO-1f Ascend Code2Wav 保持 outer eager 按实际 inner graph 路径验收
 
 - 触发：MiniCPM-o 4.5 在 Ascend 上修改 Code2Wav、CFM estimator、NPUGraph 开关、图缓存或 bundled deploy profile。
 - 强制：Stage 2 的 runner 保持 `enforce_eager: true`；这不关闭模型内部的设备 graph。早期 #5604 的 platform exact-step 路径只捕获 `blocks_forward_chunk`，cached/uncached shape 分桶；含 #10595 的 runtime 可在 NPU 上使用共享 CFM Whole-Euler/step wrapper，也可分别启用 Flow encoder 和 HiFT 子图。按当前 dispatch 区分这些路径：支持时在模型内部捕获有界子图，请求解析、request-owned state 提交和未捕获部分留在外层。带 capture 的 NPU runtime 仍需在 Token2Wav 加载前配置 `allow_internal_format=False`、`jit_compile=False` 并拒绝 `ASCEND_LAUNCH_BLOCKING=1`；SDPA 限制按实际路径验证；启用且设备为 NPU 时，缺少所需 graph API 可使加载报错，不是未命中 bucket 时的 eager 回退。

@@ -11,9 +11,9 @@ confidence: high
 # MiniCPM-o 4.5 Code2Wav CUDA graph 规则
 
 本页的 MCPMO-1d/1e 记录 CUDA HiFT 与 legacy CFM step 实现的合同，不是非 CUDA 的能力矩阵。
-支持的 Ascend 内部 graph、启动门禁与 fallback 查 [Code2Wav 运行时合同（MCPMO-1f）](rules-code2wav-runtime.md#mcpmo-1f--ascend-code2wav-保持-outer-eager按实际-inner-graph-路径验收)。
+支持的 Ascend 内部 graph、启动门禁与 fallback 查 [Code2Wav 运行时合同（MCPMO-1f）](rules-code2wav-runtime.md#mcpmo-1f-ascend-code2wav-保持-outer-eager-按实际-inner-graph-路径验收)。
 
-## MCPMO-1d — HiFT graph 只捕获稳定 pre-iSTFT 子图并限界 shape cache
+## MCPMO-1d HiFT graph 只捕获稳定 pre-iSTFT 子图并限界 shape cache
 
 - 触发：CUDA HiFT 路径的 `enable_hift_graph`、capture batch/chunk 配置、HiFT inference 分段或 streaming cache shape。
 - 强制：#5869 的 CUDA-only 实现仅接受 CUDA parameter device，其非 CUDA 分支回 eager；不要把这个历史门禁当作后续共享 wrapper 的设备白名单。CUDA capture bucket 由 codec chunk、left context、Flow lookahead、token→mel ratio 与 mel/source cache 推导；新版在首个 forward 的预捕阶段准备 uncached/cached、initial 和配置的 exact shape；只有合法 capture buckets 的缺失 graph 可 lazy capture（默认上限 8），未知 final shape、超限或无法容纳 batch 时回 eager。active stream capture 中禁止嵌套 capture/replay并回 eager；静态输入先清零再复制真实 batch，输出 slice 后 clone。
@@ -21,7 +21,7 @@ confidence: high
 - 禁止：无 connector 配置、非正 chunk、负 left context、source/mel cache 不整除时静默 capture；不核对新版 exact initial/continuation 配置就将 `initial_codec_chunk_frames` 当已预捕（旧版仅 lazy capture，新版预捕合同见 MCPMO-GRAPH-1e）；把 lazy graph limit 说成总显存上界，因为启动 graphs、global pool、static tensors 与其他 graph owners 仍驻留。active-capture 分支虽绕过 nested replay，却调用完整 eager decode（native ISTFT 或 cached envelope 首次 miss 仍可能 NOLA sync）；未做真实 outer-graph 测试前，不能把日志中的 “fallback” 当成可捕获保证。custom `capture_batch_sizes` 也尚未校验正数/去重。
 - 验收：CUDA test 比较 cached/uncached graph 与 eager，CPU/mock 覆盖 lazy capture/limit fallback，deploy test 固定默认开关；回归 #5869 CUDA-only 实现时验证其非 CUDA disable；当前设备路径按相应 backend 验证。另测 invalid config、unsupported batch、nested capture 和 variable final chunk。static input/output 与 lazy graph map 为无锁可变状态；并发 replay/capture 需先证明被上层串行化或增加互斥与重叠调用测试。PR 的单 A800 profile 约 30→5 ms/chunk、250→43 ms/request，只绑定部分 graph、单 prompt/commit `8fa28d88`，无 repeats/端到端质量，不能泛化为稳定 speedup。^[PR #5869] ^[PR #8443] ^[PR #8222]
 
-## MCPMO-1e — legacy step-level CFM DiT Graph 必须按 shape 整代退休并保持 eager parity
+## MCPMO-1e legacy step-level CFM DiT Graph 必须按 shape 整代退休并保持 eager parity
 
 - 触发：修改 MiniCPM-o 4.5 Code2Wav legacy CUDA step-level CFM DiT estimator 的 `blocks_forward_chunk` graph target、按 shape 捕获/重放、cache retirement 或 eager fallback；Whole-Euler 的完整 solver capture 另见 MCPMO-GRAPH-1a/1b。
 - 强制：对 #6082/#6587 的 legacy CUDA wrapper，仅在 CUDA 且显式启用时捕获 `estimator.blocks_forward_chunk`；`t_embedder`、`torch.cat`、`expand`、buffer 准备和 10-step Euler loop 保持 eager。graph key 必须包含所有输入的 shape、dtype 和 device；`cnn_cache=None` 与 `att_cache=None` 转为 graph 可接受的零值时，必须保持与 eager `[None] * depth` 的首 chunk 数值语义，重放结果和 cache 输出需 clone。

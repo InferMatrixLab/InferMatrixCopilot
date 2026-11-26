@@ -67,7 +67,7 @@ confidence: high
 ## CONF-5g — MiniCPM-o NPU Code2Wav 开关必须按 Stage 2 传递
 
 - 触发：修改 MiniCPM-o 4.5 bundled deploy YAML 或调整 `code2wav_enable_npu_graph`、`code2wav_max_npu_graphs`。
-- 强制：Ascend 通过 Stage 2 的 `additional_config` 投影这两个 key，并保持最终 runner outer eager；encoder/CFM/HiFT 子图边界见 [MCPMO-1f](../../models/minicpm-o-4-5/rules-code2wav-runtime.md#mcpmo-1f--ascend-code2wav-保持-outer-eager按实际-inner-graph-路径验收)。用 `_apply_platform_overrides` 与 `merge_pipeline_deploy` 核对实际 profile，包括替换而非深合并的 `additional_config` 和继承的 connector 设置。
+- 强制：Ascend 通过 Stage 2 的 `additional_config` 投影这两个 key，并保持最终 runner outer eager；encoder/CFM/HiFT 子图边界见 [MCPMO-1f](../../models/minicpm-o-4-5/rules-code2wav-runtime.md#mcpmo-1f-ascend-code2wav-保持-outer-eager-按实际-inner-graph-路径验收)。用 `_apply_platform_overrides` 与 `merge_pipeline_deploy` 核对实际 profile，包括替换而非深合并的 `additional_config` 和继承的 connector 设置。
 - 禁止：把这两个 key 放进 shared connector extra、全局配置或其他 stage；用全局 eager 改变 Stage 0/1；对所有 revision 和 profile 硬编码 `PIECEWISE` 或统一 graph cap。
 - 验收：按 revision 断言最终 Stage 0/1 runner 模式、Stage 2 outer eager、开关及 cap，覆盖关闭和 cap 0。含 #10595 的配置见[基底 YAML](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/vllm_omni/deploy/minicpmo_4_5.yaml#L253-L376)与[双卡 overlay](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/vllm_omni/deploy/minicpmo_4_5_2gpu.yaml#L25-L91)：Stage 0/1 为 `FULL_DECODE_ONLY`；Stage 2 基底 cap=32，双 NPU overlay cap=96，Talker/Code2Wav 各两副本。断言继承后的五步 CFM 与副本/设备映射，参照[部署配置测试](https://github.com/vllm-project/vllm-omni/blob/94de758f0678bb8d5e770349c463f1f267a91f20/tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py#L84-L117)。配置解析只证明投影，不是硬件资格。 ^[PR #5604] ^[PR #10595]
 
