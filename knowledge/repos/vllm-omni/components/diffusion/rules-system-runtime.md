@@ -86,7 +86,7 @@ confidence: high
 - 验收：32Q/8KV、异构 prefix、单 token/单 head、非对称等维 LSE 和 batch compaction 精确
   对照 dense/reference 输出。 ^[PR #5543] ^[PR #6102]
 
-## DIFF-4x — SymmMem Ulysses A2A transport 与 workspace 生命周期
+## DIFF-4x SymmMem Ulysses A2A transport 与 workspace 生命周期
 
 - 触发：修改 `ulysses_a2a_backend`、旧版 `ulysses_a2a_permute`、strict Ulysses all-to-all、NCCL SymmetricMemory JIT、CUDA graph 或 diffusion worker shutdown。
 - 选择：`v0.34.0` tag 的旧 bool 默认关闭。自 [#11109](https://github.com/vllm-project/vllm-omni/pull/11109) 起，CUDA `auto` 只有满足 strict pure Ulysses、非 causal、使用目标布局且无 CUDA-graphed denoising 时才尝试 copy engine；group 必须单机、具备 P2P 和 torch symmetric memory，超过两 rank 还要求全 NVLink；两 rank 可用 PCIe P2P。group collective 给所有 rank 同一结果，条件不满足则记录理由并走 `nccl`。显式 `nccl` 不做 CE 选择；在进入 `select_transport` 的 CUDA Ulysses 分支，显式 `copy_engine` 不合硬件或 graph 条件会报错；策略仍按调用的 mode/layout 决定实际交换。NPU 的 `auto` 不自动启用 SHMEM；显式 `copy_engine` 走平台自己的 eager、pure Ulysses、HCCS/SHMEM 校验。[选择器](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/distributed/ulysses_transport.py) · [调用方](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/attention/parallel/factory.py)
