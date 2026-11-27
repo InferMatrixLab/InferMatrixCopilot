@@ -1,6 +1,6 @@
 # direct_routing.py —— 规范
 
-<!-- verified-against: 2026-10-08 -->
+<!-- verified-against: 2026-11-15 -->
 
 `LOC ~880 · Direct 模式完整策略包与仓库中立的知识路由 · refactor-status: stable`
 
@@ -23,6 +23,15 @@ Direct policy bundle）、`direct_knowledge_routes`、
 `thin_mcp_server` 既有调用点/测试使用（它继续直接 import 下划线名）。
 
 ## 不变量
+- **Direct negative-claim evidence**: the canonical `first_review_checklist`
+  requires tracing concrete production callers, subclass/keyword forwarding
+  and the consumer before claiming a missing input or effect. Cleanup claims
+  inspect the actual library callee at the applicable version/platform and
+  check success/exception ownership before proposing potentially duplicate,
+  non-idempotent cleanup. Unreadable source or unverified dependencies remain
+  explicit evidence gaps, not proof of absence; independently demonstrated
+  reachable defects remain reportable. This is host guidance carried by the
+  raw plan and SDK serialization, not a new completion field or semantic gate.
 - **repo 守卫最先跑**：不支持的仓库在任何路由计算之前被拒 —— 修的是一个
   真实历史 bug（守卫曾排在空 intent 提前返回之后，向不支持的仓库泄漏
   owner 知识）。
@@ -78,6 +87,12 @@ stdlib + PyYAML + `.adapters`（AdapterError / AdapterRegistry / RepoAdapter）+
 旧 bundle 的 6,000 字符相关背景预算保持不变。
 
 ## 测试
+`test_sdk_v1.py::test_direct_plan_carries_negative_claim_tracing_guidance`
+checks that the public SDK plan and its serialized checklist retain the
+canonical caller/callee, cleanup-safety and evidence-limit guidance. This
+is a prompt-delivery regression, not proof of model compliance or a measured
+review-quality improvement.
+
 `test_knowledge_view_routing.py`（150 个真实 vllm-omni PR 的黄金路由输出、
 第二仓库经自身 `_routes.yaml` 路由、快照切换下一请求生效、快照篡改 fail-closed、
 SDK 完成校验钉住计划时快照、模块源码不含仓库名）；`test_contract.py`（公开家、import 方向、中立性豁免）；
@@ -94,3 +109,4 @@ SDK 完成校验钉住计划时快照、模块源码不含仓库名）；`test_c
 Route-table validation checks unused navigation targets for integrity without serving their content. Selected owner/model reads pass `KnowledgeView.path` and current containment. Quickmap extraction first removes retired rules. Related retrieval excludes specifically held pages; invalid or stale policy still fails the request closed.
 
 With containment enabled, the raw `direct_review_plan` also returns a private-registry-backed `knowledge_usage` receipt for its selected route, procedure, and related-document dependencies. It binds a private delivery session for later raw document reads/searches without claiming model injection inside the planner. The public `direct_completion_result` requires that receipt and rechecks all original and follow-up issued resources against the current policy. Missing, forged, stale, or held provenance returns `partial_review` with `publish_ready=false`; the original structural evidence checks remain in force. The SDK forwards its own issued context receipt to the same gate. Disabled deployments retain the existing bundle and completion result shape.
+
