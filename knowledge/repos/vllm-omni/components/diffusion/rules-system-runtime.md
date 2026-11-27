@@ -1,10 +1,10 @@
 ---
 title: "Diffusion paged cache 与系统运行时规则"
 created: 2026-09-03
-updated: 2026-09-22
+updated: 2026-11-27
 type: rule
 tags: [vllm-omni, components, diffusion]
-sources: ["PR #5255", "PR #5344", "PR #5543", "PR #5838", "PR #6094", "PR #6102", "PR #6385", "PR #6340", "PR #6714", "PR #6814", "PR #6563", "PR #5716", "PR #6786", vllm_omni/diffusion/attention/, vllm_omni/diffusion/attention/parallel/ulysses.py, vllm_omni/diffusion/attention/parallel/ring_kernels.py, vllm_omni/diffusion/diffusion_kv/, vllm_omni/diffusion/distributed/cfg_parallel.py, vllm_omni/diffusion/distributed/parallel_state.py, vllm_omni/diffusion/worker/diffusion_model_runner.py, vllm_omni/platforms/interface.py, vllm_omni/platforms/npu/platform.py, tests/diffusion/diffusion_kv/, tests/diffusion/distributed/test_cfg_parallel.py, tests/diffusion/attention/test_piecewise_attn.py, tests/diffusion/attention/test_ulysses_uaa.py, "PR #5491", "PR #5194", "vllm_omni/diffusion/data.py", "vllm_omni/diffusion/utils/hf_utils.py", "PR #7041", "PR #6463", "PR #6844", "PR #7548"]
+sources: ["PR #5255", "PR #5344", "PR #5543", "PR #5838", "PR #6094", "PR #6102", "PR #6385", "PR #6340", "PR #6714", "PR #6814", "PR #6563", "PR #5716", "PR #6786", vllm_omni/diffusion/attention/, vllm_omni/diffusion/attention/parallel/ulysses.py, vllm_omni/diffusion/attention/parallel/ring_kernels.py, vllm_omni/diffusion/diffusion_kv/, vllm_omni/diffusion/distributed/cfg_parallel.py, vllm_omni/diffusion/distributed/parallel_state.py, vllm_omni/diffusion/worker/diffusion_model_runner.py, vllm_omni/platforms/interface.py, vllm_omni/platforms/npu/platform.py, tests/diffusion/diffusion_kv/, tests/diffusion/distributed/test_cfg_parallel.py, tests/diffusion/attention/test_piecewise_attn.py, tests/diffusion/attention/test_ulysses_uaa.py, "PR #5491", "PR #5194", "vllm_omni/diffusion/data.py", "vllm_omni/diffusion/utils/hf_utils.py", "PR #7041", "PR #6463", "PR #6844", "PR #7548", "PR #11109"]
 confidence: high
 ---
 
@@ -86,12 +86,13 @@ confidence: high
 - 验收：32Q/8KV、异构 prefix、单 token/单 head、非对称等维 LSE 和 batch compaction 精确
   对照 dense/reference 输出。 ^[PR #5543] ^[PR #6102]
 
-## DIFF-4x — SymmMem Ulysses A2A 只能显式启用并保持 workspace 生命周期闭合
+## DIFF-4x — SymmMem Ulysses A2A transport 与 workspace 生命周期
 
-- 触发：修改 `ulysses_a2a_permute`、strict Ulysses all-to-all、NCCL SymmetricMemory JIT extension、CUDA graph capture 或 diffusion worker shutdown。
-- 强制：默认关闭；只在 `ulysses_degree > 1`、strict Ulysses 的正向 `(scatter,gather)=(2,1)` 与反向 `(1,2)` layout 启用，并在 worker/model 初始化时 JIT build/capability failure 直接 fail-at-init。advanced-UAA 保持其 `_ulysses_all_to_all_any_*` path；AllGather 不选择 Ulysses；strict Ulysses+Ring 的 Ulysses leg 仍可使用该 path。每个 `(device, process-group)` 只有一个单 CUDA stream 的 grow-only byte workspace；首次分配及增长必须是 collective、在增长前同步，容量内以 typed byte-slice view 复用；graph capture 中禁止增长，须先 warm up 最大 shape；worker shutdown 同步并释放 workspace。Fast Ulysses QKV staging 只有 input/output 同一 CUDA device、同一 dtype、input rank-3、shape 相同、output contiguous，且 inner row `stride(2)==1`、`stride(1)==size(2)`、outer stride 不小于一整 row（无 overlap）时，才可在 `CUDAGuard(input.device())` 与 current CUDA stream 上用 `cudaMemcpy2DAsync`。^[PR #6714] ^[PR #6814]
-- 禁止：把 flag 当作默认 transport、静默 fallback；按历史 shape/dtype 无界缓存 allocation；跨 stream 重用 staging buffer；capture 中隐式分配/扩容；把任意 strided tensor 当作 copy-engine eligible，或把 CPU/mock workspace 测试、PR benchmark 写成数学/输出 parity、普遍速度或跨硬件收益。
-- 验收：覆盖 CLI/deploy/default-stage 的显式 flag 透传与默认 false、eligible strict path 的 init build、UAA/AllGather/noneligible layout 不调用该 path、strict Ulysses+Ring 的 eligible Ulysses leg、peak workspace 复用/collective growth、capture growth fail、single-stream reject 与 shutdown release；copy op 必须拒绝 device/dtype/rank/shape/output-contiguity/inner-row/overlap 不匹配。当前没有新增 upstream unit；仅 B300 上 row-strided BF16 bitwise copy、四-rank forward/reverse parity 和四-GPU H3 smoke 证据，不能外推为一般硬件或性能结论。^[PR #6340] ^[PR #6814]
+- 触发：修改 `ulysses_a2a_backend`、旧版 `ulysses_a2a_permute`、strict Ulysses all-to-all、NCCL SymmetricMemory JIT、CUDA graph 或 diffusion worker shutdown。
+- 选择：`v0.34.0` tag 的旧 bool 默认关闭。自 [#11109](https://github.com/vllm-project/vllm-omni/pull/11109) 起，CUDA `auto` 只有满足 strict pure Ulysses、非 causal、使用目标布局且无 CUDA-graphed denoising 时才尝试 copy engine；group 必须单机、具备 P2P 和 torch symmetric memory，超过两 rank 还要求全 NVLink；两 rank 可用 PCIe P2P。group collective 给所有 rank 同一结果，条件不满足则记录理由并走 `nccl`。显式 `nccl` 不做 CE 选择；显式 CUDA `copy_engine` 不合硬件或 graph 条件会报错，不等于所有 layer 都使用 CE，策略仍按调用的 mode/layout 决定。NPU 的 `auto` 不自动启用 SHMEM；显式 `copy_engine` 走平台自己的 eager、pure Ulysses、HCCS/SHMEM 校验。[选择器](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/distributed/ulysses_transport.py) · [调用方](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/attention/parallel/factory.py)
+- 调度与生命周期：`ulysses_overlap_chunks` 只在选到 copy engine 时生效；`auto` 落到 `nccl` 就不生效。CUDA graph capture 禁用 head-overlap。CE 的正向布局为 `(scatter,gather)=(2,1)`，反向为 `(1,2)`；advanced-UAA 保留独立交换，AllGather 不走 CE。每个 `(device, process-group)` 只有一个单 CUDA stream 的 grow-only byte workspace；首次分配及增长必须是 collective、在增长前同步，容量内以 typed byte-slice view 复用；graph capture 中禁止增长，须先 warm up 最大 shape；worker shutdown 同步并释放 workspace。Fast Ulysses QKV staging 只有 input/output 同一 CUDA device、同一 dtype、input rank-3、shape 相同、output contiguous，且 inner row `stride(2)==1`、`stride(1)==size(2)`、outer stride 不小于一整 row（无 overlap）时，才可在 `CUDAGuard(input.device())` 与 current CUDA stream 上用 `cudaMemcpy2DAsync`。 ^[PR #6714] ^[PR #6814]
+- 禁止：把 `auto` 的按条件选择说成显式 `copy_engine` 的静默 fallback；把 strict Ulysses+Ring 可走的旧版/显式 Ulysses leg 当作新 `auto` 会选择的 pure Ulysses；跨 stream 复用 workspace、无界缓存或 capture 中扩容；把 CPU/mock 或单机 benchmark 外推为跨平台收益。
+- 验收：覆盖显式策略、`auto` 的 topology/graph fallback 和 overlap gating，验证不合资格布局不走 fused path；仍需实际硬件的 forward/reverse parity、workspace collective growth/复用、capture growth fail 与 teardown。历史 B300 row-strided BF16、四 rank parity 和 H3 smoke 仅证明其对应配置。^[PR #6340] ^[PR #6814]
 
 ## DIFF-4y — CFG parallel state 未初始化时串行，初始化错误必须可见
 
