@@ -1,6 +1,6 @@
 ---
 title: "LingBot World 运行入口、配置与验证"
-created: 2026-10-09
+created: 2026-11-27
 updated: 2026-10-09
 type: guide
 tags: [vllm-omni, models, diffusion, benchmark]
@@ -10,6 +10,7 @@ sources:
   - vllm-project/vllm-omni@9cf443a7bb24d6b8007981311466d769ec13b3d8:vllm_omni/deploy/lingbot_world_v2_stepwise.yaml
   - vllm-project/vllm-omni@9cf443a7bb24d6b8007981311466d769ec13b3d8:benchmarks/lingbot_world/README.md
   - vllm-project/vllm-omni@9cf443a7bb24d6b8007981311466d769ec13b3d8:benchmarks/lingbot_world/workload.py
+  - vllm-project/vllm-omni@6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb:vllm_omni/diffusion/models/lingbot_world/pipeline.py
 confidence: high
 ---
 
@@ -82,7 +83,7 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
 
 ## 并行、量化与质量开关
 
-当前 pipeline 校验纯 Ulysses：`sequence_parallel_size == ulysses_degree`，`ring_degree == allgather_degree == 1`，strict mode，禁用 `ulysses_a2a_permute`。PP/CFG/VAE-patch parallel size 大于 1、HSDP 和 expert parallel 均拒绝；不能把同 group 的 VAE width sharding 描述成支持 `vae_patch_parallel_size`。
+当前 pipeline 校验纯 Ulysses：`sequence_parallel_size == ulysses_degree`，`ring_degree == allgather_degree == 1`，strict mode。上述核对版本及 `v0.34.0` 用旧字段，要求 `ulysses_a2a_permute=false`。从 [#11109 合入点](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/models/lingbot_world/pipeline.py#L288) 起，LingBot World 的 `auto` 被固定为 `nccl`，显式 `nccl` 接受，显式 `copy_engine` 不支持；勿把通用 CUDA `auto` 的 CE 行为外推到该模型。PP/CFG/VAE-patch parallel size 大于 1、HSDP 和 expert parallel 均拒绝；不能把同 group 的 VAE width sharding 描述成支持 `vae_patch_parallel_size`。
 四 GPU compiled 示例在 `benchmarks/lingbot_world/configs/usp4_compiled.yaml`；其 TP=1 是该配置的选择，不是 pipeline validator 对所有 TP 的限制。
 
 在线 FP8 通过通用 quantization 配置传到 transformer 的 vLLM parallel linears，可按完整 prefix 保留敏感层为 BF16。camera/C2WS exclusion 是质量实验的配置选择，不是所有场景默认正确的策略。KV reuse 省去一次 writeback，VAE width sharding 改变边界数值顺序；每个开关都应与匹配的 BF16/默认 commit/full-frame decode 对照，不能从单个 kernel speedup 推断 E2E 或长 session 质量。
