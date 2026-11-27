@@ -1,7 +1,7 @@
 ---
 title: "LingBot World 运行入口、配置与验证"
-created: 2026-11-27
-updated: 2026-10-09
+created: 2026-10-09
+updated: 2026-11-27
 type: guide
 tags: [vllm-omni, models, diffusion, benchmark]
 sources:
