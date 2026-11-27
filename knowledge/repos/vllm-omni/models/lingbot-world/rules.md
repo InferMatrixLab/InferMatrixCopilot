@@ -1,7 +1,7 @@
 ---
 title: "LingBot World 模型规则"
 created: 2026-09-22
-updated: 2026-10-09
+updated: 2026-11-27
 type: rule
 tags: [vllm-omni, models, diffusion]
 sources:
@@ -55,9 +55,9 @@ sources:
 ## LBW-2b — 并行配置必须在组件加载前满足 pure Ulysses 合同
 
 - 触发：修改 LingBot parallel config 或并行能力验证。
-- 强制：sequence parallel 仅接受 `sequence_parallel_size == ulysses_degree` 的 pure strict Ulysses，`ring_degree == allgather_degree == 1` 且禁用 `ulysses_a2a_permute`；在加载组件前拒绝不支持的模式。
+- 强制：sequence parallel 仅接受 `sequence_parallel_size == ulysses_degree` 的 pure strict Ulysses，`ring_degree == allgather_degree == 1`；在加载组件前拒绝不支持的模式。`v0.34.0` 等旧字段版本要求 `ulysses_a2a_permute=false`；自 [#11109 合入点](https://github.com/vllm-project/vllm-omni/blob/6c30b6eb7f5e69407b5353be4f806e0bfc7a96fb/vllm_omni/diffusion/models/lingbot_world/pipeline.py#L288) 起，显式 `nccl` 接受，`auto` 固定为 `nccl`，显式 `copy_engine` 抛出 `NotImplementedError`。
 - 禁止：设置 `pipeline_parallel_size > 1`、`cfg_parallel_size > 1` 或 `vae_patch_parallel_size > 1`，或启用 HSDP / expert parallel；不能把 VAE width sharding 解释为支持 tiled VAE executor。
-- 验收：合法 pure Ulysses 通过；非法并行组合在 tokenizer、encoder、VAE 加载前失败。实际 process group 的检查属于 `LBW-2e`。[并行验证源码](https://github.com/vllm-project/vllm-omni/blob/9cf443a7bb24d6b8007981311466d769ec13b3d8/vllm_omni/diffusion/models/lingbot_world/pipeline.py#L249)。
+- 验收：合法 pure Ulysses 通过，新字段的三种 transport 分别验收；非法并行组合在 tokenizer、encoder、VAE 加载前失败。实际 process group 的检查属于 `LBW-2e`。[并行验证源码](https://github.com/vllm-project/vllm-omni/blob/9cf443a7bb24d6b8007981311466d769ec13b3d8/vllm_omni/diffusion/models/lingbot_world/pipeline.py#L249)。
 
 ## LBW-2c — Online FP8 配置必须贯通 eligible linears 与稳定的完整层名
 
